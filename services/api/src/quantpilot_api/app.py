@@ -7,6 +7,7 @@ command routes (POST /api/v1/commands etc.) are intentionally absent.
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from quantpilot_contracts.models import NodeHeartbeatRequest, NodeRegisterRequest
 
@@ -396,6 +398,157 @@ def account_symbols(account_id: str, request: Request) -> JSONResponse:
         (account_id,),
     )
     return ok(db.jsonable(rows), request)
+
+
+# --------------------------------------------------------------------------
+# account config (doc 12.2 risk_profiles) - OBSERVE_ONLY slice: the config is
+# stored and served for observation; nothing in this system enforces it.
+# --------------------------------------------------------------------------
+
+class FiltersConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    news_filter: bool = True
+    high_impact_only: bool = True
+    session_filter: bool = False
+    max_spread: bool = True
+    slippage_guard: bool = True
+    weekend_block: bool = False
+    max_daily_orders: int = Field(default=10, ge=1, le=1000)
+    max_positions: int = Field(default=5, ge=1, le=500)
+
+
+class ExpertConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auto_trading: bool = True
+    sound_alert: bool = False
+    popup_alert: bool = True
+    notification_alert: bool = False
+    close_on_opposite: bool = True
+    magic_number: int = Field(default=123456, ge=0)
+    order_comment: str = Field(default="QuantPilot", max_length=63)
+
+
+class AccountConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filters: FiltersConfig = Field(default_factory=FiltersConfig)
+    expert: ExpertConfig = Field(default_factory=ExpertConfig)
+
+
+class ConfigLookupRequest(BaseModel):
+    """Identity tuple -> account config (called by the local agent for an EA)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    data_path_hash: str
+    login_ref: str
+    server: str
+
+
+def _account_or_404(account_id: str) -> UUID:
+    try:
+        account_uuid = UUID(account_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=404, detail="account not found")
+    if db.query_one("SELECT id FROM trading_accounts WHERE id = %s", (account_uuid,)) is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    return account_uuid
+
+
+def _config_payload(row: dict | None, account_id: str | None) -> dict:
+    if row is None:
+        return {
+            "account_id": account_id,
+            "version": 0,
+            "status": "DEFAULT",
+            "source": "default",
+            "config": AccountConfig().model_dump(mode="json"),
+            "created_at": None,
+        }
+    return {
+        "account_id": account_id,
+        "version": row["version"],
+        "status": row["status"],
+        "source": "cloud",
+        "config": row["config_json"],
+        "created_at": row["created_at"],
+    }
+
+
+def _active_config_row(account_uuid: UUID) -> dict | None:
+    return db.query_one(
+        """
+        SELECT version, config_json, status, created_at
+          FROM risk_profiles
+         WHERE account_id = %s AND status = 'ACTIVE'
+         ORDER BY version DESC
+         LIMIT 1
+        """,
+        (account_uuid,),
+    )
+
+
+@app.get("/api/v1/accounts/{account_id}/config")
+def get_account_config(account_id: str, request: Request) -> JSONResponse:
+    """Current account config; falls back to defaults when none was saved."""
+    account_uuid = _account_or_404(account_id)
+    row = _active_config_row(account_uuid)
+    return ok(db.jsonable(_config_payload(row, account_id)), request)
+
+
+@app.put("/api/v1/accounts/{account_id}/config")
+def put_account_config(account_id: str, body: AccountConfig, request: Request) -> JSONResponse:
+    """Save a new config version: ACTIVE -> SUPERSEDED, then version = max+1.
+
+    Versioned append-only (doc 21.1): every change stays auditable.
+    """
+    account_uuid = _account_or_404(account_id)
+    doc = json.dumps(body.model_dump(mode="json"))
+    with db.conn() as connection:
+        connection.execute(
+            "UPDATE risk_profiles SET status = 'SUPERSEDED' WHERE account_id = %s AND status = 'ACTIVE'",
+            (account_uuid,),
+        )
+        connection.execute(
+            """
+            INSERT INTO risk_profiles (account_id, version, config_json)
+            VALUES (%s,
+                    (SELECT COALESCE(MAX(version), 0) + 1 FROM risk_profiles WHERE account_id = %s),
+                    CAST(%s AS jsonb))
+            """,
+            (account_uuid, account_uuid, doc),
+        )
+    row = _active_config_row(account_uuid)
+    return ok(db.jsonable(_config_payload(row, account_id)), request)
+
+
+@app.post("/api/v1/config/lookup")
+def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
+    """Resolve an identity tuple (terminal data-path hash + login/server) to
+    the account config. Unresolvable identities get the defaults with
+    resolved=false (cloud stays stateless per doc 4.4)."""
+    row = db.query_one(
+        """
+        SELECT a.id::text AS account_id
+          FROM trading_accounts a
+          JOIN mt5_terminals t ON t.id = a.terminal_id
+         WHERE t.terminal_path_hash = %s AND a.login_ref = %s AND a.server = %s
+         ORDER BY a.last_seen_at DESC NULLS LAST
+         LIMIT 1
+        """,
+        (body.data_path_hash, body.login_ref, body.server),
+    )
+    if row is None:
+        payload = _config_payload(None, None)
+        payload["resolved"] = False
+        return ok(db.jsonable(payload), request)
+    account_uuid = _account_or_404(row["account_id"])
+    active = _active_config_row(account_uuid)
+    payload = _config_payload(active, row["account_id"])
+    payload["resolved"] = True
+    return ok(db.jsonable(payload), request)
 
 
 # --------------------------------------------------------------------------

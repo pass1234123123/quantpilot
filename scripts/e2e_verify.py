@@ -37,6 +37,7 @@ TABLES = [
     "positions",
     "deals",
     "orders",
+    "risk_profiles",
     "system_events",
 ]
 
@@ -146,6 +147,39 @@ def main() -> int:
                   f"net={stats.get('net_profit')}")
             check("api.performance_daily", len(pdata.get("daily", [])) == 30,
                   f"buckets={len(pdata.get('daily', []))}")
+
+        # config: PUT must bump the version; lookup must resolve the sim identity
+        cfg0 = client.get(f"{API}/api/v1/accounts/{sim_id}/config")
+        cfg0_ok = cfg0.status_code == 200 and (cfg0.json().get("data") or {}).get("config", {}).get("filters")
+        check("api.config_get", cfg0_ok is not False,
+              f"status={cfg0.status_code} version={(cfg0.json().get('data') or {}).get('version') if cfg0.status_code == 200 else '-'}")
+        if cfg0_ok:
+            before = cfg0.json()["data"]
+            doc = before["config"]
+            doc["filters"]["max_positions"] = 7
+            put = client.put(f"{API}/api/v1/accounts/{sim_id}/config", json=doc)
+            check("api.config_put", put.status_code == 200, f"status={put.status_code}")
+            if put.status_code == 200:
+                after = put.json()["data"]
+                check("api.config_version_bump",
+                      after.get("version") == before.get("version", 0) + 1,
+                      f"{before.get('version')} -> {after.get('version')}")
+                check("api.config_value", after["config"]["filters"]["max_positions"] == 7)
+                again = client.get(f"{API}/api/v1/accounts/{sim_id}/config").json()["data"]
+                check("api.config_persisted",
+                      again.get("version") == after.get("version")
+                      and again["config"]["filters"]["max_positions"] == 7)
+
+        import hashlib
+        sim_hash = "sha256:" + hashlib.sha256(b"C:\\sim\\terminal-data").hexdigest()
+        lk = client.post(f"{API}/api/v1/config/lookup", json={
+            "data_path_hash": sim_hash, "login_ref": "10001234", "server": "MetaQuotes-Demo-Sim",
+        })
+        lk_data = lk.json().get("data") or {} if lk.status_code == 200 else {}
+        check("api.config_lookup",
+              lk.status_code == 200 and lk_data.get("resolved") is True,
+              f"status={lk.status_code} resolved={lk_data.get('resolved')} "
+              f"version={lk_data.get('version')}")
 
     # ---- 2. PostgreSQL row counts ------------------------------------------
     with psycopg.connect(PG_DSN) as conn:

@@ -50,7 +50,7 @@ def main() -> None:
     registrar = _RegistrarThread(config, node_id_holder)
     registrar.start()
 
-    server = AgentHttpServer(config.host, config.port, config.token, event_queue)
+    server = AgentHttpServer(config.host, config.port, config.token, event_queue, config.api_base_url)
     info("agent.listening", host=config.host, port=config.port)
     try:
         server.serve_forever()

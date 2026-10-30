@@ -1,48 +1,86 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed } from 'vue'
+import { useDashboardStore } from '../../stores/dashboard'
+import { num } from '../../api'
 
-const riskMode = ref('按余额百分比')
-const modes = ['按余额百分比', '按净值百分比', '固定手数']
+const store = useDashboardStore()
 
-// 示例数据：风控规则尚未接入后端（OBSERVE_ONLY 切片无交易执行）
-const gaugePercent = 0.85
-const gaugeAngle = 180 * (1 - Math.min(gaugePercent / 5, 1)) // 0..5% mapped to semicircle
+const currency = computed(() => store.snapshot?.currency ?? 'USD')
+const hasSnapshot = computed(() => store.snapshot !== null)
 
-const riskRows = [
-  { label: '总风险', value: '0.85%', status: 'ok' },
-  { label: '单笔风险', value: '1.00%', status: 'ok' },
-  { label: '单日最大亏损', value: '5.00%', status: 'ok' },
-  { label: '最大回撤', value: '10.00%', status: 'ok' },
-  { label: '最大持仓数', value: '5', status: 'ok' },
-  { label: '最大点差', value: '30 点', status: 'ok' },
-  { label: '新闻屏蔽', value: '已启用', status: 'warn' },
-]
+// 保证金占用率 = 已用保证金 / 净权益（0..1）
+const marginUsage = computed(() => {
+  const s = store.snapshot
+  if (!s) return null
+  const equity = num(s.equity)
+  const margin = num(s.margin)
+  if (equity === null || margin === null || equity <= 0) return null
+  return Math.min(margin / equity, 1)
+})
+
+const gaugePercent = computed(() => (marginUsage.value === null ? null : marginUsage.value * 100))
+const gaugeAngle = computed(() => 180 * (1 - Math.min(marginUsage.value ?? 0, 1)))
+
+// 当前回撤：快照历史（最近 500 条）内净值峰值 -> 当前净值
+const currentDrawdown = computed(() => {
+  const s = store.snapshot
+  if (!s) return null
+  const equity = num(s.equity)
+  if (equity === null || equity <= 0) return null
+  const peaks = store.snapshotHistory
+    .map((p) => num(p.equity))
+    .filter((v): v is number => v !== null && v > 0)
+  if (peaks.length === 0) return null
+  const peak = Math.max(...peaks, equity)
+  return Math.max((peak - equity) / peak, 0)
+})
+
+const openPositions = computed(() => store.positions.filter((p) => p.status === 'OPEN'))
+const activeOrders = computed(() => store.orders.filter((o) => o.status === 'ACTIVE'))
+const totalLots = computed(() => openPositions.value.reduce((acc, p) => acc + (num(p.volume) ?? 0), 0))
+
+function money(v: number | null, signed = false): string {
+  if (v === null) return '—'
+  const s = v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return (signed && v > 0 ? '+' : '') + s
+}
+
+function pct(v: number | null): string {
+  return v === null ? '—' : (v * 100).toFixed(2) + '%'
+}
+
+const riskState = computed(() => {
+  const u = marginUsage.value
+  if (u === null) return { label: '—', cls: '' }
+  if (u < 0.3) return { label: '低风险', cls: 'qp-up' }
+  if (u < 0.7) return { label: '中风险', cls: 'qp-warn' }
+  return { label: '高风险', cls: 'qp-down' }
+})
+
+const rows = computed(() => {
+  const s = store.snapshot
+  const perf = store.performance
+  return [
+    { label: '浮动盈亏', value: `${money(store.floatingPl, true)} ${currency.value}`, status: (store.floatingPl ?? 0) >= 0 ? 'ok' : 'warn' },
+    { label: '保证金水平', value: store.marginLevel === null ? '—' : store.marginLevel.toFixed(2) + '%', status: (store.marginLevel ?? 999) >= 200 ? 'ok' : 'warn' },
+    { label: '今日盈亏', value: `${money(num(perf?.period.today_net) ?? null, true)} ${currency.value}`, status: (num(perf?.period.today_net) ?? 0) >= 0 ? 'ok' : 'warn' },
+    { label: '当前回撤(峰值)', value: pct(currentDrawdown.value), status: (currentDrawdown.value ?? 0) < 0.1 ? 'ok' : 'warn' },
+    { label: '历史最大回撤', value: money(num(perf?.stats.max_drawdown) ?? null), status: 'ok' },
+    { label: '持仓数 / 挂单数', value: `${openPositions.value.length} / ${activeOrders.value.length}`, status: 'ok' },
+    { label: '总持仓手数', value: totalLots.value.toFixed(2), status: 'ok' },
+    { label: '净值 / 结余', value: `${money(num(s?.equity) ?? null)} / ${money(num(s?.balance) ?? null)}`, status: 'ok' },
+  ]
+})
 </script>
 
 <template>
   <div class="qp-panel risk">
     <div class="qp-panel__title">
       风险管理与状态
-      <span class="qp-sample-badge">示例数据</span>
+      <span v-if="hasSnapshot" class="qp-live-badge">真实观测</span>
     </div>
 
-    <div class="risk__mode">
-      <div
-        v-for="m in modes"
-        :key="m"
-        class="risk__mode-item"
-        :class="{ 'is-active': m === riskMode }"
-        @click="riskMode = m"
-      >
-        {{ m }}
-      </div>
-    </div>
-
-    <div class="risk__params qp-rows">
-      <div class="qp-row"><span class="qp-row__label">风险比例</span><b class="qp-row__value">1.00</b></div>
-      <div class="qp-row"><span class="qp-row__label">手数</span><b class="qp-row__value">0.10</b></div>
-      <div class="qp-row"><span class="qp-row__label">单笔上限</span><b class="qp-row__value">100.00</b></div>
-    </div>
+    <div class="risk__note">OBSERVE_ONLY：以下为账户实时观测值（不触发任何交易动作）</div>
 
     <div class="risk__gauge">
       <svg viewBox="0 0 200 110" class="risk__gauge-svg">
@@ -62,14 +100,16 @@ const riskRows = [
           stroke-linecap="round"
           :stroke-dasharray="`${(gaugeAngle / 180) * 267} 267`"
         />
-        <text x="100" y="78" text-anchor="middle" class="risk__gauge-value">0.85%</text>
-        <text x="100" y="96" text-anchor="middle" class="risk__gauge-label">总风险</text>
+        <text x="100" y="78" text-anchor="middle" class="risk__gauge-value">
+          {{ gaugePercent === null ? '—' : gaugePercent.toFixed(2) + '%' }}
+        </text>
+        <text x="100" y="96" text-anchor="middle" class="risk__gauge-label">保证金占用率</text>
       </svg>
-      <div class="risk__gauge-state qp-up">低风险</div>
+      <div class="risk__gauge-state" :class="riskState.cls">{{ riskState.label }}</div>
     </div>
 
     <div class="qp-rows">
-      <div v-for="row in riskRows" :key="row.label" class="qp-row">
+      <div v-for="row in rows" :key="row.label" class="qp-row">
         <span class="qp-row__label">{{ row.label }}</span>
         <b class="qp-row__value">
           <span
@@ -104,7 +144,11 @@ const riskRows = [
   background: var(--qp-accent-soft);
   font-weight: 600;
 }
-.risk__params { margin-bottom: 6px; }
+.risk__note {
+  font-size: 10px;
+  color: var(--qp-text-dim);
+  margin-bottom: 6px;
+}
 .risk__gauge { text-align: center; margin: 4px 0 10px; }
 .risk__gauge-svg { width: 170px; height: auto; }
 .risk__gauge-value { fill: var(--qp-text); font-size: 22px; font-weight: 700; }

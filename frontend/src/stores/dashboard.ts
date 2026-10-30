@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountInfo, type AccountSnapshot, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -17,6 +17,8 @@ export const useDashboardStore = defineStore('dashboard', {
     deals: [] as DealRow[],
     orders: [] as OrderRow[],
     performance: null as PerformanceData | null,
+    config: null as AccountConfigData | null,
+    configSaving: false,
     lastRefreshAt: '' as string,
   }),
   getters: {
@@ -82,7 +84,8 @@ export const useDashboardStore = defineStore('dashboard', {
       this.deals = []
       this.orders = []
       this.performance = null
-      const [snapshot, history, symbols, positions, deals, orders, performance] = await Promise.all([
+      this.config = null
+      const [snapshot, history, symbols, positions, deals, orders, performance, config] = await Promise.all([
         api.snapshot(accountId).catch(() => null),
         api.snapshots(accountId, 500).catch(() => [] as SnapshotPoint[]),
         api.symbols(accountId).catch(() => [] as SymbolRow[]),
@@ -90,6 +93,7 @@ export const useDashboardStore = defineStore('dashboard', {
         api.deals(accountId, 500).catch(() => [] as DealRow[]),
         api.orders(accountId).catch(() => [] as OrderRow[]),
         api.performance(accountId, 30).catch(() => null),
+        api.getConfig(accountId).catch(() => null),
       ])
       if (this.selectedAccountId !== accountId) return
       this.snapshot = snapshot
@@ -99,6 +103,18 @@ export const useDashboardStore = defineStore('dashboard', {
       this.deals = deals
       this.orders = orders
       this.performance = performance
+      this.config = config
+    },
+    async saveConfig() {
+      if (!this.selectedAccountId || !this.config) return
+      this.configSaving = true
+      try {
+        this.config = await api.saveConfig(this.selectedAccountId, this.config.config)
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e)
+      } finally {
+        this.configSaving = false
+      }
     },
     async selectAccount(accountId: string) {
       this.selectedAccountId = accountId

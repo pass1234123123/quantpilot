@@ -5,6 +5,7 @@ import { useDashboardStore } from '../../stores/dashboard'
 const store = useDashboardStore()
 const account = computed(() => store.selectedAccount)
 const snap = computed(() => store.snapshot)
+const config = computed(() => store.config)
 
 // 真实数据：Permission/Trading Status ← snapshot 权限位；Account Info ← accounts
 const allOperational = computed(
@@ -12,38 +13,48 @@ const allOperational = computed(
 )
 
 const yesNo = (v: boolean | undefined) => (v ? '是' : '否')
+const onOff = (v: boolean | undefined) => (v === undefined ? '—' : v ? '开启' : '关闭')
+
+// 新闻过滤配置状态（云端 risk_profiles；日历数据源本切片未接入）
+const newsFilter = computed(() => config.value?.config.filters.news_filter)
+const highImpactOnly = computed(() => config.value?.config.filters.high_impact_only)
+
+// 点差与滑点配置状态；点差行情观测：云端按设计不持久化逐跳行情
+// （writers 将 spread/bid/ask 排除在 spec_json 外），故诚实标注待接入
+const maxSpread = computed(() => config.value?.config.filters.max_spread)
+const slippageGuard = computed(() => config.value?.config.filters.slippage_guard)
 </script>
 
 <template>
   <div class="bc">
-    <!-- 新闻过滤（示例数据） -->
+    <!-- 新闻过滤（云端配置；日历数据源待接入） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
         新闻过滤
-        <span class="qp-sample-badge">示例数据</span>
+        <span class="qp-live-badge">配置真实</span>
       </div>
       <div class="bc__news">
-        <div class="bc__news-row"><span>高影响新闻</span><b>已屏蔽</b></div>
-        <div class="bc__news-row"><span>影响级别</span><b>高</b></div>
+        <div class="bc__news-row"><span>新闻过滤</span><b :class="newsFilter ? 'qp-up' : 'qp-dim'">{{ onOff(newsFilter) }}</b></div>
+        <div class="bc__news-row"><span>仅高影响事件</span><b :class="highImpactOnly ? 'qp-up' : 'qp-dim'">{{ onOff(highImpactOnly) }}</b></div>
         <div class="bc__countdown">
-          <div class="bc__countdown-label">下一条新闻</div>
-          <div class="bc__countdown-time">03:59:16</div>
-          <div class="bc__countdown-name">美国非农就业数据</div>
+          <div class="bc__countdown-label">财经日历数据源</div>
+          <div class="bc__countdown-name">待接入：本切片暂无新闻日历供应商</div>
+          <div class="bc__countdown-name bc__dim">以上为云端配置开关的真实状态</div>
         </div>
       </div>
     </div>
 
-    <!-- 点差与佣金（示例数据） -->
+    <!-- 点差与佣金（配置 + EA 上报观测） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
         点差与佣金
-        <span class="qp-sample-badge">示例数据</span>
+        <span class="qp-live-badge">配置真实</span>
       </div>
       <div class="bc__rows">
-        <div class="bc__row"><span>最大点差</span><b>30 点</b></div>
-        <div class="bc__row"><span>佣金上限</span><b>$7.0/手</b></div>
-        <div class="bc__row"><span>滑点保护</span><b class="qp-up">开启</b></div>
-        <div class="bc__row"><span>库存费过滤</span><b class="qp-dim">关闭</b></div>
+        <div class="bc__row"><span>最大点差过滤</span><b :class="maxSpread ? 'qp-up' : 'qp-dim'">{{ onOff(maxSpread) }}</b></div>
+        <div class="bc__row"><span>滑点保护</span><b :class="slippageGuard ? 'qp-up' : 'qp-dim'">{{ onOff(slippageGuard) }}</b></div>
+        <div class="bc__row"><span>品种点差观测</span><b class="qp-dim">数据源待接入</b></div>
+        <div class="bc__row"><span>佣金数据</span><b class="qp-dim">数据源待接入</b></div>
       </div>
     </div>
 
@@ -138,6 +149,7 @@ const yesNo = (v: boolean | undefined) => (v ? '是' : '否')
 .bc__countdown-label { font-size: 9px; letter-spacing: 1px; color: var(--qp-text-dim); }
 .bc__countdown-time { font-size: 20px; font-weight: 700; color: var(--qp-warn); font-variant-numeric: tabular-nums; }
 .bc__countdown-name { font-size: 10px; color: var(--qp-text-dim); }
+.bc__dim { opacity: 0.65; }
 
 .bc__shield {
   text-align: center;

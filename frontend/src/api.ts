@@ -187,8 +187,55 @@ export interface PerformanceData {
   period: PerfPeriod
 }
 
+export interface FiltersConfig {
+  news_filter: boolean
+  high_impact_only: boolean
+  session_filter: boolean
+  max_spread: boolean
+  slippage_guard: boolean
+  weekend_block: boolean
+  max_daily_orders: number
+  max_positions: number
+}
+
+export interface ExpertConfig {
+  auto_trading: boolean
+  sound_alert: boolean
+  popup_alert: boolean
+  notification_alert: boolean
+  close_on_opposite: boolean
+  magic_number: number
+  order_comment: string
+}
+
+export interface AccountConfigData {
+  account_id: string | null
+  version: number
+  status: string
+  source: string
+  resolved?: boolean
+  config: { filters: FiltersConfig; expert: ExpertConfig }
+  created_at: string | null
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} on ${path}`)
+  }
+  const body = (await res.json()) as ApiEnvelope<T>
+  if (body.error) {
+    throw new Error(`${body.error.code}: ${body.error.message}`)
+  }
+  return body.data
+}
+
+async function send<T>(path: string, method: 'PUT' | 'POST', payload: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method,
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} on ${path}`)
   }
@@ -214,6 +261,9 @@ export const api = {
   orders: (accountId: string) => get<OrderRow[]>(`/api/v1/accounts/${accountId}/orders`),
   performance: (accountId: string, days = 30) =>
     get<PerformanceData>(`/api/v1/accounts/${accountId}/performance?days=${days}`),
+  getConfig: (accountId: string) => get<AccountConfigData>(`/api/v1/accounts/${accountId}/config`),
+  saveConfig: (accountId: string, config: { filters: FiltersConfig; expert: ExpertConfig }) =>
+    send<AccountConfigData>(`/api/v1/accounts/${accountId}/config`, 'PUT', config),
 }
 
 /** Parse API decimal strings ("9980.00000000", "0E-8") safely. */

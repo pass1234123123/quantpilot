@@ -8,6 +8,9 @@ Endpoints (all JSON):
     POST /ea/v1/positions      open-position snapshot       -> ea.positions
     POST /ea/v1/deals          incremental history deals    -> ea.deals
     POST /ea/v1/orders         pending-order snapshot       -> ea.orders
+    POST /ea/v1/config         identity -> cloud lookup -> config response
+                               (synchronous; NOT an event; informational for
+                               the EA, OBSERVE_ONLY - PRD 21.3)
     GET  /ea/v1/commands       S1: always empty list (command channel reserved)
 
 The agent is OBSERVE_ONLY in this slice: it never returns trade commands and
@@ -22,6 +25,8 @@ import json
 import queue
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+import httpx
 
 from quantpilot_contracts.constants import (
     EVENT_EA_DEALS,
@@ -70,8 +75,16 @@ def _sanitize(data: dict[str, Any]) -> dict[str, Any]:
 
 
 class AgentHttpServer:
-    def __init__(self, host: str, port: int, token: str, event_queue: "queue.Queue[dict[str, Any]]") -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        token: str,
+        event_queue: "queue.Queue[dict[str, Any]]",
+        api_base_url: str = "http://127.0.0.1:8000",
+    ) -> None:
         outer = self
+        outer._cloud = httpx.Client(base_url=api_base_url, timeout=httpx.Timeout(5.0))
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "QuantPilotAgent/0.1"
@@ -111,6 +124,38 @@ class AgentHttpServer:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     return None
 
+            def _handle_config(self, body: dict[str, Any]) -> None:
+                """EA identity -> cloud config lookup -> relay to the EA.
+
+                The response is informational for the EA (it only logs it);
+                OBSERVE_ONLY, never a trade command (PRD 21.3). The raw
+                data_path stays local - only its sha256 goes to the cloud.
+                """
+                model = EaRegisteredData.model_validate(body)
+                resp = outer._cloud.post(
+                    "/api/v1/config/lookup",
+                    json={
+                        "data_path_hash": _sha256(model.terminal.data_path),
+                        "login_ref": model.account.login_ref,
+                        "server": model.account.server,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data") or {}
+                info(
+                    "http.config_lookup",
+                    resolved=data.get("resolved"),
+                    version=data.get("version"),
+                )
+                self._ok(
+                    {
+                        "resolved": bool(data.get("resolved")),
+                        "version": data.get("version") or 0,
+                        "source": data.get("source"),
+                        "config": data.get("config"),
+                    }
+                )
+
             def log_message(self, fmt: str, *args: Any) -> None:  # route stdlib logs through structured logger
                 info("http.access", line=fmt % args)
 
@@ -136,6 +181,16 @@ class AgentHttpServer:
                 if body is None:
                     self._err(400, "BAD_JSON", "body is not valid JSON")
                     return
+
+                # synchronous config poll: cloud lookup, NOT an event stream item
+                if route == "/ea/v1/config":
+                    try:
+                        self._handle_config(body)
+                    except Exception as exc:
+                        warn("http.config_lookup_failed", error=str(exc))
+                        self._err(502, "CLOUD_LOOKUP_FAILED", str(exc))
+                    return
+
                 try:
                     if route == "/ea/v1/register":
                         data = EaRegisteredData.model_validate(body).model_dump(mode="json")
@@ -182,6 +237,7 @@ class AgentHttpServer:
     def shutdown(self) -> None:
         self._httpd.shutdown()
         self._httpd.server_close()
+        self._cloud.close()
 
 
 def _stamp_spec_hashes(symbols_event_data: dict[str, Any]) -> None:

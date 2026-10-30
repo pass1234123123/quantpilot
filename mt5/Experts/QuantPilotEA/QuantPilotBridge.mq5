@@ -9,6 +9,8 @@
 //|   - sends open-position snapshots (doc 12.2 projection, read-only)|
 //|   - sends pending-order snapshots (doc 12.2 orders projection)   |
 //|   - sends account history deals incrementally (read-only)        |
+//|   - polls the cloud-side account config every 60s and LOGS it    |
+//|     (informational only - it is never applied, OBSERVE_ONLY)     |
 //|   - sends a shutdown note on removal                             |
 //|                                                                   |
 //| What it MUST NOT contain (PRD 21.3):                             |
@@ -21,17 +23,18 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.1.0"
+#define QP_EA_VERSION        "1.2.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
 #define QP_DEALS_PER_BATCH   200
 #define QP_DEALS_REFRESH_SEC 60    // incremental history-deal poll
+#define QP_CONFIG_REFRESH_SEC 60   // config poll (informational only)
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
@@ -48,6 +51,7 @@ string   g_terminal_json    = "";
 datetime g_last_specs_at   = 0;
 datetime g_last_deal_time  = 0;    // max deal time already reported (0 = full backfill)
 datetime g_last_deals_at   = 0;    // when the deals channel last succeeded
+datetime g_last_config_at  = 0;    // when the config poll last succeeded
 
 //+------------------------------------------------------------------+
 //| Logging                                                          |
@@ -160,6 +164,12 @@ bool QpIdentityChanged()
 //+------------------------------------------------------------------+
 bool QpHttpPost(const string path, const string payload)
   {
+   string response_body;
+   return(QpHttpPost(path, payload, response_body));
+  }
+
+bool QpHttpPost(const string path, const string payload, string &response_body)
+  {
    string url     = AgentEndpoint + path;
    string headers = "Content-Type: application/json\r\n" +
                     "X-QP-Token: " + AgentToken + "\r\n";
@@ -186,6 +196,7 @@ bool QpHttpPost(const string path, const string payload)
       return(false);
      }
    string body = CharArrayToString(result_data, 0, ArraySize(result_data), CP_UTF8);
+   response_body = body;
    if(StringFind(body, "\"ok\":true") < 0 && StringFind(body, "\"ok\": true") < 0)
      {
       QpLog("ERROR", "agent rejected " + path + ": " + body);
@@ -517,6 +528,29 @@ bool QpSendOrders()
   }
 
 //+------------------------------------------------------------------+
+//| Cloud config poll (informational only, PRD 21.3 OBSERVE_ONLY).   |
+//| The agent resolves this identity to the account config in the    |
+//| cloud and relays it back. The EA only LOGS the response - it is   |
+//| never applied to any behavior; this build contains no trading    |
+//| logic whatsoever.                                                 |
+//+------------------------------------------------------------------+
+bool QpSendConfigPoll()
+  {
+   QpJsonObject o;
+   o.Clear();
+   o.AddStr("ea_version", QP_EA_VERSION);
+   o.AddRaw("terminal", g_terminal_json);
+   o.AddRaw("account", QpAccountJson());
+   o.AddStr("observed_at", QpIsoNow());
+   string body = "";
+   if(!QpHttpPost("/ea/v1/config", o.Dump(), body))
+      return(false);
+   // OBSERVE_ONLY: informational log only; nothing here influences trading
+   QpLog("INFO", "config poll: " + (StringLen(body) > 0 ? body : "(empty response)"));
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| Symbol specs (PRD 5.4) in batches                                |
 //+------------------------------------------------------------------+
 bool QpSendSymbolSpecs()
@@ -708,6 +742,13 @@ void OnTimer()
      {
       if(QpSendDeals())
          g_last_deals_at = TimeGMT();
+     }
+
+   // cloud config poll (informational only, never applied - PRD 21.3)
+   if(g_last_config_at == 0 || TimeGMT() - g_last_config_at >= QP_CONFIG_REFRESH_SEC)
+     {
+      if(QpSendConfigPoll())
+         g_last_config_at = TimeGMT();
      }
   }
 //+------------------------------------------------------------------+

@@ -269,6 +269,23 @@ def main() -> int:
     if not empty:
         failures += 1
 
+    # 11. config poll: agent must resolve the identity and relay a config
+    r = client.post(
+        AGENT + "/ea/v1/config",
+        json={"ea_version": "1.0.0", "terminal": terminal(), "account": account(), "observed_at": iso_now()},
+        headers=HEADERS,
+    )
+    cfg_ok = False
+    resolved = version = None
+    if r.status_code == 200:
+        body = r.json()
+        cfg_ok = body.get("ok") is True and isinstance(body.get("config"), dict)
+        resolved = body.get("resolved")
+        version = body.get("version")
+    print(f"[config] agent lookup: {'OK' if cfg_ok else 'FAIL'} resolved={resolved} version={version}")
+    if not cfg_ok:
+        failures += 1
+
     print(f"\nagent-side failures: {failures}")
     return failures
 
