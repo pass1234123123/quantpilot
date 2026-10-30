@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
+import { num } from '../../api'
 
 const store = useDashboardStore()
 const account = computed(() => store.selectedAccount)
@@ -19,10 +20,36 @@ const onOff = (v: boolean | undefined) => (v === undefined ? '—' : v ? '开启
 const newsFilter = computed(() => config.value?.config.filters.news_filter)
 const highImpactOnly = computed(() => config.value?.config.filters.high_impact_only)
 
-// 点差与滑点配置状态；点差行情观测：云端按设计不持久化逐跳行情
-// （writers 将 spread/bid/ask 排除在 spec_json 外），故诚实标注待接入
+// 点差与滑点配置状态
 const maxSpread = computed(() => config.value?.config.filters.max_spread)
 const slippageGuard = computed(() => config.value?.config.filters.slippage_guard)
+
+// 品种点差观测：EA 每小时 spec 刷新时上报 spread/bid/ask，
+// 云端 symbol_quotes 仅保留每品种最新一次观测（不存逐跳行情）
+const spreadSummary = computed(() => {
+  const rows = store.symbols.filter((s) => s.spread_points !== null)
+  if (!rows.length) return null
+  const pts = rows.map((s) => s.spread_points as number)
+  let at = ''
+  for (const s of rows) {
+    if (s.quote_observed_at && s.quote_observed_at > at) at = s.quote_observed_at
+  }
+  return {
+    min: Math.min(...pts),
+    max: Math.max(...pts),
+    count: rows.length,
+    at: at ? new Date(at).toLocaleTimeString('zh-CN', { hour12: false }) : '',
+  }
+})
+
+// 累计佣金：performance 统计（deals 投影 SUM(commission)，真实经纪商数据）
+const commissionNum = computed(() => num(store.performance?.stats.total_commission ?? null))
+const commissionText = computed(() =>
+  commissionNum.value === null
+    ? null
+    : commissionNum.value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+)
+const currency = computed(() => snap.value?.currency ?? '')
 </script>
 
 <template>
@@ -44,17 +71,26 @@ const slippageGuard = computed(() => config.value?.config.filters.slippage_guard
       </div>
     </div>
 
-    <!-- 点差与佣金（配置 + EA 上报观测） -->
+    <!-- 点差与佣金（配置 + EA 上报点差观测 + deals 佣金统计） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
         点差与佣金
-        <span class="qp-live-badge">配置真实</span>
+        <span class="qp-live-badge">配置+观测真实</span>
       </div>
       <div class="bc__rows">
         <div class="bc__row"><span>最大点差过滤</span><b :class="maxSpread ? 'qp-up' : 'qp-dim'">{{ onOff(maxSpread) }}</b></div>
         <div class="bc__row"><span>滑点保护</span><b :class="slippageGuard ? 'qp-up' : 'qp-dim'">{{ onOff(slippageGuard) }}</b></div>
-        <div class="bc__row"><span>品种点差观测</span><b class="qp-dim">数据源待接入</b></div>
-        <div class="bc__row"><span>佣金数据</span><b class="qp-dim">数据源待接入</b></div>
+        <div class="bc__row">
+          <span>品种点差观测</span>
+          <b v-if="spreadSummary" class="qp-up">{{ spreadSummary.min }}–{{ spreadSummary.max }} 点 · {{ spreadSummary.count }} 品种</b>
+          <b v-else class="qp-dim">待上报（EA 每小时刷新）</b>
+        </div>
+        <div class="bc__row">
+          <span>累计佣金</span>
+          <b v-if="commissionText !== null" :class="commissionNum !== null && commissionNum < 0 ? 'qp-down' : 'qp-up'">{{ commissionText }} {{ currency }}</b>
+          <b v-else class="qp-dim">待统计</b>
+        </div>
+        <div v-if="spreadSummary?.at" class="bc__row bc__row--note"><span>点差观测时间</span><b class="qp-dim">{{ spreadSummary.at }}</b></div>
       </div>
     </div>
 

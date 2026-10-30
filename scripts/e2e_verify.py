@@ -34,6 +34,7 @@ TABLES = [
     "symbols",
     "broker_symbols",
     "symbol_specs",
+    "symbol_quotes",
     "positions",
     "deals",
     "orders",
@@ -101,7 +102,7 @@ def main() -> int:
     check("api.symbols", len(syms_data) >= 1, f"count={len(syms_data)}")
     for srow in syms_data[:5]:
         print(f"       symbol: {srow.get('broker_symbol')} canonical={srow.get('canonical_instrument')} "
-              f"spec_hash={str(srow.get('spec_hash'))[:16]}...")
+              f"spread={srow.get('spread_points')}pt @{str(srow.get('quote_observed_at'))[:19]}")
 
     poses = client.get(f"{API}/api/v1/accounts/{account_id}/positions")
     poses_data = poses.json().get("data", [])
@@ -116,6 +117,18 @@ def main() -> int:
     check("sim.account_present", sim is not None)
     if sim:
         sim_id = sim["account_id"]
+        # symbol_quotes projection: distinct non-zero spreads from sim_ea
+        ssyms = client.get(f"{API}/api/v1/accounts/{sim_id}/symbols")
+        ssyms_data = ssyms.json().get("data", [])
+        expected = {"EURUSD": 12, "GBPUSD": 15, "XAUUSD": 25}
+        got = {s.get("broker_symbol"): s.get("spread_points") for s in ssyms_data}
+        spread_ok = all(got.get(n) == p for n, p in expected.items())
+        quoted_at = all(s.get("quote_observed_at") for s in ssyms_data if s.get("broker_symbol") in expected)
+        check("api.symbols_spread", spread_ok and quoted_at, f"spreads={got}")
+        for srow in [s for s in ssyms_data if s.get("broker_symbol") in expected][:3]:
+            print(f"       quote: {srow.get('broker_symbol')} spread={srow.get('spread_points')}pt "
+                  f"bid={srow.get('bid')} ask={srow.get('ask')} @{str(srow.get('quote_observed_at'))[:19]}")
+
         deals = client.get(f"{API}/api/v1/accounts/{sim_id}/deals")
         deals_data = deals.json().get("data", [])
         check("api.deals", deals.status_code == 200 and len(deals_data) >= 2,

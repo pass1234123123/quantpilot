@@ -55,7 +55,7 @@ def account() -> dict:
     }
 
 
-def symbol(name: str) -> dict:
+def symbol(name: str, spread: int, bid: str, ask: str, digits: int = 5) -> dict:
     return {
         "broker_symbol": name,
         "visible": True,
@@ -64,7 +64,7 @@ def symbol(name: str) -> dict:
         "trade_mode_raw": 4,
         "filling_modes": ["FOK", "IOC"],
         "calc_mode": "CALC_MODE_0",
-        "digits": 5,
+        "digits": digits,
         "point": "0.00001000",
         "volume_min": "0.01000000",
         "volume_max": "100.00000000",
@@ -78,10 +78,19 @@ def symbol(name: str) -> dict:
         "currency_base": "EUR",
         "currency_profit": "USD",
         "currency_margin": "USD",
-        "spread": 12,
-        "bid": "1.08123",
-        "ask": "1.08135",
+        "spread": spread,
+        "bid": bid,
+        "ask": ask,
     }
+
+
+def sim_symbols() -> list[dict]:
+    """Distinct non-zero spreads so the symbol_quotes projection is verifiable."""
+    return [
+        symbol("EURUSD", 12, "1.08123000", "1.08135000"),
+        symbol("GBPUSD", 15, "1.27123000", "1.27138000"),
+        symbol("XAUUSD", 25, "2712.34000", "2712.59000", digits=2),
+    ]
 
 
 def main() -> int:
@@ -136,7 +145,7 @@ def main() -> int:
             "account": account(),
             "batch_index": 0,
             "batch_total": 1,
-            "symbols": [symbol("EURUSD"), symbol("GBPUSD"), symbol("XAUUSD")],
+            "symbols": sim_symbols(),
             "observed_at": iso_now(),
         },
     )

@@ -84,6 +84,11 @@ export interface SymbolRow {
   canonical_instrument: string
   spec_hash: string | null
   observed_at: string | null
+  /** 最新点差观测（EA 每小时 spec 刷新时上报，云端仅存最新值） */
+  spread_points: number | null
+  bid: string | null
+  ask: string | null
+  quote_observed_at: string | null
 }
 
 export interface PositionRow {

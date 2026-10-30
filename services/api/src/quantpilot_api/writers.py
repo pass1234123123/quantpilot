@@ -352,6 +352,32 @@ def handle_symbols(data: dict[str, Any]) -> None:
                 ),
             ).fetchone()
             assert row is not None
+            # latest spread observation per (account, symbol): upsert only, no
+            # quote history (doc 4.4 - the cloud keeps no tick-by-tick data).
+            # The observed_at guard keeps out-of-order redeliveries idempotent.
+            connection.execute(
+                """
+                INSERT INTO symbol_quotes
+                       (account_id, broker_symbol, spread_points, bid, ask, observed_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (account_id, broker_symbol) DO UPDATE
+                   SET spread_points = EXCLUDED.spread_points,
+                       bid            = EXCLUDED.bid,
+                       ask            = EXCLUDED.ask,
+                       observed_at    = EXCLUDED.observed_at,
+                       updated_at     = now()
+                 WHERE symbol_quotes.observed_at IS NULL
+                    OR symbol_quotes.observed_at <= EXCLUDED.observed_at
+                """,
+                (
+                    _uuid(account_id),
+                    name,
+                    _int(sym.get("spread")) or 0,
+                    _dec(sym.get("bid")),
+                    _dec(sym.get("ask")),
+                    observed_at,
+                ),
+            )
             spec_hash = sym.get("spec_hash")
             if spec_hash:
                 spec_json = {

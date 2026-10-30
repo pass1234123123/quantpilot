@@ -384,7 +384,8 @@ def account_symbols(account_id: str, request: Request) -> JSONResponse:
         SELECT bs.id::text AS broker_symbol_id, bs.broker_symbol,
                bs.enabled, bs.visible, bs.selected, bs.tradable,
                cs.canonical_instrument,
-               sp.spec_hash, sp.observed_at
+               sp.spec_hash, sp.observed_at,
+               q.spread_points, q.bid, q.ask, q.observed_at AS quote_observed_at
           FROM broker_symbols bs
           JOIN symbols cs ON cs.id = bs.canonical_symbol_id
      LEFT JOIN LATERAL (
@@ -392,6 +393,10 @@ def account_symbols(account_id: str, request: Request) -> JSONResponse:
                  WHERE broker_symbol_id = bs.id
                  ORDER BY observed_at DESC LIMIT 1
               ) sp ON true
+     LEFT JOIN LATERAL (
+                SELECT spread_points, bid, ask, observed_at FROM symbol_quotes
+                 WHERE account_id = bs.account_id AND broker_symbol = bs.broker_symbol
+              ) q ON true
          WHERE bs.account_id = %s
          ORDER BY bs.broker_symbol
         """,
