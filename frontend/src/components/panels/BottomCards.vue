@@ -10,85 +10,87 @@ const snap = computed(() => store.snapshot)
 const allOperational = computed(
   () => !!snap.value?.connected && !!snap.value?.trade_allowed && !!snap.value?.expert_allowed,
 )
+
+const yesNo = (v: boolean | undefined) => (v ? '是' : '否')
 </script>
 
 <template>
   <div class="bc">
-    <!-- News Filter（示例数据） -->
+    <!-- 新闻过滤（示例数据） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
-        News Filter
+        新闻过滤
         <span class="qp-sample-badge">示例数据</span>
       </div>
       <div class="bc__news">
-        <div class="bc__news-row"><span>High Impact News</span><b>Blocked</b></div>
-        <div class="bc__news-row"><span>Impact Level</span><b>High</b></div>
+        <div class="bc__news-row"><span>高影响新闻</span><b>已屏蔽</b></div>
+        <div class="bc__news-row"><span>影响级别</span><b>高</b></div>
         <div class="bc__countdown">
-          <div class="bc__countdown-label">NEXT NEWS</div>
+          <div class="bc__countdown-label">下一条新闻</div>
           <div class="bc__countdown-time">03:59:16</div>
-          <div class="bc__countdown-name">US Non-Farm Payrolls</div>
+          <div class="bc__countdown-name">美国非农就业数据</div>
         </div>
       </div>
     </div>
 
-    <!-- Spread & Commission（示例数据） -->
+    <!-- 点差与佣金（示例数据） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
-        Spread &amp; Commission
+        点差与佣金
         <span class="qp-sample-badge">示例数据</span>
       </div>
       <div class="bc__rows">
-        <div class="bc__row"><span>Max Spread</span><b>30 pts</b></div>
-        <div class="bc__row"><span>Commission Limit</span><b>$7.0/lot</b></div>
-        <div class="bc__row"><span>Slippage Guard</span><b class="qp-up">On</b></div>
-        <div class="bc__row"><span>Swap Filter</span><b class="qp-dim">Off</b></div>
+        <div class="bc__row"><span>最大点差</span><b>30 点</b></div>
+        <div class="bc__row"><span>佣金上限</span><b>$7.0/手</b></div>
+        <div class="bc__row"><span>滑点保护</span><b class="qp-up">开启</b></div>
+        <div class="bc__row"><span>库存费过滤</span><b class="qp-dim">关闭</b></div>
       </div>
     </div>
 
-    <!-- Permission Signal（真实数据） -->
+    <!-- 权限信号（真实数据） -->
     <div class="qp-panel bc__card bc__card--signal">
       <div class="qp-panel__title">
-        Permission Signal
+        权限信号
         <span class="qp-live-badge">真实数据</span>
       </div>
       <div class="bc__shield" :class="{ 'is-ok': allOperational }">
         <div class="bc__shield-icon">🛡</div>
         <div class="bc__shield-text">
-          {{ allOperational ? 'ALL SYSTEMS OPERATIONAL' : 'PERMISSION INCOMPLETE' }}
+          {{ allOperational ? '全系统正常运行' : '权限不完整' }}
         </div>
       </div>
       <div class="bc__rows">
-        <div class="bc__row"><span>Connected</span><b :class="snap?.connected ? 'qp-up' : 'qp-down'">{{ snap?.connected ? 'Yes' : 'No' }}</b></div>
-        <div class="bc__row"><span>Trade Allowed</span><b :class="snap?.trade_allowed ? 'qp-up' : 'qp-down'">{{ snap?.trade_allowed ? 'Yes' : 'No' }}</b></div>
-        <div class="bc__row"><span>Expert Allowed</span><b :class="snap?.expert_allowed ? 'qp-up' : 'qp-down'">{{ snap?.expert_allowed ? 'Yes' : 'No' }}</b></div>
+        <div class="bc__row"><span>已连接</span><b :class="snap?.connected ? 'qp-up' : 'qp-down'">{{ yesNo(snap?.connected) }}</b></div>
+        <div class="bc__row"><span>允许交易</span><b :class="snap?.trade_allowed ? 'qp-up' : 'qp-down'">{{ yesNo(snap?.trade_allowed) }}</b></div>
+        <div class="bc__row"><span>允许 EA</span><b :class="snap?.expert_allowed ? 'qp-up' : 'qp-down'">{{ yesNo(snap?.expert_allowed) }}</b></div>
       </div>
     </div>
 
-    <!-- Trading Status（真实数据） -->
+    <!-- 交易状态（真实数据） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
-        Trading Status
+        交易状态
         <span class="qp-live-badge">真实数据</span>
       </div>
       <div class="bc__rows">
-        <div class="bc__row"><span>Account Status</span><b class="qp-warn">{{ account?.status || '—' }}</b></div>
-        <div class="bc__row"><span>Open Positions</span><b>{{ snap?.open_positions ?? '—' }}</b></div>
-        <div class="bc__row"><span>EA Version</span><b>{{ snap?.ea_version || '—' }}</b></div>
-        <div class="bc__row"><span>Terminal</span><b>{{ snap?.terminal_version || '—' }}</b></div>
+        <div class="bc__row"><span>账户状态</span><b class="qp-warn">{{ account?.status || '—' }}</b></div>
+        <div class="bc__row"><span>持仓数量</span><b>{{ snap?.open_positions ?? '—' }}</b></div>
+        <div class="bc__row"><span>EA 版本</span><b>{{ snap?.ea_version || '—' }}</b></div>
+        <div class="bc__row"><span>终端版本</span><b>{{ snap?.terminal_version || '—' }}</b></div>
       </div>
     </div>
 
-    <!-- Account Info（真实数据） -->
+    <!-- 账户信息（真实数据） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
-        Account Info
+        账户信息
         <span class="qp-live-badge">真实数据</span>
       </div>
       <div class="bc__rows">
-        <div class="bc__row"><span>Account Mode</span><b>{{ account?.account_mode || '—' }}</b></div>
-        <div class="bc__row"><span>Leverage</span><b>1:{{ account?.leverage ?? '—' }}</b></div>
-        <div class="bc__row"><span>Broker</span><b class="bc__ellip">{{ account?.company || account?.server || '—' }}</b></div>
-        <div class="bc__row"><span>Login</span><b>{{ account?.login_ref || '—' }}</b></div>
+        <div class="bc__row"><span>账户模式</span><b>{{ account?.account_mode || '—' }}</b></div>
+        <div class="bc__row"><span>杠杆</span><b>1:{{ account?.leverage ?? '—' }}</b></div>
+        <div class="bc__row"><span>经纪商</span><b class="bc__ellip">{{ account?.company || account?.server || '—' }}</b></div>
+        <div class="bc__row"><span>账号</span><b>{{ account?.login_ref || '—' }}</b></div>
       </div>
     </div>
   </div>

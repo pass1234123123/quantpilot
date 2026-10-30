@@ -1,25 +1,25 @@
 <script setup lang="ts">
 // 示例数据：绩效统计需交易成交数据，本切片（OBSERVE_ONLY）尚无成交
 const stats = [
-  { label: 'Total Trades', value: '128' },
-  { label: 'Win Rate', value: '67.19%' },
-  { label: 'Profit Factor', value: '2.31' },
-  { label: 'Recovery Factor', value: '3.85' },
-  { label: 'Expectancy', value: '18.74 USD' },
-  { label: 'Max Drawdown', value: '18.45%', tone: 'down', extra: '-$565.20' },
-  { label: 'Average Profit', value: '45.32 USD' },
-  { label: 'Average Loss', value: '21.85 USD' },
-  { label: 'Consecutive Wins', value: '7', tone: 'up' },
-  { label: 'Consecutive Losses', value: '2', tone: 'down' },
-  { label: 'Open Trades', value: '4' },
-  { label: 'Best Trade', value: '+$128.40', tone: 'up' },
+  { label: '总交易次数', value: '128' },
+  { label: '胜率', value: '67.19%' },
+  { label: '利润因子', value: '2.31' },
+  { label: '恢复因子', value: '3.85' },
+  { label: '期望值', value: '18.74 USD' },
+  { label: '最大回撤', value: '18.45%', tone: 'down', extra: '-$565.20' },
+  { label: '平均盈利', value: '45.32 USD' },
+  { label: '平均亏损', value: '21.85 USD' },
+  { label: '连胜次数', value: '7', tone: 'up' },
+  { label: '连亏次数', value: '2', tone: 'down' },
+  { label: '未平仓订单', value: '4' },
+  { label: '最佳交易', value: '+$128.40', tone: 'up' },
 ]
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      Performance Info
+      绩效信息
       <span class="qp-sample-badge">示例数据</span>
     </div>
     <div class="perf-grid">

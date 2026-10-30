@@ -1,28 +1,28 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-const tab = ref('Today')
-const tabs = ['Today', 'Week', 'Month', 'Custom']
+const tab = ref('今日')
+const tabs = ['今日', '本周', '本月', '自定义']
 
 // 示例数据：盈利统计需成交数据，本切片（OBSERVE_ONLY）尚无成交
 const rows = [
-  { label: 'Today Profit', value: '+$285.75', pct: '+3.72%', up: true },
-  { label: 'Weekly Profit', value: '+$1,256.30', pct: '+13.92%', up: true },
-  { label: 'Monthly Profit', value: '+$3,875.60', pct: '+42.38%', up: true },
-  { label: 'Net Profit', value: '+$7,650.25', pct: '', up: true },
-  { label: 'Last Trade Result', value: '+$68.40', pct: '', up: true },
+  { label: '今日盈利', value: '+$285.75', pct: '+3.72%', up: true },
+  { label: '本周盈利', value: '+$1,256.30', pct: '+13.92%', up: true },
+  { label: '本月盈利', value: '+$3,875.60', pct: '+42.38%', up: true },
+  { label: '净利润', value: '+$7,650.25', pct: '', up: true },
+  { label: '最后一笔结果', value: '+$68.40', pct: '', up: true },
 ]
 const meta = [
-  { label: 'Session', value: 'New York' },
-  { label: 'Consecutive Wins', value: '7' },
-  { label: 'Consecutive Losses', value: '2' },
+  { label: '交易时段', value: '纽约' },
+  { label: '连胜次数', value: '7' },
+  { label: '连亏次数', value: '2' },
 ]
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      Profit Monitor
+      盈亏监控
       <span class="qp-sample-badge">示例数据</span>
     </div>
 

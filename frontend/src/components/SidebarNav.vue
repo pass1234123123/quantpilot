@@ -6,27 +6,27 @@ import { num } from '../api'
 const store = useDashboardStore()
 
 const navItems = [
-  'Dashboard',
-  'Performance',
-  'Risk Management',
-  'Filtering Settings',
-  'Expert Settings',
-  'Trade Journal',
-  'News Filter',
-  'Market Watch',
-  'Alerts',
-  'Settings',
-  'Help & Support',
+  '仪表盘',
+  '绩效',
+  '风险管理',
+  '过滤设置',
+  'EA 设置',
+  '交易日志',
+  '新闻过滤',
+  '行情监控',
+  '告警',
+  '设置',
+  '帮助与支持',
 ]
 
-const active = 'Dashboard'
+const active = '仪表盘'
 
 const systemHealth = computed(() => (store.apiHealthy ? 100 : 0))
-const dataFeed = computed(() => (store.apiHealthy ? 'Stable' : 'Down'))
+const dataFeed = computed(() => (store.apiHealthy ? '正常' : '中断'))
 const brokerConnection = computed(() =>
-  store.snapshot?.connected ? 'Established' : 'Unknown',
+  store.snapshot?.connected ? '已建立' : '未知',
 )
-const eaStatus = computed(() => (store.snapshot?.expert_allowed ? 'Running' : 'Off'))
+const eaStatus = computed(() => (store.snapshot?.expert_allowed ? '运行中' : '停止'))
 const lastUpdate = computed(() => store.snapshot?.captured_at ?? store.lastRefreshAt)
 const openPositions = computed(() => store.snapshot?.open_positions ?? 0)
 const freeMargin = computed(() => num(store.snapshot?.free_margin))
@@ -38,7 +38,7 @@ const freeMargin = computed(() => num(store.snapshot?.free_margin))
       <div class="sidebar__logo">Q</div>
       <div>
         <div class="sidebar__brand-name">QUANTPILOT</div>
-        <div class="sidebar__brand-sub">AI TRADING SYSTEM</div>
+        <div class="sidebar__brand-sub">AI 智能交易系统</div>
       </div>
     </div>
 
@@ -55,21 +55,21 @@ const freeMargin = computed(() => num(store.snapshot?.free_margin))
     </nav>
 
     <div class="sidebar__status">
-      <div class="sidebar__status-title">SYSTEM STATUS</div>
+      <div class="sidebar__status-title">系统状态</div>
       <div class="sidebar__health">
         <div class="sidebar__ring" :class="{ 'is-ok': systemHealth === 100 }">
           {{ systemHealth }}%
         </div>
-        <div class="sidebar__health-label">System Health</div>
+        <div class="sidebar__health-label">系统健康度</div>
       </div>
-      <div class="sidebar__status-row"><span>Data Feed</span><b>{{ dataFeed }}</b></div>
+      <div class="sidebar__status-row"><span>数据源</span><b>{{ dataFeed }}</b></div>
       <div class="sidebar__status-row">
-        <span>Broker Connection</span><b>{{ brokerConnection }}</b>
+        <span>券商连接</span><b>{{ brokerConnection }}</b>
       </div>
-      <div class="sidebar__status-row"><span>EA Status</span><b>{{ eaStatus }}</b></div>
-      <div class="sidebar__status-row"><span>Open Positions</span><b>{{ openPositions }}</b></div>
-      <div class="sidebar__status-row"><span>Free Margin</span><b>{{ freeMargin ?? '—' }}</b></div>
-      <div class="sidebar__status-row"><span>Last Update</span><b>{{ lastUpdate || '—' }}</b></div>
+      <div class="sidebar__status-row"><span>EA 状态</span><b>{{ eaStatus }}</b></div>
+      <div class="sidebar__status-row"><span>持仓数量</span><b>{{ openPositions }}</b></div>
+      <div class="sidebar__status-row"><span>可用保证金</span><b>{{ freeMargin ?? '—' }}</b></div>
+      <div class="sidebar__status-row"><span>最后更新</span><b>{{ lastUpdate || '—' }}</b></div>
     </div>
   </aside>
 </template>

@@ -11,30 +11,30 @@ const switches = ref({
   weekendBlock: false,
 })
 const limits = [
-  { label: 'Max Orders Per Day', value: '10' },
-  { label: 'Max Open Positions', value: '5' },
-  { label: 'Trade Direction', value: 'Both' },
-  { label: 'Allowed Symbols', value: '28' },
-  { label: 'Blocked Symbols', value: '3' },
+  { label: '每日最大订单数', value: '10' },
+  { label: '最大持仓数', value: '5' },
+  { label: '交易方向', value: '双向' },
+  { label: '允许品种数', value: '28' },
+  { label: '屏蔽品种数', value: '3' },
 ]
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      Filtering Settings
+      过滤设置
       <span class="qp-sample-badge">示例数据</span>
     </div>
 
-    <div class="fs__section">Environmental Filters</div>
+    <div class="fs__section">环境过滤器</div>
     <div class="fs__switches">
       <div v-for="(_on, key) in switches" :key="key" class="fs__switch">
-        <span>{{ { newsFilter: 'News', highImpactOnly: 'High Impact', sessionFilter: 'Session', maxSpread: 'Max Spread', slippageGuard: 'Slippage Guard', weekendBlock: 'Weekend Block' }[key] }}</span>
+        <span>{{ { newsFilter: '新闻', highImpactOnly: '高影响事件', sessionFilter: '交易时段', maxSpread: '最大点差', slippageGuard: '滑点保护', weekendBlock: '周末禁交易' }[key] }}</span>
         <el-switch v-model="switches[key as keyof typeof switches]" size="small" />
       </div>
     </div>
 
-    <div class="fs__section">Operational Limits</div>
+    <div class="fs__section">操作限额</div>
     <div class="qp-rows">
       <div v-for="l in limits" :key="l.label" class="qp-row">
         <span class="qp-row__label">{{ l.label }}</span><b class="qp-row__value">{{ l.value }}</b>

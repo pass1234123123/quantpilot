@@ -32,19 +32,19 @@ const serverTime = computed(() => {
 
 const cards = computed(() => [
   {
-    label: 'Account Balance',
+    label: '账户余额',
     value: fmtMoney(snap.value?.balance),
     sub: snap.value?.currency ?? '',
     tone: '',
   },
   {
-    label: 'Equity',
+    label: '净值',
     value: fmtMoney(snap.value?.equity),
     sub: snap.value?.currency ?? '',
     tone: '',
   },
   {
-    label: 'Floating P/L',
+    label: '浮动盈亏',
     value:
       floating.value === null
         ? '—'
@@ -55,18 +55,18 @@ const cards = computed(() => [
         : `${floatingPct.value >= 0 ? '+' : ''}${floatingPct.value.toFixed(2)}%`,
     tone: (floating.value ?? 0) >= 0 ? 'up' : 'down',
   },
-  { label: 'Used Margin', value: fmtMoney(snap.value?.margin), sub: snap.value?.currency ?? '', tone: '' },
-  { label: 'Free Margin', value: fmtMoney(snap.value?.free_margin), sub: snap.value?.currency ?? '', tone: '' },
+  { label: '已用保证金', value: fmtMoney(snap.value?.margin), sub: snap.value?.currency ?? '', tone: '' },
+  { label: '可用保证金', value: fmtMoney(snap.value?.free_margin), sub: snap.value?.currency ?? '', tone: '' },
   {
-    label: 'Margin Level',
+    label: '保证金水平',
     value: marginLevel.value === null ? '—' : `${marginLevel.value.toFixed(2)}%`,
-    sub: marginLevel.value === null ? 'No Margin Used' : marginLevel.value >= 500 ? 'Safe' : marginLevel.value >= 200 ? 'Moderate' : 'Low',
+    sub: marginLevel.value === null ? '无持仓保证金' : marginLevel.value >= 500 ? '安全' : marginLevel.value >= 200 ? '中等' : '偏低',
     tone: marginLevel.value === null ? '' : marginLevel.value >= 200 ? 'up' : 'down',
   },
   {
-    label: 'Server Time',
+    label: '服务器时间',
     value: serverTime.value,
-    sub: snap.value?.connected ? 'CONNECTED' : 'OFFLINE',
+    sub: snap.value?.connected ? '已连接' : '离线',
     tone: snap.value?.connected ? 'up' : 'down',
   },
 ])

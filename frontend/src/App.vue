@@ -33,14 +33,14 @@ onBeforeUnmount(() => {
     <div class="main">
       <header class="header">
         <div class="header__title">
-          <h1>MASTER DASHBOARD</h1>
-          <span>Account Management · OBSERVE_ONLY 切片</span>
+          <h1>主仪表盘</h1>
+          <span>账户管理 · OBSERVE_ONLY 只读观察切片</span>
         </div>
         <div class="header__actions">
           <el-select
             v-if="store.accounts.length > 0"
             :model-value="store.selectedAccountId"
-            placeholder="Select Account"
+            placeholder="选择账户"
             size="small"
             style="width: 260px"
             @update:model-value="store.selectAccount($event as string)"
@@ -53,7 +53,7 @@ onBeforeUnmount(() => {
             />
           </el-select>
           <el-button size="small" :loading="store.loading" @click="store.refreshAll()">
-            Refresh
+            刷新
           </el-button>
         </div>
       </header>
@@ -84,12 +84,12 @@ onBeforeUnmount(() => {
       <BottomCards />
 
       <footer class="footer">
-        <span>QuantPilot AI · Smart Trade Ecosystem</span>
-        <span>Version 0.1.0 (Frontend Slice)</span>
+        <span>QuantPilot AI · 智能交易生态系统</span>
+        <span>版本 0.1.0（前端切片）</span>
         <span class="footer__status" :class="store.apiHealthy ? 'is-ok' : 'is-bad'">
-          {{ store.apiHealthy ? 'All Systems Operational' : 'API Offline' }}
+          {{ store.apiHealthy ? '全系统正常运行' : 'API 离线' }}
         </span>
-        <span class="footer__time">Last Refresh: {{ store.lastRefreshAt || '—' }}</span>
+        <span class="footer__time">最后刷新：{{ store.lastRefreshAt || '—' }}</span>
       </footer>
     </div>
   </div>

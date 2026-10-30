@@ -1,17 +1,17 @@
 <script setup lang="ts">
 // 示例数据：盈亏柱状图需成交数据，本切片（OBSERVE_ONLY）尚无成交
 const bars = [
-  { m: '20 May', profit: 900, loss: 200 },
-  { m: '05 Jun', profit: 1250, loss: 350 },
-  { m: '20 Jun', profit: 700, loss: 600 },
-  { m: '05 Jul', profit: 1600, loss: 150 },
-  { m: '20 Jul', profit: 1100, loss: 420 },
-  { m: '05 Aug', profit: 1850, loss: 280 },
-  { m: '20 Aug', profit: 600, loss: 750 },
-  { m: '05 Sep', profit: 1400, loss: 190 },
-  { m: '20 Sep', profit: 1700, loss: 330 },
-  { m: '05 Oct', profit: 1000, loss: 520 },
-  { m: '20 Oct', profit: 1950, loss: 110 },
+  { m: '5/20', profit: 900, loss: 200 },
+  { m: '6/5', profit: 1250, loss: 350 },
+  { m: '6/20', profit: 700, loss: 600 },
+  { m: '7/5', profit: 1600, loss: 150 },
+  { m: '7/20', profit: 1100, loss: 420 },
+  { m: '8/5', profit: 1850, loss: 280 },
+  { m: '8/20', profit: 600, loss: 750 },
+  { m: '9/5', profit: 1400, loss: 190 },
+  { m: '9/20', profit: 1700, loss: 330 },
+  { m: '10/5', profit: 1000, loss: 520 },
+  { m: '10/20', profit: 1950, loss: 110 },
 ]
 const maxAbs = Math.max(...bars.flatMap((b) => [b.profit, b.loss]))
 </script>
@@ -19,7 +19,7 @@ const maxAbs = Math.max(...bars.flatMap((b) => [b.profit, b.loss]))
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      Profit Monitor (Summary)
+      盈亏汇总
       <span class="qp-sample-badge">示例数据</span>
     </div>
 
@@ -37,8 +37,8 @@ const maxAbs = Math.max(...bars.flatMap((b) => [b.profit, b.loss]))
     </div>
 
     <div class="ps__legend">
-      <span><i class="ps__dot ps__dot--profit" />Profit (USD)</span>
-      <span><i class="ps__dot ps__dot--loss" />Loss (USD)</span>
+      <span><i class="ps__dot ps__dot--profit" />盈利 (USD)</span>
+      <span><i class="ps__dot ps__dot--loss" />亏损 (USD)</span>
     </div>
   </div>
 </template>

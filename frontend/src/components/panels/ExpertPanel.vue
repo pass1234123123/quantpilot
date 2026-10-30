@@ -10,24 +10,24 @@ const switches = ref({
   closeOnOpposite: true,
 })
 const params = [
-  { label: 'Magic Number', value: '123456' },
-  { label: 'Trade Comment', value: 'QuantPilot' },
-  { label: 'Slippage', value: '10' },
-  { label: 'Trade Direction', value: 'Both' },
-  { label: 'Max Open Positions', value: '5' },
+  { label: '魔术号', value: '123456' },
+  { label: '订单注释', value: 'QuantPilot' },
+  { label: '滑点', value: '10' },
+  { label: '交易方向', value: '双向' },
+  { label: '最大持仓数', value: '5' },
 ]
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      Expert Settings
+      EA 设置
       <span class="qp-sample-badge">示例数据</span>
     </div>
 
     <div class="es__switches">
       <div v-for="(_on, key) in switches" :key="key" class="es__switch">
-        <span>{{ { autoTrading: 'Auto Trading', soundAlert: 'Sound Alert', popupAlert: 'Popup Alert', notificationAlert: 'Notification Alert', closeOnOpposite: 'Close On Opposite' }[key] }}</span>
+        <span>{{ { autoTrading: '自动交易', soundAlert: '声音提醒', popupAlert: '弹窗提醒', notificationAlert: '通知提醒', closeOnOpposite: '反向信号平仓' }[key] }}</span>
         <el-switch v-model="switches[key as keyof typeof switches]" size="small" />
       </div>
     </div>

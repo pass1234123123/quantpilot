@@ -1,28 +1,28 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-const riskMode = ref('% of Balance')
-const modes = ['% of Balance', '% of Equity', 'Fixed Lot Size']
+const riskMode = ref('按余额百分比')
+const modes = ['按余额百分比', '按净值百分比', '固定手数']
 
 // 示例数据：风控规则尚未接入后端（OBSERVE_ONLY 切片无交易执行）
 const gaugePercent = 0.85
 const gaugeAngle = 180 * (1 - Math.min(gaugePercent / 5, 1)) // 0..5% mapped to semicircle
 
 const riskRows = [
-  { label: 'Total Risk', value: '0.85%', status: 'ok' },
-  { label: 'Risk Per Trade', value: '1.00%', status: 'ok' },
-  { label: 'Max Daily Loss', value: '5.00%', status: 'ok' },
-  { label: 'Max Drawdown', value: '10.00%', status: 'ok' },
-  { label: 'Max Open Positions', value: '5', status: 'ok' },
-  { label: 'Max Spread', value: '30 pts', status: 'ok' },
-  { label: 'News Block', value: 'Enabled', status: 'warn' },
+  { label: '总风险', value: '0.85%', status: 'ok' },
+  { label: '单笔风险', value: '1.00%', status: 'ok' },
+  { label: '单日最大亏损', value: '5.00%', status: 'ok' },
+  { label: '最大回撤', value: '10.00%', status: 'ok' },
+  { label: '最大持仓数', value: '5', status: 'ok' },
+  { label: '最大点差', value: '30 点', status: 'ok' },
+  { label: '新闻屏蔽', value: '已启用', status: 'warn' },
 ]
 </script>
 
 <template>
   <div class="qp-panel risk">
     <div class="qp-panel__title">
-      Risk Management &amp; Status
+      风险管理与状态
       <span class="qp-sample-badge">示例数据</span>
     </div>
 
@@ -39,9 +39,9 @@ const riskRows = [
     </div>
 
     <div class="risk__params qp-rows">
-      <div class="qp-row"><span class="qp-row__label">Risk %</span><b class="qp-row__value">1.00</b></div>
-      <div class="qp-row"><span class="qp-row__label">Lot Size</span><b class="qp-row__value">0.10</b></div>
-      <div class="qp-row"><span class="qp-row__label">Max Per Trade</span><b class="qp-row__value">100.00</b></div>
+      <div class="qp-row"><span class="qp-row__label">风险比例</span><b class="qp-row__value">1.00</b></div>
+      <div class="qp-row"><span class="qp-row__label">手数</span><b class="qp-row__value">0.10</b></div>
+      <div class="qp-row"><span class="qp-row__label">单笔上限</span><b class="qp-row__value">100.00</b></div>
     </div>
 
     <div class="risk__gauge">
@@ -63,9 +63,9 @@ const riskRows = [
           :stroke-dasharray="`${(gaugeAngle / 180) * 267} 267`"
         />
         <text x="100" y="78" text-anchor="middle" class="risk__gauge-value">0.85%</text>
-        <text x="100" y="96" text-anchor="middle" class="risk__gauge-label">Total Risk</text>
+        <text x="100" y="96" text-anchor="middle" class="risk__gauge-label">总风险</text>
       </svg>
-      <div class="risk__gauge-state qp-up">LOW RISK</div>
+      <div class="risk__gauge-state qp-up">低风险</div>
     </div>
 
     <div class="qp-rows">

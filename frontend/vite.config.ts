@@ -5,6 +5,7 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [vue()],
   server: {
+    host: true, // bind all interfaces (IPv4 + IPv6); Node 17+ default resolves localhost to ::1 only
     port: 5173,
     proxy: {
       // dev proxy -> cloud API (services/api), avoids CORS

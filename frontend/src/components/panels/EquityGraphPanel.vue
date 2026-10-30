@@ -50,8 +50,8 @@ onMounted(() => {
     timeScale: { borderColor: 'rgba(148, 163, 184, 0.2)', timeVisible: true },
     autoSize: false,
   })
-  balanceSeries = chart.addSeries(LineSeries, { color: '#00b0c0', lineWidth: 2, title: 'Balance' })
-  equitySeries = chart.addSeries(LineSeries, { color: '#22c55e', lineWidth: 2, title: 'Equity' })
+  balanceSeries = chart.addSeries(LineSeries, { color: '#00b0c0', lineWidth: 2, title: '余额' })
+  equitySeries = chart.addSeries(LineSeries, { color: '#22c55e', lineWidth: 2, title: '净值' })
   render()
 })
 
@@ -68,16 +68,16 @@ onBeforeUnmount(() => {
 
 const stats = [
   // 真实数据：由快照历史计算
-  { label: 'Snapshots', key: 'count' },
-  { label: 'Since', key: 'first' },
-  { label: 'Latest Equity', key: 'last' },
+  { label: '快照数量', key: 'count' },
+  { label: '起始时间', key: 'first' },
+  { label: '最新净值', key: 'last' },
 ] as const
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      Equity &amp; Balance Graph
+      净值与余额曲线
       <span class="qp-live-badge">真实数据</span>
     </div>
 
