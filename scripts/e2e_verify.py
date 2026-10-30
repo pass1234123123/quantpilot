@@ -35,6 +35,8 @@ TABLES = [
     "broker_symbols",
     "symbol_specs",
     "positions",
+    "deals",
+    "orders",
     "system_events",
 ]
 
@@ -107,6 +109,43 @@ def main() -> int:
     for prow in poses_data[:5]:
         print(f"       position: ticket={prow.get('broker_position_ticket')} {prow.get('broker_symbol')} "
               f"{prow.get('direction')} profit={prow.get('profit')} status={prow.get('status')}")
+
+    # ---- deals / orders / performance on the sim account (deterministic) ----
+    sim = next((a for a in accounts if a.get("login_ref") == "10001234"), None)
+    check("sim.account_present", sim is not None)
+    if sim:
+        sim_id = sim["account_id"]
+        deals = client.get(f"{API}/api/v1/accounts/{sim_id}/deals")
+        deals_data = deals.json().get("data", [])
+        check("api.deals", deals.status_code == 200 and len(deals_data) >= 2,
+              f"status={deals.status_code} count={len(deals_data)}")
+        for drow in deals_data[:5]:
+            print(f"       deal: ticket={drow.get('broker_deal_ticket')} {drow.get('broker_symbol')} "
+                  f"{drow.get('direction')}/{drow.get('entry')} profit={drow.get('profit')}")
+
+        orders = client.get(f"{API}/api/v1/accounts/{sim_id}/orders")
+        orders_data = orders.json().get("data", [])
+        check("api.orders", orders.status_code == 200 and len(orders_data) >= 1,
+              f"status={orders.status_code} count={len(orders_data)}")
+        removed = [o for o in orders_data if o.get("broker_ticket") == "800001" and o.get("status") == "REMOVED"]
+        check("api.orders_state_sync", len(removed) == 1,
+              "ticket 800001 REMOVED after empty snapshot" if removed else "ticket 800001 not REMOVED")
+        for orow in orders_data[:5]:
+            print(f"       order: ticket={orow.get('broker_ticket')} {orow.get('broker_symbol')} "
+                  f"{orow.get('order_kind')} status={orow.get('status')}")
+
+        perf = client.get(f"{API}/api/v1/accounts/{sim_id}/performance")
+        perf_ok = perf.status_code == 200
+        check("api.performance", perf_ok, f"status={perf.status_code}")
+        if perf_ok:
+            pdata = perf.json()["data"]
+            stats = pdata.get("stats", {})
+            check("api.performance_stats",
+                  stats.get("closed_trades", 0) >= 1 and stats.get("all_deals", 0) >= 2,
+                  f"closed={stats.get('closed_trades')} all={stats.get('all_deals')} "
+                  f"net={stats.get('net_profit')}")
+            check("api.performance_daily", len(pdata.get("daily", [])) == 30,
+                  f"buckets={len(pdata.get('daily', []))}")
 
     # ---- 2. PostgreSQL row counts ------------------------------------------
     with psycopg.connect(PG_DSN) as conn:

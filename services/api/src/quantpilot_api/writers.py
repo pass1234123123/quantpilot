@@ -454,6 +454,130 @@ def handle_positions(data: dict[str, Any]) -> None:
             )
 
 
+def handle_deals(data: dict[str, Any]) -> None:
+    """History-deal projection (doc 12.2, incremental from the EA).
+
+    Deals are immutable broker facts: insert-only with ON CONFLICT DO NOTHING,
+    so overlapping EA windows and JetStream redelivery are naturally
+    idempotent (PRD 4.5).
+    """
+    terminal_id, account_id = _resolve(data)
+    with db.conn() as connection:
+        for deal in data.get("deals") or []:
+            ticket = str(deal.get("broker_deal_ticket", ""))
+            if not ticket:
+                continue
+            connection.execute(
+                """
+                INSERT INTO deals
+                       (account_id, broker_deal_ticket, broker_order_ticket,
+                        broker_position_ticket, broker_symbol, direction, entry,
+                        volume, price, commission, swap, profit, deal_time,
+                        magic, comment)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (account_id, broker_deal_ticket) DO NOTHING
+                """,
+                (
+                    _uuid(account_id),
+                    ticket,
+                    str(deal.get("broker_order_ticket", "")),
+                    str(deal.get("broker_position_ticket", "")),
+                    str(deal.get("broker_symbol", "")),
+                    str(deal.get("direction", "")),
+                    str(deal.get("entry", "")),
+                    _dec(deal.get("volume")),
+                    _dec(deal.get("price")),
+                    _dec(deal.get("commission")),
+                    _dec(deal.get("swap")),
+                    _dec(deal.get("profit")),
+                    _ts(deal.get("deal_time")) if deal.get("deal_time") else None,
+                    _int(deal.get("magic")),
+                    deal.get("comment") or None,
+                ),
+            )
+
+
+def handle_orders(data: dict[str, Any]) -> None:
+    """Pending-order projection, state-synced like handle_positions.
+
+    Reported tickets are upserted ACTIVE; previously ACTIVE tickets missing
+    from the snapshot are marked REMOVED (cancelled/expired/filled - the
+    matching deal, if any, arrives via the deals channel).
+    """
+    terminal_id, account_id = _resolve(data)
+    observed_at = _ts(data.get("observed_at"))
+    tickets: list[str] = []
+    with db.conn() as connection:
+        for order in data.get("orders") or []:
+            ticket = str(order.get("broker_ticket", ""))
+            if not ticket:
+                continue
+            tickets.append(ticket)
+            connection.execute(
+                """
+                INSERT INTO orders
+                       (account_id, broker_ticket, broker_symbol, direction,
+                        order_kind, volume, price, sl, tp, time_setup,
+                        time_expiration, status, last_reported_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE', %s)
+                ON CONFLICT (account_id, broker_ticket) DO UPDATE
+                   SET broker_symbol    = EXCLUDED.broker_symbol,
+                       direction        = EXCLUDED.direction,
+                       order_kind       = EXCLUDED.order_kind,
+                       volume            = EXCLUDED.volume,
+                       price             = EXCLUDED.price,
+                       sl                = EXCLUDED.sl,
+                       tp                = EXCLUDED.tp,
+                       time_setup        = EXCLUDED.time_setup,
+                       time_expiration   = EXCLUDED.time_expiration,
+                       status            = 'ACTIVE',
+                       last_reported_at = EXCLUDED.last_reported_at,
+                       removed_at        = NULL,
+                       updated_at        = now(),
+                       version           = orders.version + 1
+                 WHERE orders.last_reported_at IS NULL
+                    OR orders.last_reported_at <= EXCLUDED.last_reported_at
+                """,
+                (
+                    _uuid(account_id),
+                    ticket,
+                    str(order.get("broker_symbol", "")),
+                    str(order.get("direction", "")),
+                    str(order.get("order_kind", "")),
+                    _dec(order.get("volume")),
+                    _dec(order.get("price")),
+                    _dec(order.get("sl")),
+                    _dec(order.get("tp")),
+                    _ts(order.get("time_setup")) if order.get("time_setup") else None,
+                    _ts(order.get("time_expiration")) if order.get("time_expiration") else None,
+                    observed_at,
+                ),
+            )
+        if tickets:
+            connection.execute(
+                """
+                UPDATE orders
+                   SET status = 'REMOVED', removed_at = now(), updated_at = now(),
+                       version = version + 1
+                 WHERE account_id = %s AND status = 'ACTIVE'
+                   AND broker_ticket <> ALL(%s)
+                   AND (last_reported_at IS NULL OR last_reported_at <= %s)
+                """,
+                (_uuid(account_id), tickets, observed_at),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE orders
+                   SET status = 'REMOVED', removed_at = now(), updated_at = now(),
+                       version = version + 1
+                 WHERE account_id = %s AND status = 'ACTIVE'
+                   AND (last_reported_at IS NULL OR last_reported_at <= %s)
+                """,
+                (_uuid(account_id), observed_at),
+            )
+
+
 def handle_shutdown(data: dict[str, Any]) -> None:
     terminal_id, account_id = _resolve(data)
     add_system_event(
@@ -474,5 +598,7 @@ HANDLERS = {
     "ea.heartbeat": handle_heartbeat,
     "ea.symbols": handle_symbols,
     "ea.positions": handle_positions,
+    "ea.deals": handle_deals,
+    "ea.orders": handle_orders,
     "ea.shutdown": handle_shutdown,
 }

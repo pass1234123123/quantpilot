@@ -1,40 +1,52 @@
 <script setup lang="ts">
-// 示例数据：盈亏柱状图需成交数据，本切片（OBSERVE_ONLY）尚无成交
-const bars = [
-  { m: '5/20', profit: 900, loss: 200 },
-  { m: '6/5', profit: 1250, loss: 350 },
-  { m: '6/20', profit: 700, loss: 600 },
-  { m: '7/5', profit: 1600, loss: 150 },
-  { m: '7/20', profit: 1100, loss: 420 },
-  { m: '8/5', profit: 1850, loss: 280 },
-  { m: '8/20', profit: 600, loss: 750 },
-  { m: '9/5', profit: 1400, loss: 190 },
-  { m: '9/20', profit: 1700, loss: 330 },
-  { m: '10/5', profit: 1000, loss: 520 },
-  { m: '10/20', profit: 1950, loss: 110 },
-]
-const maxAbs = Math.max(...bars.flatMap((b) => [b.profit, b.loss]))
+import { computed } from 'vue'
+import { useDashboardStore } from '../../stores/dashboard'
+import { num } from '../../api'
+
+const store = useDashboardStore()
+
+// 最近 14 个交易日的日盈亏柱状图（按平仓成交聚合）
+const bars = computed(() => {
+  const daily = store.performance?.daily ?? []
+  return daily.slice(-14).map((b) => {
+    const d = new Date(b.date + 'T00:00:00Z')
+    const label = `${d.getUTCMonth() + 1}/${d.getUTCDate()}`
+    return {
+      m: label,
+      profit: num(b.profit) ?? 0,
+      loss: num(b.loss) ?? 0,
+      trades: b.trades,
+    }
+  })
+})
+
+const hasData = computed(() => bars.value.some((b) => b.trades > 0))
+const maxAbs = computed(() => {
+  const values = bars.value.flatMap((b) => [b.profit, b.loss])
+  return values.length > 0 ? Math.max(...values, 1) : 1
+})
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
       盈亏汇总
-      <span class="qp-sample-badge">示例数据</span>
+      <span v-if="hasData" class="qp-live-badge">EA 真实数据</span>
     </div>
 
-    <div class="ps__chart">
+    <div v-if="hasData" class="ps__chart">
       <div class="ps__zero" />
-      <div v-for="b in bars" :key="b.m" class="ps__col">
+      <div v-for="b in bars" :key="b.m" class="ps__col" :title="`${b.m}：${b.trades} 笔平仓`">
         <div class="ps__pos">
-          <div class="ps__bar ps__bar--profit" :style="{ height: (b.profit / maxAbs) * 100 + '%' }" />
+          <div v-if="b.profit > 0" class="ps__bar ps__bar--profit" :style="{ height: (b.profit / maxAbs) * 100 + '%' }" />
         </div>
         <div class="ps__neg">
-          <div class="ps__bar ps__bar--loss" :style="{ height: (b.loss / maxAbs) * 100 + '%' }" />
+          <div v-if="b.loss > 0" class="ps__bar ps__bar--loss" :style="{ height: (b.loss / maxAbs) * 100 + '%' }" />
         </div>
         <div class="ps__label">{{ b.m }}</div>
       </div>
     </div>
+    <div v-else class="ps__empty">暂无平仓成交记录（EA 每 60 秒同步账户历史成交）</div>
 
     <div class="ps__legend">
       <span><i class="ps__dot ps__dot--profit" />盈利 (USD)</span>
@@ -70,4 +82,13 @@ const maxAbs = Math.max(...bars.flatMap((b) => [b.profit, b.loss]))
 .ps__dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
 .ps__dot--profit { background: #00d0e0; }
 .ps__dot--loss { background: #ef4444; }
+.ps__empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--qp-text-dim);
+  font-size: 12px;
+  min-height: 150px;
+}
 </style>

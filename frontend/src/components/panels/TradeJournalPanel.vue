@@ -8,6 +8,24 @@ const store = useDashboardStore()
 const rows = computed(() => store.positions)
 const openRows = computed(() => rows.value.filter((r) => r.status === 'OPEN'))
 
+// 已实现盈亏：按持仓号聚合该仓位的全部成交（profit+swap+commission）
+const realizedByTicket = computed(() => {
+  const map = new Map<string, number>()
+  for (const d of store.deals) {
+    const ticket = d.broker_position_ticket
+    if (!ticket) continue
+    const net = (num(d.profit) ?? 0) + (num(d.swap) ?? 0) + (num(d.commission) ?? 0)
+    map.set(ticket, (map.get(ticket) ?? 0) + net)
+  }
+  return map
+})
+
+function realized(row: { broker_position_ticket: string; status: string }): number | null {
+  if (row.status !== 'CLOSED') return null
+  const v = realizedByTicket.value.get(row.broker_position_ticket)
+  return v === undefined ? null : v
+}
+
 // 浮动盈亏 = 仓位利润 + 库存费（swap）
 function floating(row: { profit: string | null; swap: string | null }): number | null {
   const p = num(row.profit)
@@ -83,6 +101,17 @@ function directionLabel(d: 'BUY' | 'SELL'): string {
       </el-table-column>
       <el-table-column label="开仓时间" width="120">
         <template #default="{ row }">{{ fmtTime(row.open_time) }}</template>
+      </el-table-column>
+      <el-table-column label="已实现盈亏" width="110" align="right">
+        <template #default="{ row }">
+          <span
+            v-if="realized(row) !== null"
+            :class="(realized(row) ?? 0) >= 0 ? 'qp-up' : 'qp-down'"
+          >
+            {{ (realized(row) ?? 0) >= 0 ? '+' : '' }}{{ fmt(realized(row)) }}
+          </span>
+          <span v-else>—</span>
+        </template>
       </el-table-column>
       <el-table-column label="状态" min-width="90">
         <template #default="{ row }">

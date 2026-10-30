@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountInfo, type AccountSnapshot, type NodeInfo, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
+import { api, num, type AccountInfo, type AccountSnapshot, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -14,6 +14,9 @@ export const useDashboardStore = defineStore('dashboard', {
     snapshotHistory: [] as SnapshotPoint[],
     symbols: [] as SymbolRow[],
     positions: [] as PositionRow[],
+    deals: [] as DealRow[],
+    orders: [] as OrderRow[],
+    performance: null as PerformanceData | null,
     lastRefreshAt: '' as string,
   }),
   getters: {
@@ -76,17 +79,26 @@ export const useDashboardStore = defineStore('dashboard', {
       this.snapshotHistory = []
       this.symbols = []
       this.positions = []
-      const [snapshot, history, symbols, positions] = await Promise.all([
+      this.deals = []
+      this.orders = []
+      this.performance = null
+      const [snapshot, history, symbols, positions, deals, orders, performance] = await Promise.all([
         api.snapshot(accountId).catch(() => null),
         api.snapshots(accountId, 500).catch(() => [] as SnapshotPoint[]),
         api.symbols(accountId).catch(() => [] as SymbolRow[]),
         api.positions(accountId).catch(() => [] as PositionRow[]),
+        api.deals(accountId, 500).catch(() => [] as DealRow[]),
+        api.orders(accountId).catch(() => [] as OrderRow[]),
+        api.performance(accountId, 30).catch(() => null),
       ])
       if (this.selectedAccountId !== accountId) return
       this.snapshot = snapshot
       this.snapshotHistory = history
       this.symbols = symbols
       this.positions = positions
+      this.deals = deals
+      this.orders = orders
+      this.performance = performance
     },
     async selectAccount(accountId: string) {
       this.selectedAccountId = accountId

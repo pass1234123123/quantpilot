@@ -105,6 +105,88 @@ export interface PositionRow {
   closed_at: string | null
 }
 
+export interface DealRow {
+  deal_id: string
+  account_id: string
+  broker_deal_ticket: string
+  broker_order_ticket: string
+  broker_position_ticket: string
+  broker_symbol: string
+  direction: 'BUY' | 'SELL'
+  entry: 'IN' | 'OUT' | 'INOUT' | 'OUT_BY'
+  volume: string
+  price: string
+  commission: string | null
+  swap: string | null
+  profit: string | null
+  deal_time: string
+  magic: number | null
+  comment: string | null
+}
+
+export interface OrderRow {
+  order_id: string
+  account_id: string
+  broker_ticket: string
+  broker_symbol: string
+  direction: 'BUY' | 'SELL'
+  order_kind: string
+  volume: string
+  price: string
+  sl: string | null
+  tp: string | null
+  time_setup: string | null
+  time_expiration: string | null
+  status: 'ACTIVE' | 'REMOVED'
+  last_reported_at: string | null
+  removed_at: string | null
+}
+
+export interface PerfStats {
+  closed_trades: number
+  wins: number
+  losses: number
+  win_rate: string | null
+  net_profit: string
+  gross_profit: string
+  gross_loss: string
+  profit_factor: string | null
+  expectancy: string | null
+  avg_win: string | null
+  avg_loss: string | null
+  max_consecutive_wins: number
+  max_consecutive_losses: number
+  best_trade: string | null
+  worst_trade: string | null
+  max_drawdown: string
+  recovery_factor: string | null
+  total_commission: string
+  total_swap: string
+  all_deals: number
+}
+
+export interface DailyBucket {
+  date: string
+  profit: string
+  loss: string
+  net: string
+  trades: number
+}
+
+export interface PerfPeriod {
+  today_net: string
+  week_net: string
+  month_net: string
+  last_trade_net: string | null
+  last_trade_at: string | null
+}
+
+export interface PerformanceData {
+  stats: PerfStats
+  daily: DailyBucket[]
+  period: PerfPeriod
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
   if (!res.ok) {
@@ -127,6 +209,11 @@ export const api = {
     get<SnapshotPoint[]>(`/api/v1/accounts/${accountId}/snapshots?limit=${limit}`),
   symbols: (accountId: string) => get<SymbolRow[]>(`/api/v1/accounts/${accountId}/symbols`),
   positions: (accountId: string) => get<PositionRow[]>(`/api/v1/accounts/${accountId}/positions`),
+  deals: (accountId: string, limit = 500) =>
+    get<DealRow[]>(`/api/v1/accounts/${accountId}/deals?limit=${limit}`),
+  orders: (accountId: string) => get<OrderRow[]>(`/api/v1/accounts/${accountId}/orders`),
+  performance: (accountId: string, days = 30) =>
+    get<PerformanceData>(`/api/v1/accounts/${accountId}/performance?days=${days}`),
 }
 
 /** Parse API decimal strings ("9980.00000000", "0E-8") safely. */

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
@@ -197,6 +199,180 @@ def account_positions(account_id: str, request: Request) -> JSONResponse:
         (account_id,),
     )
     return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/accounts/{account_id}/orders")
+def account_orders(account_id: str, request: Request) -> JSONResponse:
+    """Pending-order projection (doc 13.2, read-only, state-synced from EA).
+
+    status REMOVED means the order left the terminal (cancelled / expired /
+    filled); the matching deal, if any, arrives via the deals channel.
+    """
+    rows = db.query(
+        """
+        SELECT o.id::text AS order_id, o.account_id::text AS account_id,
+               o.broker_ticket, o.broker_symbol, o.direction, o.order_kind,
+               o.volume, o.price, o.sl, o.tp, o.time_setup, o.time_expiration,
+               o.status, o.last_reported_at, o.removed_at
+          FROM orders o
+         WHERE o.account_id = %s
+         ORDER BY (o.status = 'ACTIVE') DESC, o.time_setup DESC
+         LIMIT 500
+        """,
+        (account_id,),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/accounts/{account_id}/deals")
+def account_deals(account_id: str, request: Request, limit: int = 500) -> JSONResponse:
+    """Closed-trade history from the EA account history (read-only).
+
+    deal_time is broker server time; MQL5 exposes no server-timezone API, so
+    timestamps follow the server clock (documented approximation).
+    """
+    limit = max(1, min(limit, 2000))
+    rows = db.query(
+        """
+        SELECT d.id::text AS deal_id, d.account_id::text AS account_id,
+               d.broker_deal_ticket, d.broker_order_ticket, d.broker_position_ticket,
+               d.broker_symbol, d.direction, d.entry, d.volume, d.price,
+               d.commission, d.swap, d.profit, d.deal_time, d.magic, d.comment
+          FROM deals d
+         WHERE d.account_id = %s
+         ORDER BY d.deal_time DESC, d.broker_deal_ticket DESC
+         LIMIT %s
+        """,
+        (account_id, limit),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/accounts/{account_id}/performance")
+def account_performance(account_id: str, request: Request, days: int = 30) -> JSONResponse:
+    """Derived read-only trading statistics computed from the deals projection.
+
+    A "closed trade" is one OUT/OUT_BY deal; its realized P/L is
+    profit + swap + commission as reported by the broker. Daily buckets and
+    periods follow the broker server clock (see /deals note).
+    """
+    days = max(1, min(days, 90))
+    closers = db.query(
+        """
+        SELECT d.entry, d.profit, d.swap, d.commission, d.deal_time
+          FROM deals d
+         WHERE d.account_id = %s AND d.entry IN ('OUT', 'OUT_BY')
+         ORDER BY d.deal_time DESC, d.broker_deal_ticket DESC
+         LIMIT 10000
+        """,
+        (account_id,),
+    )
+    closers.reverse()  # oldest first for cumulative metrics
+    totals = db.query_one(
+        """
+        SELECT count(*) AS deal_count,
+               COALESCE(SUM(commission), 0) AS commission,
+               COALESCE(SUM(swap), 0) AS swap
+          FROM deals
+         WHERE account_id = %s
+        """,
+        (account_id,),
+    )
+    zero = Decimal("0")
+    nets: list[Decimal] = []
+    times: list = []
+    for row in closers:
+        nets.append((row["profit"] or zero) + (row["swap"] or zero) + (row["commission"] or zero))
+        times.append(row["deal_time"])
+
+    wins = [n for n in nets if n > 0]
+    losses = [n for n in nets if n < 0]
+    gross_profit = sum(wins, zero)
+    gross_loss = sum((-n for n in losses), zero)
+    net = gross_profit - gross_loss
+    closed = len(nets)
+
+    # streaks + cumulative curve (max drawdown)
+    streak_win = streak_loss = max_win = max_loss = 0
+    peak = zero
+    max_dd = zero
+    cum = zero
+    for n in nets:
+        if n > 0:
+            streak_win += 1
+            streak_loss = 0
+        elif n < 0:
+            streak_loss += 1
+            streak_win = 0
+        max_win = max(max_win, streak_win)
+        max_loss = max(max_loss, streak_loss)
+        cum += n
+        if cum > peak:
+            peak = cum
+        if peak - cum > max_dd:
+            max_dd = peak - cum
+
+    # daily buckets, last N days (zero-filled)
+    today = datetime.now(timezone.utc).date()
+    daily_map: dict = {}
+    for n, t in zip(nets, times):
+        bucket = daily_map.setdefault(t.date(), {"profit": zero, "loss": zero, "net": zero, "trades": 0})
+        if n > 0:
+            bucket["profit"] += n
+        elif n < 0:
+            bucket["loss"] += -n
+        bucket["net"] += n
+        bucket["trades"] += 1
+    daily = []
+    for i in range(days - 1, -1, -1):
+        day = today - timedelta(days=i)
+        bucket = daily_map.get(day)
+        if bucket:
+            daily.append({
+                "date": day.isoformat(), **bucket,
+            })
+        else:
+            daily.append({"date": day.isoformat(), "profit": zero, "loss": zero, "net": zero, "trades": 0})
+
+    def _q(numerator: Decimal, denominator: Decimal) -> str | None:
+        return str(round(numerator / denominator, 6)) if denominator != 0 else None
+
+    def _r(value: Decimal) -> str:
+        return str(value.quantize(Decimal("0.01")))
+
+    stats = {
+        "closed_trades": closed,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": _q(Decimal(len(wins)), Decimal(closed)) if closed else None,
+        "net_profit": _r(net),
+        "gross_profit": _r(gross_profit),
+        "gross_loss": _r(gross_loss),
+        "profit_factor": _q(gross_profit, gross_loss) if gross_loss != 0 else None,
+        "expectancy": _r(net / closed) if closed else None,
+        "avg_win": _r(gross_profit / len(wins)) if wins else None,
+        "avg_loss": _r(gross_loss / len(losses)) if losses else None,
+        "max_consecutive_wins": max_win,
+        "max_consecutive_losses": max_loss,
+        "best_trade": _r(max(nets)) if nets else None,
+        "worst_trade": _r(min(nets)) if nets else None,
+        "max_drawdown": _r(max_dd),
+        "recovery_factor": str(round(net / max_dd, 4)) if max_dd > 0 and closed else None,
+        "total_commission": _r(totals["commission"]) if totals else "0.00",
+        "total_swap": _r(totals["swap"]) if totals else "0.00",
+        "all_deals": totals["deal_count"] if totals else 0,
+    }
+    today_net = daily[-1]["net"] if daily else zero
+    week_net = sum((bucket["net"] for bucket in daily[-7:]), zero)
+    month_net = sum((bucket["net"] for bucket in daily), zero)
+    period = {
+        "today_net": _r(today_net),
+        "week_net": _r(week_net),
+        "month_net": _r(month_net),
+        "last_trade_net": _r(nets[-1]) if nets else None,
+        "last_trade_at": times[-1].isoformat() if times else None,
+    }
+    return ok(db.jsonable({"stats": stats, "daily": daily, "period": period}), request)
 
 
 @app.get("/api/v1/accounts/{account_id}/symbols")

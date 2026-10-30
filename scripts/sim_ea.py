@@ -186,7 +186,82 @@ def main() -> int:
         },
     )
 
-    # 7. commands endpoint must exist and be empty (OBSERVE_ONLY)
+    # 7. history deals: one IN (opened 900001) + one OUT (closed 900002)
+    def deal(ticket: int, order_ticket: int, position_ticket: int,
+             symbol_name: str, direction: str, entry: str, price: str, profit: str) -> dict:
+        return {
+            "broker_deal_ticket": str(ticket),
+            "broker_order_ticket": str(order_ticket),
+            "broker_position_ticket": str(position_ticket),
+            "broker_symbol": symbol_name,
+            "direction": direction,
+            "entry": entry,
+            "volume": "0.10000000",
+            "price": price,
+            "commission": "-0.05",
+            "swap": "-0.02",
+            "profit": profit,
+            "deal_time": iso_now(),
+            "magic": 0,
+            "comment": "sim",
+        }
+
+    post(
+        "/ea/v1/deals",
+        {
+            "ea_version": "1.0.0",
+            "terminal": terminal(),
+            "account": account(),
+            "batch_index": 0,
+            "batch_total": 1,
+            "deals": [
+                deal(700001, 600001, 900001, "EURUSD", "BUY", "IN", "1.08123000", "0"),
+                deal(700002, 600002, 900002, "GBPUSD", "SELL", "OUT", "1.27123000", "-3.40"),
+            ],
+            "observed_at": iso_now(),
+        },
+    )
+
+    # 8. pending orders snapshot A: one BUY_LIMIT (800001)
+    def pending_order(ticket: int) -> dict:
+        return {
+            "broker_ticket": str(ticket),
+            "broker_symbol": "EURUSD",
+            "direction": "BUY",
+            "order_kind": "BUY_LIMIT",
+            "volume": "0.10000000",
+            "price": "1.08000000",
+            "sl": None,
+            "tp": "1.09000000",
+            "time_setup": iso_now(),
+            "time_expiration": None,
+        }
+
+    post(
+        "/ea/v1/orders",
+        {
+            "ea_version": "1.0.0",
+            "terminal": terminal(),
+            "account": account(),
+            "orders": [pending_order(800001)],
+            "observed_at": iso_now(),
+        },
+    )
+
+    # 9. orders snapshot B: empty -> 800001 must be marked REMOVED
+    time.sleep(1)
+    post(
+        "/ea/v1/orders",
+        {
+            "ea_version": "1.0.0",
+            "terminal": terminal(),
+            "account": account(),
+            "orders": [],
+            "observed_at": iso_now(),
+        },
+    )
+
+    # 10. commands endpoint must exist and be empty (OBSERVE_ONLY)
     r = client.get(AGENT + "/ea/v1/commands", headers=HEADERS)
     body = r.json()
     empty = body.get("commands") == []

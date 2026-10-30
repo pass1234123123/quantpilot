@@ -7,6 +7,8 @@
 //|   - reports symbol trading specifications (PRD 5.4)                |
 //|   - sends doc A.3 account heartbeats on a timer                  |
 //|   - sends open-position snapshots (doc 12.2 projection, read-only)|
+//|   - sends pending-order snapshots (doc 12.2 orders projection)   |
+//|   - sends account history deals incrementally (read-only)        |
 //|   - sends a shutdown note on removal                             |
 //|                                                                   |
 //| What it MUST NOT contain (PRD 21.3):                             |
@@ -19,15 +21,17 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.0.0"
-#define QP_HTTP_TIMEOUT_MS   5000
+#define QP_EA_VERSION        "1.1.0"
+#define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
+#define QP_DEALS_PER_BATCH   200
+#define QP_DEALS_REFRESH_SEC 60    // incremental history-deal poll
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
@@ -42,6 +46,8 @@ string   g_last_login      = "";
 string   g_last_server     = "";
 string   g_terminal_json    = "";
 datetime g_last_specs_at   = 0;
+datetime g_last_deal_time  = 0;    // max deal time already reported (0 = full backfill)
+datetime g_last_deals_at   = 0;    // when the deals channel last succeeded
 
 //+------------------------------------------------------------------+
 //| Logging                                                          |
@@ -297,6 +303,220 @@ bool QpSendPositions()
   }
 
 //+------------------------------------------------------------------+
+//| Enum labels for history deals / pending orders (MQL5 reference)  |
+//+------------------------------------------------------------------+
+string QpDealEntryLabel(const long entry)
+  {
+   switch((int)entry)
+     {
+      case DEAL_ENTRY_IN:     return("IN");
+      case DEAL_ENTRY_OUT:    return("OUT");
+      case DEAL_ENTRY_INOUT:  return("INOUT");
+      case DEAL_ENTRY_OUT_BY: return("OUT_BY");
+     }
+   return("UNKNOWN");
+  }
+
+string QpOrderKindLabel(const long otype)
+  {
+   switch((int)otype)
+     {
+      case ORDER_TYPE_BUY_LIMIT:        return("BUY_LIMIT");
+      case ORDER_TYPE_SELL_LIMIT:       return("SELL_LIMIT");
+      case ORDER_TYPE_BUY_STOP:         return("BUY_STOP");
+      case ORDER_TYPE_SELL_STOP:        return("SELL_STOP");
+      case ORDER_TYPE_BUY_STOP_LIMIT:   return("BUY_STOP_LIMIT");
+      case ORDER_TYPE_SELL_STOP_LIMIT:  return("SELL_STOP_LIMIT");
+     }
+   return("UNKNOWN_" + IntegerToString(otype));
+  }
+
+string QpOrderDirection(const long otype)
+  {
+   switch((int)otype)
+     {
+      case ORDER_TYPE_BUY_LIMIT:
+      case ORDER_TYPE_BUY_STOP:
+      case ORDER_TYPE_BUY_STOP_LIMIT:
+         return("BUY");
+      case ORDER_TYPE_SELL_LIMIT:
+      case ORDER_TYPE_SELL_STOP:
+      case ORDER_TYPE_SELL_STOP_LIMIT:
+         return("SELL");
+     }
+   return(""); // not a pending BUY/SELL-family order; caller skips it
+  }
+
+//+------------------------------------------------------------------+
+//| Incremental account history deals (read-only, doc 12.2).          |
+//| HistorySelect + HistoryDealGet* only; no trade calls anywhere.   |
+//| Sends deals with time >= g_last_deal_time; the inclusive bound    |
+//| re-sends boundary-second deals whose ticket arrived late - the   |
+//| cloud upserts idempotently on (account_id, broker_deal_ticket).  |
+//+------------------------------------------------------------------+
+bool QpSendDeals()
+  {
+   if(!HistorySelect(0, TimeCurrent() + 86400))
+     {
+      QpLog("ERROR", "HistorySelect failed");
+      return(false);
+     }
+   int total = HistoryDealsTotal();
+
+   string parts[];
+   int count = 0;
+   datetime max_time = g_last_deal_time;
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         continue;
+      long dtype = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL)
+         continue; // skip balance/credit operations - market fills only
+      datetime dtime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(g_last_deal_time > 0 && dtime < g_last_deal_time)
+         continue;
+
+      string name = HistoryDealGetString(ticket, DEAL_SYMBOL);
+      int digits = (int)SymbolInfoInteger(name, SYMBOL_DIGITS);
+      QpJsonObject d;
+      d.Clear();
+      d.AddStr("broker_deal_ticket", IntegerToString((long)ticket));
+      d.AddStr("broker_order_ticket", IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_ORDER)));
+      d.AddStr("broker_position_ticket", IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID)));
+      d.AddStr("broker_symbol", name);
+      d.AddStr("direction", dtype == DEAL_TYPE_BUY ? "BUY" : "SELL");
+      d.AddStr("entry", QpDealEntryLabel(HistoryDealGetInteger(ticket, DEAL_ENTRY)));
+      d.AddNumStr("volume", DoubleToString(HistoryDealGetDouble(ticket, DEAL_VOLUME), 8));
+      d.AddNumStr("price", DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), digits));
+      d.AddNumStr("commission", DoubleToString(HistoryDealGetDouble(ticket, DEAL_COMMISSION), 2));
+      d.AddNumStr("swap", DoubleToString(HistoryDealGetDouble(ticket, DEAL_SWAP), 2));
+      d.AddNumStr("profit", DoubleToString(HistoryDealGetDouble(ticket, DEAL_PROFIT), 2));
+      d.AddStr("deal_time", QpIsoTime(dtime));
+      d.AddInt("magic", HistoryDealGetInteger(ticket, DEAL_MAGIC));
+      d.AddStr("comment", HistoryDealGetString(ticket, DEAL_COMMENT));
+      int n = ArraySize(parts);
+      ArrayResize(parts, n + 1);
+      parts[n] = d.Dump();
+      count++;
+      if(dtime > max_time)
+         max_time = dtime;
+     }
+
+   if(count == 0)
+     {
+      QpLog("DEBUG", "no new deals since last report");
+      return(true);
+     }
+
+   int batch_total = (count + QP_DEALS_PER_BATCH - 1) / QP_DEALS_PER_BATCH;
+   bool all_ok = true;
+   int sent = 0;
+   for(int batch_index = 0; batch_index < batch_total; batch_index++)
+     {
+      int from = batch_index * QP_DEALS_PER_BATCH;
+      int to = from + QP_DEALS_PER_BATCH;
+      if(to > count)
+         to = count;
+      string deals_json = "";
+      for(int j = from; j < to; j++)
+        {
+         if(j > from)
+            deals_json += ",";
+         deals_json += parts[j];
+        }
+      QpJsonObject o;
+      o.Clear();
+      o.AddStr("ea_version", QP_EA_VERSION);
+      o.AddRaw("terminal", g_terminal_json);
+      o.AddRaw("account", QpAccountJson());
+      o.AddInt("batch_index", batch_index);
+      o.AddInt("batch_total", batch_total);
+      o.AddRaw("deals", "[" + deals_json + "]");
+      o.AddStr("observed_at", QpIsoNow());
+      if(!QpHttpPost("/ea/v1/deals", o.Dump()))
+        {
+         all_ok = false;
+         break;
+        }
+      sent += to - from;
+     }
+
+   if(all_ok)
+     {
+      g_last_deal_time = max_time;
+      QpLog("INFO", "reported " + IntegerToString(sent) + " deal(s) in " +
+            IntegerToString(batch_total) + " batch(es)");
+     }
+   return(all_ok);
+  }
+
+//+------------------------------------------------------------------+
+//| Pending orders snapshot (doc 12.2 orders projection, read-only).  |
+//| OrdersTotal/OrderGetTicket/OrderGet* only; no trade calls.        |
+//| Same state-sync contract as positions: the snapshot is the       |
+//| complete set of active pending orders at observed_at.            |
+//+------------------------------------------------------------------+
+bool QpSendOrders()
+  {
+   string orders_json = "";
+   int total = OrdersTotal();
+   int added = 0;
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+      long otype = OrderGetInteger(ORDER_TYPE);
+      string direction = QpOrderDirection(otype);
+      if(direction == "")
+        {
+         QpLog("DEBUG", "skipping order " + IntegerToString((long)ticket) +
+               " with unsupported type " + IntegerToString(otype));
+         continue;
+        }
+      string name = OrderGetString(ORDER_SYMBOL);
+      int digits = (int)SymbolInfoInteger(name, SYMBOL_DIGITS);
+      double sl = OrderGetDouble(ORDER_SL);
+      double tp = OrderGetDouble(ORDER_TP);
+
+      QpJsonObject od;
+      od.Clear();
+      od.AddStr("broker_ticket", IntegerToString((long)ticket));
+      od.AddStr("broker_symbol", name);
+      od.AddStr("direction", direction);
+      od.AddStr("order_kind", QpOrderKindLabel(otype));
+      od.AddNumStr("volume", DoubleToString(OrderGetDouble(ORDER_VOLUME_CURRENT), 8));
+      od.AddNumStr("price", DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), digits));
+      if(sl != 0.0)
+         od.AddNumStr("sl", DoubleToString(sl, digits));
+      if(tp != 0.0)
+         od.AddNumStr("tp", DoubleToString(tp, digits));
+      od.AddStr("time_setup", QpIsoTime((datetime)OrderGetInteger(ORDER_TIME_SETUP)));
+      long expiry = OrderGetInteger(ORDER_TIME_EXPIRATION);
+      if(expiry != 0)
+         od.AddStr("time_expiration", QpIsoTime((datetime)expiry));
+      if(added > 0)
+         orders_json += ",";
+      orders_json += od.Dump();
+      added++;
+     }
+
+   QpJsonObject o;
+   o.Clear();
+   o.AddStr("ea_version", QP_EA_VERSION);
+   o.AddRaw("terminal", g_terminal_json);
+   o.AddRaw("account", QpAccountJson());
+   o.AddRaw("orders", "[" + orders_json + "]");
+   o.AddStr("observed_at", QpIsoNow());
+   if(!QpHttpPost("/ea/v1/orders", o.Dump()))
+      return(false);
+   QpLog("DEBUG", "reported " + IntegerToString(added) + " pending order(s)");
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| Symbol specs (PRD 5.4) in batches                                |
 //+------------------------------------------------------------------+
 bool QpSendSymbolSpecs()
@@ -423,6 +643,7 @@ int OnInit()
    if(QpSendRegister())
      {
       g_registered = true;
+      g_last_deal_time = 0; // new account context -> full history backfill
       if(QpSendSymbolSpecs())
          g_last_specs_at = TimeGMT();
      }
@@ -461,6 +682,7 @@ void OnTimer()
       if(QpSendRegister())
         {
          g_registered = true;
+         g_last_deal_time = 0; // new account context -> full history backfill
          if(QpSendSymbolSpecs())
             g_last_specs_at = TimeGMT();
         }
@@ -477,5 +699,15 @@ void OnTimer()
 
    // position snapshot every heartbeat tick (read-only reconcile, doc 5.2)
    QpSendPositions();
+
+   // pending-order snapshot every heartbeat tick (state sync, doc 12.2)
+   QpSendOrders();
+
+   // incremental history deals (read-only; new account backfills fully)
+   if(g_last_deals_at == 0 || TimeGMT() - g_last_deals_at >= QP_DEALS_REFRESH_SEC)
+     {
+      if(QpSendDeals())
+         g_last_deals_at = TimeGMT();
+     }
   }
 //+------------------------------------------------------------------+

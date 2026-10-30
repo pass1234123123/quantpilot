@@ -7,6 +7,8 @@ EVENT_EA_REGISTERED = "ea.registered"
 EVENT_EA_HEARTBEAT = "ea.heartbeat"
 EVENT_EA_SYMBOLS = "ea.symbols"
 EVENT_EA_POSITIONS = "ea.positions"
+EVENT_EA_DEALS = "ea.deals"
+EVENT_EA_ORDERS = "ea.orders"
 EVENT_EA_SHUTDOWN = "ea.shutdown"
 
 # --- Error codes (doc A.4) ---

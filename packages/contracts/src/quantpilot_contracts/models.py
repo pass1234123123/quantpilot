@@ -190,6 +190,83 @@ class EaPositionsData(BaseModel):
     observed_at: datetime
 
 
+class DealRecord(BaseModel):
+    """One closed-trade deal as observed via HistoryDealGet (read-only).
+
+    Balance/credit operations are NOT deals here - the EA filters to
+    DEAL_TYPE_BUY/SELL only, so every record is a market fill.
+    """
+
+    model_config = StrictModel
+
+    broker_deal_ticket: str = Field(description="HistoryDealGetTicket as string")
+    broker_order_ticket: str = Field(default="", description="DEAL_ORDER as string")
+    broker_position_ticket: str = Field(default="", description="DEAL_POSITION_ID as string")
+    broker_symbol: str
+    direction: Literal["BUY", "SELL"]
+    entry: Literal["IN", "OUT", "INOUT", "OUT_BY"] = Field(description="DEAL_ENTRY label")
+    volume: Money
+    price: Money
+    commission: Money = Field(default=Decimal("0"))
+    swap: Money = Field(default=Decimal("0"))
+    profit: Money = Field(default=Decimal("0"))
+    deal_time: datetime
+    magic: int = 0
+    comment: str = ""
+
+
+class EaDealsData(BaseModel):
+    """Event ea.deals payload: incremental history-deal batches for one account.
+
+    Deals are immutable broker facts; the consumer upserts idempotently on
+    (account_id, broker_deal_ticket), so overlapping windows and JetStream
+    redeliveries are safe (doc 4.4/4.5).
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    batch_index: int = 0
+    batch_total: int = 1
+    deals: list[DealRecord]
+    observed_at: datetime
+
+
+class OrderRecord(BaseModel):
+    """One pending order as observed via OrderGet* (read-only, doc 12.2)."""
+
+    model_config = StrictModel
+
+    broker_ticket: str = Field(description="OrderGetTicket as string")
+    broker_symbol: str
+    direction: Literal["BUY", "SELL"]
+    order_kind: str = Field(description="ORDER_TYPE label: BUY_LIMIT/SELL_STOP/...")
+    volume: Money
+    price: Money
+    sl: Money | None = None
+    tp: Money | None = None
+    time_setup: datetime
+    time_expiration: datetime | None = None
+
+
+class EaOrdersData(BaseModel):
+    """Event ea.orders payload: full pending-order snapshot for one account.
+
+    Same state-based sync contract as EaPositionsData: tickets missing from
+    the snapshot are marked REMOVED by the cloud consumer.
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    orders: list[OrderRecord]
+    observed_at: datetime
+
+
 class NodeEventEnvelope(BaseModel):
     """Wrapper published to JetStream subject node.<node_id>.events."""
 

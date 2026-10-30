@@ -6,6 +6,8 @@ Endpoints (all JSON):
     POST /ea/v1/heartbeat      doc A.3 heartbeat            -> ea.heartbeat
     POST /ea/v1/symbols        symbol spec batch            -> ea.symbols
     POST /ea/v1/positions      open-position snapshot       -> ea.positions
+    POST /ea/v1/deals          incremental history deals    -> ea.deals
+    POST /ea/v1/orders         pending-order snapshot       -> ea.orders
     GET  /ea/v1/commands       S1: always empty list (command channel reserved)
 
 The agent is OBSERVE_ONLY in this slice: it never returns trade commands and
@@ -22,14 +24,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from quantpilot_contracts.constants import (
+    EVENT_EA_DEALS,
     EVENT_EA_HEARTBEAT,
+    EVENT_EA_ORDERS,
     EVENT_EA_POSITIONS,
     EVENT_EA_REGISTERED,
     EVENT_EA_SHUTDOWN,
     EVENT_EA_SYMBOLS,
 )
 from quantpilot_contracts.models import (
+    EaDealsData,
     EaHeartbeatData,
+    EaOrdersData,
     EaPositionsData,
     EaRegisteredData,
     EaShutdownData,
@@ -146,6 +152,12 @@ class AgentHttpServer:
                     elif route == "/ea/v1/positions":
                         data = EaPositionsData.model_validate(body).model_dump(mode="json")
                         event_type = EVENT_EA_POSITIONS
+                    elif route == "/ea/v1/deals":
+                        data = EaDealsData.model_validate(body).model_dump(mode="json")
+                        event_type = EVENT_EA_DEALS
+                    elif route == "/ea/v1/orders":
+                        data = EaOrdersData.model_validate(body).model_dump(mode="json")
+                        event_type = EVENT_EA_ORDERS
                     elif route == "/ea/v1/shutdown":
                         data = EaShutdownData.model_validate(body).model_dump(mode="json")
                         event_type = EVENT_EA_SHUTDOWN
