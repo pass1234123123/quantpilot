@@ -24,6 +24,10 @@ dist/
 # alembic bytecode
 infra/postgres/alembic/__pycache__/
 
+# node / frontend
+node_modules/
+frontend/dist/
+
 # OS
 Thumbs.db
 .DS_Store

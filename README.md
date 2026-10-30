@@ -11,6 +11,7 @@ EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL �
 packages/contracts/   Pydantic 数据契约 + NATS subject + 共享常量
 agent/                本地节点：终端发现 + HTTP 接收(8787) + JetStream 发布
 services/api/         FastAPI：节点注册/心跳 + JetStream 消费者入库 + 查询路由
+frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
 infra/postgres/       Alembic 迁移（0001 建表 + 0002 broker_symbols.selected）
 scripts/              开发工具（隧道/冒烟/验收/部署）
@@ -40,8 +41,27 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 
 ```powershell
 .venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（401/注册/心跳/规格/命令）
-.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 五端点 + 8 张表落库
+.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 六端点 + 8 张表落库
 ```
+
+## Web 仪表盘（frontend/）
+
+Vue3 + TypeScript + Vite + Element Plus + Pinia + TradingView Lightweight Charts。
+深色交易终端风格（`docs/ui-reference.png`），通过 Vite dev proxy 访问 API（无 CORS 配置）。
+
+```powershell
+cd frontend
+pnpm install
+pnpm dev        # http://127.0.0.1:5173
+pnpm build      # 类型检查 + 产线构建
+```
+
+- **真实数据面板**：KPI 带（余额/净值/保证金等 ← 最新快照）、Equity & Balance Graph
+  （快照历史，`GET /api/v1/accounts/{id}/snapshots`）、Market Watch（品种发现）、
+  Permission Signal / Trading Status / Account Info、侧栏 System Status；每 30s 自动刷新。
+- **示例数据面板**：Trade Journal、Performance、Risk Management、Profit Monitor、
+  Filtering / Expert Settings、News Filter 等标注"示例数据"——对应数据链路（成交/风控/命令通道）
+  在后续切片实现。
 
 数据库变更（如换库）：
 

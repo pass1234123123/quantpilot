@@ -1,0 +1,127 @@
+/* QuantPilot AI — dark trading terminal theme (per docs/ui-reference.png) */
+
+:root {
+  color-scheme: dark;
+  --qp-bg: #0b1420;
+  --qp-panel: #0f1b2d;
+  --qp-panel-2: #12213a;
+  --qp-border: rgba(0, 176, 192, 0.18);
+  --qp-border-soft: rgba(148, 163, 184, 0.12);
+  --qp-accent: #00b0c0;
+  --qp-accent-soft: rgba(0, 176, 192, 0.12);
+  --qp-up: #22c55e;
+  --qp-down: #ef4444;
+  --qp-warn: #f59e0b;
+  --qp-text: #e6edf3;
+  --qp-text-dim: #7d8fa3;
+
+  /* Element Plus dark palette overrides */
+  --el-bg-color: var(--qp-panel);
+  --el-bg-color-overlay: var(--qp-panel-2);
+  --el-border-color: rgba(148, 163, 184, 0.2);
+  --el-border-color-light: var(--qp-border-soft);
+  --el-border-color-lighter: var(--qp-border-soft);
+  --el-fill-color-blank: var(--qp-panel);
+  --el-fill-color-light: rgba(0, 176, 192, 0.06);
+  --el-color-primary: var(--qp-accent);
+  --el-text-color-primary: var(--qp-text);
+  --el-text-color-regular: #b6c2cf;
+  --el-text-color-secondary: var(--qp-text-dim);
+  --el-font-size-base: 13px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--qp-bg);
+  color: var(--qp-text);
+  font-family: 'Segoe UI', 'Inter', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- shared panel chrome ---------- */
+
+.qp-panel {
+  background: var(--qp-panel);
+  border: 1px solid var(--qp-border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.qp-panel__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--qp-text);
+  margin-bottom: 12px;
+}
+
+.qp-panel__title::before {
+  content: '';
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--qp-accent);
+}
+
+.qp-sample-badge {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: var(--qp-warn);
+  background: rgba(245, 158, 11, 0.08);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+.qp-live-badge {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(34, 197, 94, 0.45);
+  color: var(--qp-up);
+  background: rgba(34, 197, 94, 0.08);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+
+/* metric rows inside panels */
+.qp-rows { display: flex; flex-direction: column; gap: 7px; }
+.qp-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(148, 163, 184, 0.05);
+}
+.qp-row__label { color: var(--qp-text-dim); }
+.qp-row__value { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.qp-up { color: var(--qp-up); }
+.qp-down { color: var(--qp-down); }
+.qp-dim { color: var(--qp-text-dim); }
+
+/* Element Plus compact tweaks */
+.el-table { --el-table-border-color: var(--qp-border-soft); --el-table-header-bg-color: rgba(0, 176, 192, 0.05); --el-table-tr-bg-color: transparent; --el-table-row-hover-bg-color: rgba(0, 176, 192, 0.06); background: transparent; }
+.el-table .el-table__cell { padding: 5px 0; }
+.el-select__wrapper, .el-input__wrapper { background: rgba(148, 163, 184, 0.06); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(0, 176, 192, 0.25); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }

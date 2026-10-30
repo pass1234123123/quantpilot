@@ -157,6 +157,25 @@ def account_snapshot(account_id: str, request: Request) -> JSONResponse:
     return ok(db.jsonable(row), request)
 
 
+@app.get("/api/v1/accounts/{account_id}/snapshots")
+def account_snapshots_history(account_id: str, request: Request, limit: int = 500) -> JSONResponse:
+    """Read-only snapshot history (equity curve source). Oldest-first."""
+    limit = max(1, min(limit, 2000))
+    rows = db.query(
+        """
+        SELECT s.balance, s.equity, s.margin, s.free_margin,
+               s.open_positions, s.captured_at
+          FROM account_snapshots s
+         WHERE s.account_id = %s
+         ORDER BY s.captured_at DESC
+         LIMIT %s
+        """,
+        (account_id, limit),
+    )
+    rows.reverse()
+    return ok(db.jsonable(rows), request)
+
+
 @app.get("/api/v1/accounts/{account_id}/symbols")
 def account_symbols(account_id: str, request: Request) -> JSONResponse:
     rows = db.query(

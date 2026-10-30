@@ -87,6 +87,11 @@ def main() -> int:
         print(f"       snapshot: balance={s.get('balance')} equity={s.get('equity')} "
               f"open_positions={s.get('open_positions')} captured_at={s.get('captured_at')}")
 
+    hist = client.get(f"{API}/api/v1/accounts/{account_id}/snapshots?limit=500")
+    hist_data = hist.json().get("data", [])
+    check("api.snapshots_history", hist.status_code == 200 and len(hist_data) >= 1,
+          f"status={hist.status_code} count={len(hist_data)}")
+
     syms = client.get(f"{API}/api/v1/accounts/{account_id}/symbols")
     syms_data = syms.json().get("data", [])
     check("api.symbols", len(syms_data) >= 1, f"count={len(syms_data)}")
