@@ -1,0 +1,17 @@
+[project]
+name = "quantpilot-agent"
+version = "0.1.0"
+description = "QuantPilot AI - local trading node agent (EA bridge, OBSERVE_ONLY slice)"
+requires-python = ">=3.12"
+dependencies = [
+    "quantpilot-contracts",
+    "nats-py>=2.7",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,16 @@
+[project]
+name = "quantpilot-contracts"
+version = "0.1.0"
+description = "QuantPilot AI - shared contracts: schemas, NATS subjects, constants"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.7"]
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

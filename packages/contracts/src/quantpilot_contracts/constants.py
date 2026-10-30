@@ -1,0 +1,30 @@
+"""Shared constants for QuantPilot AI (PRD 13.x / A.4)."""
+
+SCHEMA_VERSION = "1.0"
+
+# --- Event types (JetStream, subject node.<node_id>.events) ---
+EVENT_EA_REGISTERED = "ea.registered"
+EVENT_EA_HEARTBEAT = "ea.heartbeat"
+EVENT_EA_SYMBOLS = "ea.symbols"
+EVENT_EA_SHUTDOWN = "ea.shutdown"
+
+# --- Error codes (doc A.4) ---
+ERR_ACCOUNT_IDENTITY_MISMATCH = "ACCOUNT_IDENTITY_MISMATCH"
+ERR_TERMINAL_NOT_CONNECTED = "TERMINAL_NOT_CONNECTED"
+ERR_SYMBOL_NOT_TRADABLE = "SYMBOL_NOT_TRADABLE"
+ERR_SYMBOL_SPEC_STALE = "SYMBOL_SPEC_STALE"
+ERR_DUPLICATE_COMMAND = "DUPLICATE_COMMAND"
+ERR_COMMAND_EXPIRED = "COMMAND_EXPIRED"
+
+# --- Statuses (accounts default OBSERVE_ONLY; never auto-enable trading) ---
+ACCOUNT_MODE_DEMO = "DEMO"
+ACCOUNT_MODE_REAL = "REAL"
+ACCOUNT_STATUS_OBSERVE_ONLY = "OBSERVE_ONLY"
+NODE_STATUS_ONLINE = "ONLINE"
+NODE_STATUS_OFFLINE = "OFFLINE"
+
+# --- JetStream ---
+NATS_STREAM_NODE_EVENTS = "QP_NODE_EVENTS"
+NATS_DURABLE_API = "quantpilot-api-node-events"
+NATS_EVENTS_SUBJECT_TMPL = "node.{node_id}.events"
+NATS_EVENTS_SUBJECT_WILDCARD = "node.*.events"

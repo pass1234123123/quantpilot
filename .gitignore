@@ -1,0 +1,29 @@
+# secrets / server access
+.server/
+.env
+.env.local
+*.local.md
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# local state / caches / uploads
+.state/
+.uploads/
+.screenshots/
+*.log
+
+# alembic bytecode
+infra/postgres/alembic/__pycache__/
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,1647 @@
+QuantPilot AI
+AI 多账户量化自动交易平台
+产品需求文档（PRD）+ 软件架构设计（SAD）+ 技术设计（TDD）数据库规范 + API 规范 + MT5 EA 通信协议 + 测试与部署手册
+版本：V1.0  |  日期：2026-10-30  |  状态：研发基线 / 可供 AI 编程执行
+项目定位：全部 MT5 支持品种 · AI + 传统量化双引擎 · 多账户Windows 客户端 + Web 后台 · 先自用，后商业化
+[[Heading1]] 文档使用说明
+本文档是 QuantPilot AI 的工程基线，不是收益承诺，也不是可直接用于真实资金交易的成品代码。它定义产品边界、系统架构、关键数据模型、服务接口、EA 协议、风控原则、开发顺序和验收标准。开发人员或 AI 编程代理必须先阅读本文件，再按阶段实施。
+[[ListBullet]] 需求优先级：P0 = 首版必须；P1 = 首版增强或第二阶段；P2 = 商业化/规模化阶段。
+[[ListBullet]] 任何会影响订单执行、仓位、止损、风控和账户权限的改动，必须补充测试与审计记录。
+[[ListBullet]] 文中风险比例、阈值和时间参数均为配置示例，不构成交易建议；默认实盘交易关闭。
+[[ListBullet]] 产品支持“全部 MT5 可用品种”的含义是动态发现并适配当前经纪商终端暴露的品种及交易规则，不代表所有券商、所有品种、所有时段都可交易。
+[[ListBullet]] MT5 客户端和券商服务器属于第三方专有环境；QuantPilot 自研部分与第三方组件必须分开管理许可证。
+[[Heading1]] 目录 / 章节地图
+[[ListBullet]] 1. 产品概述与目标
+[[ListBullet]] 2. 产品需求文档 PRD
+[[ListBullet]] 3. 用户角色、权限与核心业务流程
+[[ListBullet]] 4. 总体系统架构
+[[ListBullet]] 5. MT5 EA 执行端详细设计
+[[ListBullet]] 6. 本地交易节点设计
+[[ListBullet]] 7. 量化策略引擎设计
+[[ListBullet]] 8. AI 分析引擎设计
+[[ListBullet]] 9. 独立风控引擎设计
+[[ListBullet]] 10. 多账户与品种适配
+[[ListBullet]] 11. Windows 客户端与 Web 后台
+[[ListBullet]] 12. 数据库设计与数据字典
+[[ListBullet]] 13. API 与消息协议
+[[ListBullet]] 14. 安全、可靠性与故障恢复
+[[ListBullet]] 15. 回测、仿真与策略验证
+[[ListBullet]] 16. 技术栈、开源选型与许可证
+[[ListBullet]] 17. 项目目录结构与代码规范
+[[ListBullet]] 18. 测试策略与验收标准
+[[ListBullet]] 19. 部署、运维与监控
+[[ListBullet]] 20. 24 周开发路线与里程碑
+[[ListBullet]] 21. AI 编程代理工作规范
+[[ListBullet]] 22. 风险清单、未决事项与决策记录
+[[ListBullet]] 附录 A：协议示例
+[[ListBullet]] 附录 B：官方技术参考
+[[Heading1]] 1. 产品概述与目标
+[[Heading2]] 1.1 产品定义
+QuantPilot AI 是面向 MT5 交易终端的多账户自动交易与策略管理平台。平台由原生 MQL5 EA 执行端、Windows 本地交易节点、Python 后端服务、AI 分析引擎、传统量化策略引擎、独立风控引擎、Web 管理后台和 Windows 桌面客户端组成。
+[[Heading2]] 1.2 已确认的产品定位
+项目
+已确认选择
+交易品种
+全部 MT5 支持的交易品种；运行时动态发现、校验交易规则
+交易模式
+AI + 传统量化双引擎
+账户管理
+多账户、多终端、多经纪商环境
+软件形态
+Windows 客户端 + Web 管理后台 + MT5 EA
+商业目标
+先自用验证，后续商业化销售
+暂定名称
+QuantPilot AI
+[[Heading2]] 1.3 产品目标
+[[ListBullet]] 建立稳定的 MT5 交易闭环：行情/信号 → 风控 → EA 执行 → 成交回报 → 对账。
+[[ListBullet]] 支持多个独立 MT5 终端和账户，不让一个账户的异常扩散到其他账户。
+[[ListBullet]] 让传统策略可插拔、可配置、可回测、可版本化。
+[[ListBullet]] 让 AI 负责市场状态理解、策略评分、信号过滤和研究辅助，而不是无约束地产生订单。
+[[ListBullet]] 让风控规则独立于 AI 和策略，拥有最终拒绝交易权。
+[[ListBullet]] 提供可审计的订单生命周期、账户状态、策略表现和系统事件。
+[[ListBullet]] 预留用户、授权、订阅、设备和版本管理能力。
+[[Heading2]] 1.4 非目标与明确排除项
+[[ListBullet]] 不承诺盈利、胜率或固定回报；不把回测结果描述为未来表现保证。
+[[ListBullet]] 首版不开发高频交易基础设施，不承诺微秒级延迟。
+[[ListBullet]] 首版不开发面向公众的跟单资金池、代客理财、托管或资金归集业务。
+[[ListBullet]] 不允许 LLM 直接持有券商密码或绕过 EA/风控下单。
+[[ListBullet]] 不把 AI 模型、网络连接或云服务设为 EA 执行安全的唯一依赖。
+[[ListBullet]] 不在第一版开发策略商城、第三方策略市场和自动自我修改实盘策略。
+[[Heading2]] 1.5 核心产品原则
+原则
+工程要求
+执行权唯一
+正式实盘订单由 MT5 EA 执行；任何辅助接口不得形成第二套隐蔽执行链。
+风控优先
+风险检查失败、数据过期、账户状态不明时拒绝新增风险。
+账户隔离
+每个 MT5 终端/账户独立运行上下文、凭据、状态与故障边界。
+可审计
+信号、风控决定、指令、EA 回执、订单、成交均有可关联 ID。
+幂等
+网络重试、消息重投、进程重启不得造成重复开仓。
+可恢复
+重启后从 MT5 实际账户状态重新对账，不盲目重放开仓命令。
+渐进发布
+默认模拟/只读；实盘必须由用户显式开启并经过安全检查。
+[[Heading1]] 2. 产品需求文档 PRD
+[[Heading2]] 2.1 用户角色
+角色
+权限范围
+Owner / 系统所有者
+所有账户、节点、策略、风控、授权、配置、审计和紧急停止。
+Trader / 交易操作员
+查看获授权账户，启动/暂停策略，按权限执行平仓等操作。
+Analyst / 分析员
+查看行情、策略信号、回测和报告；默认无交易执行权限。
+Viewer / 只读用户
+查看仪表盘、账户状态和报告。
+Service Agent / 服务身份
+节点与后端之间机器认证，只能访问绑定节点和账户资源。
+[[Heading2]] 2.2 功能优先级
+模块
+P0 首版必须
+P1 增强
+P2 商业化
+EA 执行
+品种发现、报价、开平仓、止损止盈、回报、日志
+挂单、部分成交增强、订单恢复
+远程版本分批升级
+本地节点
+终端发现、账户绑定、命令转发、心跳
+多节点编排、节点自更新
+租户级节点配额
+量化策略
+趋势、均线、RSI/MACD、突破、均值回归
+波动率/价格行为/组合策略
+策略 SDK/商城
+AI
+市场状态分类、策略评分、信号过滤
+交易复盘、研究助手
+租户模型路由与成本计量
+风控
+单笔风险、日亏损、回撤、点差、仓位上限、熔断
+相关性/组合风险、新闻时段规则
+策略级/租户级风险模板
+多账户
+多终端、账户快照、持仓/订单同步
+账户组和复制配置（非盲目复制）
+商业用户多租户
+后台
+账户、持仓、策略、风险、日志
+回测报表、告警规则
+订阅、授权、计费
+桌面端
+节点安装、终端配置、服务状态
+自动升级、诊断包
+品牌定制
+[[Heading2]] 2.3 核心用户故事
+[[ListBullet]] 作为 Owner，我可以添加一个 MT5 终端，并验证终端路径、登录账户、服务器名称和交易权限。
+[[ListBullet]] 作为 Owner，我可以将一个账户绑定到唯一的本地交易节点，并为它设置独立风险限额。
+[[ListBullet]] 作为 Trader，我可以在模拟模式下启用一个策略实例，并看到它生成的信号、风控决定和 EA 执行回报。
+[[ListBullet]] 作为 Owner，我可以设置全局停止新开仓，并单独决定是否撤销挂单或管理已有仓位。
+[[ListBullet]] 作为 Analyst，我可以查看策略在不同品种和周期上的回测结果，包括成本、最大回撤和样本外结果。
+[[ListBullet]] 作为 Owner，我可以在 AI 服务不可用时让系统切换到传统策略模式或停止新增交易。
+[[ListBullet]] 作为 Viewer，我只能查看被授权账户，不可以更改交易配置或执行操作。
+[[Heading2]] 2.4 主要页面需求
+页面
+核心内容
+关键操作
+总览仪表盘
+总账户数、在线节点、总余额/净值、当日盈亏、风险状态、异常告警
+账户筛选、时间范围、跳转账户
+账户中心
+终端、券商、账户标识、连接状态、账户类型、余额/净值、保证金
+添加、绑定、暂停、只读检查
+实时交易
+持仓、挂单、订单、成交、浮动盈亏、止损止盈
+按权限平仓/修改/撤单
+策略中心
+策略目录、版本、实例、品种/周期、参数、状态
+创建实例、启停、复制配置
+AI 中心
+市场状态、策略评分、AI 结论、置信度、模型版本、数据时间
+查看解释、启停 AI 过滤
+风控中心
+单笔风险、日亏损、回撤、敞口、熔断状态
+修改限额、模拟检查、紧急停止
+回测中心
+任务、参数、成本模型、净值曲线、指标、样本外报告
+创建/取消/比较任务
+系统中心
+节点、服务、队列、心跳、错误、版本、资源使用
+诊断、重启服务、导出日志
+审计中心
+操作者、时间、对象、旧值/新值、请求 ID、结果
+检索、导出
+授权中心
+用户、设备、套餐、授权状态、版本权限
+商业化阶段启用
+[[Heading2]] 2.5 关键业务规则
+[[ListBullet]] 账户创建后默认状态为 DISABLED 或 OBSERVE_ONLY；不得自动开始实盘交易。
+[[ListBullet]] 每个交易账户必须绑定一个 account_id、terminal_id、node_id 和 broker_server 标识。
+[[ListBullet]] 同一账户的真实交易指令必须按账户串行化执行；不同账户可以并行。
+[[ListBullet]] 同一交易指令的重复投递必须返回原有执行状态，不得再次开仓。
+[[ListBullet]] 所有指令都必须设置 expires_at；过期指令不可执行。
+[[ListBullet]] 所有策略信号必须带 symbol、timeframe、生成时间、数据时间、策略版本和信号 ID。
+[[ListBullet]] AI 输出只作为决策输入；最终交易命令必须由策略编排器生成并通过风控。
+[[ListBullet]] 风控配置更新必须记录审计事件，并支持生效时间与版本。
+[[ListBullet]] 当账户、行情、品种规格、终端连接状态任一关键数据过期或未知时，禁止新增风险。
+[[ListBullet]] 平仓、撤单、止损调整与新开仓应使用不同 command_type 和权限控制。
+[[Heading1]] 3. 用户权限与核心业务流程
+[[Heading2]] 3.1 账户接入流程
+[[CodeBlock]] 用户在 Windows 客户端添加 MT5 终端
+[[CodeBlock]]   -> 本地 Agent 检查终端路径和进程
+[[CodeBlock]]   -> 读取终端版本、服务器、账户登录状态
+[[CodeBlock]]   -> 用户在 MT5 自身终端完成券商登录
+[[CodeBlock]]   -> Agent 读取 account_info / terminal_info
+[[CodeBlock]]   -> 用户确认账户归属与用途（模拟/实盘）
+[[CodeBlock]]   -> 后端创建 terminal/account 绑定
+[[CodeBlock]]   -> EA 安装并完成心跳注册
+[[CodeBlock]]   -> 初始状态 OBSERVE_ONLY
+[[CodeBlock]]   -> 完成品种规格和交易权限检查
+[[CodeBlock]]   -> 用户显式开启策略实例
+[[Heading2]] 3.2 交易闭环
+[[CodeBlock]] Tick / Bar / Scheduled Event
+[[CodeBlock]]   -> Market Data Normalizer
+[[CodeBlock]]   -> Feature Calculator
+[[CodeBlock]]   -> Strategy Engine: 0..N signals
+[[CodeBlock]]   -> AI Context / Strategy Evaluator (optional)
+[[CodeBlock]]   -> Signal Aggregator
+[[CodeBlock]]   -> Risk Engine (authoritative gate)
+[[CodeBlock]]   -> Trade Command Builder
+[[CodeBlock]]   -> Durable Command Store + Outbox
+[[CodeBlock]]   -> Local Trading Agent
+[[CodeBlock]]   -> MT5 EA validates command
+[[CodeBlock]]   -> MT5 trade request
+[[CodeBlock]]   -> OnTradeTransaction / reconciliation
+[[CodeBlock]]   -> Execution Report
+[[CodeBlock]]   -> Backend order/deal/position projection
+[[CodeBlock]]   -> Audit + Metrics + UI update
+[[Heading2]] 3.3 紧急停止流程
+[[ListNumber]] Owner 触发全局或账户级 STOP_NEW_RISK。
+[[ListNumber]] 后端写入不可丢失的风控状态变更，并广播给绑定节点。
+[[ListNumber]] 本地 Agent 和 EA 同时读取停止状态；EA 本地也保留可手动启用的停止开关。
+[[ListNumber]] 所有新开仓命令被拒绝；平仓/撤单是否允许由单独权限和规则决定。
+[[ListNumber]] 系统持续同步已有持仓，直到用户解除停止或按预设策略完成处理。
+[[ListNumber]] 记录操作者、时间、范围、原因、节点确认和账户确认。
+[[Heading1]] 4. 总体系统架构
+[[Heading2]] 4.1 逻辑架构
+[[CodeBlock]]                     ┌─────────────────────────────┐
+[[CodeBlock]]                     │ Windows Client / Web UI     │
+[[CodeBlock]]                     └──────────────┬──────────────┘
+[[CodeBlock]]                                    │ HTTPS / WebSocket
+[[CodeBlock]]                     ┌──────────────▼──────────────┐
+[[CodeBlock]]                     │ API Gateway / Auth / RBAC   │
+[[CodeBlock]]                     └──────────────┬──────────────┘
+[[CodeBlock]]                                    │
+[[CodeBlock]]        ┌───────────────────────────┼────────────────────────────┐
+[[CodeBlock]]        │                           │                            │
+[[CodeBlock]] ┌──────▼────────┐        ┌─────────▼────────┐        ┌──────────▼───────┐
+[[CodeBlock]] │ Strategy      │        │ AI Analysis      │        │ Risk Engine      │
+[[CodeBlock]] │ Engine        │        │ Engine            │        │ Authoritative    │
+[[CodeBlock]] └──────┬────────┘        └─────────┬────────┘        └──────────┬───────┘
+[[CodeBlock]]        └───────────────────────────┼────────────────────────────┘
+[[CodeBlock]]                                    │
+[[CodeBlock]]                     ┌──────────────▼──────────────┐
+[[CodeBlock]]                     │ Command Service + Outbox    │
+[[CodeBlock]]                     └──────────────┬──────────────┘
+[[CodeBlock]]                                    │ NATS / HTTPS
+[[CodeBlock]]                     ┌──────────────▼──────────────┐
+[[CodeBlock]]                     │ Local Trading Agent         │
+[[CodeBlock]]                     └──────────────┬──────────────┘
+[[CodeBlock]]                                    │ local IPC / HTTP
+[[CodeBlock]]                     ┌──────────────▼──────────────┐
+[[CodeBlock]]                     │ MT5 EA / MT5 Terminal       │
+[[CodeBlock]]                     └──────────────┬──────────────┘
+[[CodeBlock]]                                    │
+[[CodeBlock]]                            Broker Trade Server
+[[Heading2]] 4.2 部署边界
+组件
+建议部署
+说明
+Web/API/数据库/NATS
+Linux 云服务器或自有服务器
+不直接保存券商主密码；管理面和交易执行面隔离
+AI/策略服务
+Linux 服务容器
+可按账户/策略异步处理；关键实时路径需设置延迟预算
+Local Trading Agent
+Windows VPS/用户 Windows 主机
+管理本机多个 MT5 终端；凭据优先本地安全存储
+MT5 Terminal + EA
+Windows 环境
+每个账户建议独立终端数据目录/进程，按实际终端许可与券商规则部署
+Web UI
+静态站点/CDN 或 API 同域
+使用 HTTPS、短时访问令牌和 RBAC
+[[Heading2]] 4.3 进程隔离原则
+[[ListBullet]] 每个 MT5 终端独立进程；避免多个账户复用同一个终端上下文造成账户切换或状态错配。
+[[ListBullet]] 每个账户拥有独立 account worker 和 command queue；账户内串行，账户间并行。
+[[ListBullet]] Agent 负责进程监督、健康检查、协议转发和状态同步；不实现第二套交易策略。
+[[ListBullet]] 后台服务无权直接绕过 EA 交易；Python MetaTrader5 API 只用于受控诊断/研究或只读采集，首版禁止成为正式实盘下单路径。
+[[Heading2]] 4.4 一致性模型
+数据库是配置、策略版本、风险规则、命令意图和审计的权威存储；MT5 终端/券商服务器是实际订单、成交和持仓的权威来源。后台数据库中的 positions/orders 是可重建的投影，不得在对账失败时被当作真实持仓事实。
+[[Heading1]] 5. MT5 EA 执行端详细设计
+[[Heading2]] 5.1 EA 内部组件
+组件
+职责
+ExpertAdvisor Main
+OnInit/OnDeinit/OnTick/OnTimer 生命周期协调
+Terminal Adapter
+封装 AccountInfo、TerminalInfo、SymbolInfo、Trade permissions
+Market Snapshot
+按需采集报价、点差、时间戳、K线快照
+Symbol Registry
+发现/选择品种，读取交易规格并版本化上报
+Command Poller
+从本地 Agent 获取命令；校验账户、有效期、签名/认证上下文
+Command Validator
+检查 schema、命令 ID、策略/账户绑定、风控版本、重复执行
+Execution Adapter
+封装 OrderCheck/OrderSend 或 CTrade 调用及返回码处理
+Trade Event Handler
+处理 OnTradeTransaction，记录订单/成交事件
+Reconciliation
+周期性读取 positions/orders/history 与后台状态对账
+Local Safety Guard
+交易开关、最大手数、允许品种、最大订单数、过期命令拒绝
+Telemetry & Logger
+心跳、错误码、执行耗时、交易状态和版本信息
+[[Heading2]] 5.2 EA 生命周期
+[[CodeBlock]] OnInit:
+[[CodeBlock]]   load immutable config
+[[CodeBlock]]   validate terminal/account identity
+[[CodeBlock]]   verify algo-trading permission
+[[CodeBlock]]   initialize timers and local state
+[[CodeBlock]]   register EA instance
+[[CodeBlock]]   publish terminal/account/symbol capabilities
+[[CodeBlock]]   start in OBSERVE_ONLY unless explicitly authorized
+[[CodeBlock]] OnTimer:
+[[CodeBlock]]   heartbeat
+[[CodeBlock]]   poll command queue
+[[CodeBlock]]   refresh risk/kill-switch state
+[[CodeBlock]]   sync symbol specifications
+[[CodeBlock]]   reconcile orders/positions
+[[CodeBlock]]   flush telemetry
+[[CodeBlock]] OnTick:
+[[CodeBlock]]   update lightweight market snapshot
+[[CodeBlock]]   run only strategies explicitly configured for tick execution
+[[CodeBlock]]   avoid blocking network or expensive model inference
+[[CodeBlock]] OnTradeTransaction:
+[[CodeBlock]]   capture transaction event
+[[CodeBlock]]   append local event record
+[[CodeBlock]]   notify Agent asynchronously
+[[CodeBlock]]   reconcile final state after server response
+[[CodeBlock]] OnDeinit:
+[[CodeBlock]]   stop accepting new commands
+[[CodeBlock]]   flush logs/events
+[[CodeBlock]]   report shutdown reason
+[[CodeBlock]]   release resources
+[[Heading2]] 5.3 交易权限检查
+[[ListBullet]] 终端级 Algo Trading 是否允许。
+[[ListBullet]] EA 属性中的 Allow Algo Trading 是否允许。
+[[ListBullet]] 账户是否允许交易、是否为只读/投资者密码登录。
+[[ListBullet]] 品种是否可交易、当前是否处于交易时段。
+[[ListBullet]] 账户保证金、交易模式、FIFO/对冲/净额规则。
+[[ListBullet]] EA 实例是否已绑定当前 account login + server + terminal fingerprint。
+[[Heading2]] 5.4 品种规格适配
+字段
+用途
+规则
+SYMBOL_VOLUME_MIN/MAX/STEP
+最小/最大手数和步长
+手数必须按步长规范化；不可超限
+SYMBOL_TRADE_TICK_SIZE
+最小价格变动
+价格按 tick size 对齐，不只依赖 digits
+SYMBOL_TRADE_TICK_VALUE(_PROFIT/_LOSS)
+tick 价值
+用于风险估算；应与 OrderCalcProfit 结果交叉校验
+SYMBOL_POINT / DIGITS
+报价单位/精度
+显示精度不等于最小可交易价格步长
+SYMBOL_TRADE_STOPS_LEVEL
+止损/挂单距离限制
+下单前检查，执行失败时记录服务器返回码
+SYMBOL_TRADE_FREEZE_LEVEL
+冻结距离
+修改/撤单时检查
+SYMBOL_TRADE_MODE
+交易模式
+检查 full/long-only/short-only/close-only/disabled 等状态
+SYMBOL_FILLING_MODE
+成交填充规则
+按经纪商/品种支持的 filling policy 选择
+SYMBOL_TRADE_CALC_MODE
+保证金/盈亏计算模式
+不同 CFD/Futures/Forex 计算规则不同
+SYMBOL_SWAP_*
+隔夜费用规则
+回测成本与持仓风险分析使用
+注意：上述枚举和字段需以目标 MT5 build 的 MQL5 官方文档为准。规格变化时重新读取并生成 symbol_spec_version；下单命令应携带规格版本或在执行前重新校验。
+[[Heading2]] 5.5 订单执行状态机
+[[CodeBlock]] CREATED
+[[CodeBlock]]   -> VALIDATED
+[[CodeBlock]]   -> SENT
+[[CodeBlock]]   -> ACCEPTED / PLACED
+[[CodeBlock]]   -> PARTIALLY_FILLED
+[[CodeBlock]]   -> FILLED
+[[CodeBlock]]   -> REJECTED / EXPIRED / CANCELLED
+[[CodeBlock]]   -> UNKNOWN (timeout / disconnect; requires reconciliation)
+UNKNOWN 是重要状态：请求超时不代表订单没有被服务器接收。遇到 UNKNOWN 时禁止简单重发开仓请求，必须先按 client_command_id、订单备注/关联标识、订单历史和成交历史进行对账；若仍不能确定，进入人工处理或账户暂停状态。
+[[Heading2]] 5.6 MQL5 执行要求
+[[ListBullet]] 执行前使用 OrderCheck 或等价检查；记录请求参数和检查结果。
+[[ListBullet]] OrderSend 返回 true 只表示请求处理阶段成功，不等于订单最终成交；必须检查 retcode，并跟踪交易事务/订单/成交。
+[[ListBullet]] 对每个 EA 分配稳定 magic number；comment 放置短 command token，但不可单独依赖 comment 作为唯一幂等键。
+[[ListBullet]] 平仓时明确指定 position ticket，正确处理 hedging/netting 账户差异。
+[[ListBullet]] 不得在 OnTick 中执行阻塞式网络调用或 LLM 推理。
+[[ListBullet]] 所有价格和手数都经过 tick size、volume step 和交易规则规范化。
+[[Heading2]] 5.7 EA 输入参数建议
+参数
+类型
+默认建议
+ExecutionMode
+enum
+OBSERVE_ONLY
+AllowNewOrders
+bool
+false
+AgentEndpoint
+string
+本地 Agent 地址
+AccountBindingId
+string
+由安装/绑定流程生成
+MagicNumber
+long
+每个策略实例唯一
+HeartbeatSeconds
+int
+5～15 秒，可配置
+CommandPollMs
+int
+按终端负载和延迟预算配置
+MaxCommandAgeSeconds
+int
+短有效期，按策略周期配置
+MaxLotHardLimit
+double
+必须由账户级安全配置下发
+AllowedSymbols
+string/list
+默认从账户授权配置获取
+LogLevel
+enum
+INFO
+[[Heading2]] 5.8 EA 本地安全边界
+[[ListBullet]] EA 默认不接受新开仓命令，直到绑定、风控同步和用户授权完成。
+[[ListBullet]] 若 Agent 断连，停止新增风险；已存在仓位按券商服务器端 SL/TP 和预设本地管理规则处理。
+[[ListBullet]] EA 不得因为云端超时而自动把过期命令排队执行。
+[[ListBullet]] 远程配置只能在白名单字段范围内更新；AI 不能修改 MaxLotHardLimit、DailyLossLimit 等安全上限。
+[[Heading1]] 6. 本地交易节点 Local Trading Agent
+[[Heading2]] 6.1 职责边界
+[[ListBullet]] 管理本机 MT5 终端实例、安装路径、进程、版本和账户身份。
+[[ListBullet]] 与云端建立经过认证的双向连接；主动出站连接优先，避免开放不必要的入站端口。
+[[ListBullet]] 在本机提供仅绑定 loopback 或受保护 IPC 的 EA 通信端点。
+[[ListBullet]] 维护命令本地缓存、回执队列、账户状态快照和事件补传。
+[[ListBullet]] 执行终端启动/停止、EA 部署、日志采集和健康检查。
+[[ListBullet]] 不保存或执行策略逻辑；不成为绕过 EA 的交易下单组件。
+[[Heading2]] 6.2 建议实现
+部分
+建议
+语言
+Python 3.12+ 或 Rust；首版建议 Python，后续性能瓶颈再替换
+服务模式
+Windows Service；可由 Tauri 客户端管理
+进程监督
+subprocess + Windows Job Objects/服务控制；明确超时与退出码
+本地通信
+127.0.0.1 HTTP 或 named pipe；请求带本地短期 token
+云端通信
+HTTPS/WebSocket 或 NATS WebSocket/专用安全隧道；首版可 HTTPS 长轮询
+本地存储
+SQLite/加密配置文件，用于离线缓存和事件队列
+日志
+结构化 JSON 日志，轮转、脱敏、可打包诊断
+[[Heading2]] 6.3 多终端隔离
+[[ListBullet]] 每个终端独立 data directory/portable 配置（如使用 portable mode，需先验证券商安装方式兼容）。
+[[ListBullet]] 启动时固定 terminal executable path、data path、broker server 和 login identity。
+[[ListBullet]] 不得通过“当前活动终端”或窗口标题推断账户身份；必须读取 terminal/account API 并比对绑定。
+[[ListBullet]] Agent 发现 login/server 与绑定信息不匹配时，将账户标记 IDENTITY_MISMATCH 并停止新开仓。
+[[Heading1]] 7. 传统量化策略引擎
+[[Heading2]] 7.1 设计目标
+策略引擎负责产生可解释、可回测、可版本化的信号，不直接提交真实订单。策略输入是标准化行情与特征，输出是 StrategySignal。策略引擎可以在 Python 中进行研究和组合；若某策略需要极低延迟或必须与 EA 同步执行，可另行实现经过一致性测试的 MQL5 版本，但必须共享同一策略规范和测试样例。
+[[Heading2]] 7.2 策略接口
+[[CodeBlock]] class Strategy:
+[[CodeBlock]]     strategy_id: str
+[[CodeBlock]]     version: str
+[[CodeBlock]]     supported_symbols: list[str] | SymbolSelector
+[[CodeBlock]]     supported_timeframes: list[str]
+[[CodeBlock]]     def validate_config(self, config) -> ValidationResult: ...
+[[CodeBlock]]     def warmup(self, market_history, config) -> None: ...
+[[CodeBlock]]     def on_bar(self, market_snapshot, features, config) -> list[Signal]: ...
+[[CodeBlock]]     def on_tick(self, tick, state, config) -> list[Signal]: ...
+[[CodeBlock]]     def on_reset(self) -> None: ...
+[[Heading2]] 7.3 首批策略
+策略
+主要输入
+信号逻辑示例
+注意事项
+Trend Following
+EMA、ADX、ATR
+趋势方向与强度达到阈值
+震荡环境容易反复止损
+Moving Average Cross
+快慢 EMA/SMA
+快线上穿/下穿慢线
+需避免未收盘 K 线抖动
+RSI/MACD Momentum
+RSI、MACD、成交/波动特征
+动量方向与阈值过滤
+超买超卖不等于立即反转
+Breakout
+近期高低点、ATR、波动压缩
+收盘突破区间并通过波动过滤
+假突破和滑点风险
+Mean Reversion
+Bollinger、Z-score、ATR
+价格偏离均值并出现回归条件
+强趋势期间可能持续逆势
+Volatility Regime
+ATR、realized volatility
+按波动状态切换策略集合
+不单独作为方向信号
+Multi-timeframe
+M5/M15/H1/H4 特征
+高周期定方向，低周期触发
+必须防止未来数据泄漏
+Price Action
+结构高低点、K 线形态
+结构突破/回踩确认
+定义必须可量化和可复现
+[[Heading2]] 7.4 信号标准结构
+[[CodeBlock]] {
+[[CodeBlock]]   "signal_id": "uuid",
+[[CodeBlock]]   "strategy_id": "trend_following",
+[[CodeBlock]]   "strategy_version": "1.0.0",
+[[CodeBlock]]   "account_id": "account-uuid",
+[[CodeBlock]]   "symbol": "EURUSD",
+[[CodeBlock]]   "timeframe": "H1",
+[[CodeBlock]]   "direction": "BUY",
+[[CodeBlock]]   "signal_type": "ENTRY",
+[[CodeBlock]]   "strength": 0.72,
+[[CodeBlock]]   "generated_at": "2026-10-30T12:00:00Z",
+[[CodeBlock]]   "market_data_at": "2026-10-30T12:00:00Z",
+[[CodeBlock]]   "reference_price": 1.08500,
+[[CodeBlock]]   "proposed_stop_loss": 1.08200,
+[[CodeBlock]]   "proposed_take_profit": 1.09100,
+[[CodeBlock]]   "valid_until": "2026-10-30T13:00:00Z",
+[[CodeBlock]]   "features_ref": "feature-snapshot-id",
+[[CodeBlock]]   "reason_codes": ["EMA_TREND_UP", "ADX_ABOVE_THRESHOLD"]
+[[CodeBlock]] }
+[[Heading2]] 7.5 信号合并与冲突处理
+[[ListBullet]] 同一账户/品种/方向/策略周期可设置去重窗口。
+[[ListBullet]] 多策略同向信号可以按策略权重合并，但权重必须来自可审计配置或经过验证的评估结果。
+[[ListBullet]] 多策略反向信号默认标记 CONFLICT，不允许简单相互抵消后自动下单。
+[[ListBullet]] 策略组合必须明确净敞口、相关性和重复风险；同一方向多策略不是独立风险。
+[[ListBullet]] 每个信号都必须记录 strategy_version、feature snapshot 和 data timestamp，确保回测可复现。
+[[Heading2]] 7.6 策略参数与版本
+[[ListBullet]] 配置采用 JSON Schema/Pydantic 验证；配置版本不可原地覆盖，更新产生新 revision。
+[[ListBullet]] 策略实例绑定固定策略版本和参数 revision。
+[[ListBullet]] 实盘启用的策略版本不可自动替换；升级需审批、回测和灰度。
+[[ListBullet]] 策略参数优化结果仅作为候选配置，不能自动覆盖实盘配置。
+[[Heading1]] 8. AI 分析引擎
+[[Heading2]] 8.1 AI 的职责边界
+AI 是分析和辅助决策模块。它可以输出市场状态、策略适用评分、信号风险解释和复盘结论；不能直接调用交易执行接口，不能读取券商主密码，不能修改风控硬上限。AI 输出必须经过 schema 校验、数据新鲜度检查、策略编排和独立风控。
+[[Heading2]] 8.2 推荐分层
+层级
+方法
+输出
+Market Regime
+统计特征 + 监督/无监督模型
+TREND_UP / TREND_DOWN / RANGE / HIGH_VOL / UNKNOWN
+Strategy Evaluator
+历史滚动表现 + 市场状态条件模型
+每个策略适用分数、风险标签
+Signal Filter
+规则模型/分类模型
+ALLOW / REJECT / REVIEW + 原因码
+Research Assistant
+LLM API
+自然语言解释、报告、策略研究建议
+Post-trade Review
+统计模型 + LLM 总结
+交易归因、异常归类、改进建议
+[[Heading2]] 8.3 AI 输入数据
+[[ListBullet]] OHLCV / Tick / Spread / ATR / realized volatility / trend features。
+[[ListBullet]] 品种规格、交易时段、账户状态摘要（不含密码/敏感凭据）。
+[[ListBullet]] 策略信号、策略版本、近期策略表现和风险上下文。
+[[ListBullet]] 可选新闻/日历数据必须带来源、发布时间、时区和采集时间；数据源失效时标记 UNKNOWN。
+[[Heading2]] 8.4 AI 输出严格结构
+[[CodeBlock]] {
+[[CodeBlock]]   "analysis_id": "uuid",
+[[CodeBlock]]   "model_provider": "provider-name",
+[[CodeBlock]]   "model_id": "model-version",
+[[CodeBlock]]   "prompt_version": "market-eval-v1",
+[[CodeBlock]]   "created_at": "2026-10-30T12:00:05Z",
+[[CodeBlock]]   "input_snapshot_id": "snapshot-id",
+[[CodeBlock]]   "market_regime": "RANGE",
+[[CodeBlock]]   "regime_confidence": 0.81,
+[[CodeBlock]]   "strategy_scores": [
+[[CodeBlock]]     {"strategy_id": "trend_following", "score": 0.24, "reason_codes": ["RANGE_MARKET"]},
+[[CodeBlock]]     {"strategy_id": "mean_reversion", "score": 0.68, "reason_codes": ["RANGE_STABILITY"]}
+[[CodeBlock]]   ],
+[[CodeBlock]]   "signal_decision": "REVIEW",
+[[CodeBlock]]   "risk_flags": ["SPREAD_ELEVATED"],
+[[CodeBlock]]   "explanation": "简短解释",
+[[CodeBlock]]   "expires_at": "2026-10-30T12:05:00Z"
+[[CodeBlock]] }
+[[Heading2]] 8.5 AI 运行模式
+模式
+行为
+首版建议
+OFF
+仅传统策略 + 风控
+必须支持；AI 服务故障时可回退
+ADVISORY
+AI 展示分析，不改变交易许可
+首版默认 AI 模式
+FILTER
+AI 可过滤信号，但不能新增信号或放宽风控
+完成验证后启用
+REGIME_ROUTING
+AI/分类模型选择允许的策略集合
+第二阶段
+AUTONOMOUS_RESEARCH
+AI 生成候选策略/参数供人工审核
+后续；禁止直接改实盘
+[[Heading2]] 8.6 模型治理
+[[ListBullet]] 记录 provider、model ID、temperature/参数、prompt version、输入快照 hash、输出、耗时和成本。
+[[ListBullet]] 模型输出必须通过 JSON Schema 校验；无效/超时/过期输出按 UNKNOWN 处理。
+[[ListBullet]] 所有模型版本上线前做固定数据集评估、回归测试和影子运行。
+[[ListBullet]] AI 不能使用未来行情、未公布新闻或回测后验信息。
+[[ListBullet]] LLM 不适合每个 Tick 调用；按 K 线收盘、策略事件或固定分析间隔触发。
+[[ListBullet]] 建立 AI 输出漂移监控；漂移时自动降级到 OFF 或 ADVISORY。
+[[Heading1]] 9. 独立风控引擎
+[[Heading2]] 9.1 风控架构
+风控服务是交易许可的最终权威组件。它接收信号和账户快照，输出明确的 ALLOW / REJECT / REDUCE / REVIEW。EA 还必须执行本地硬限制，因此风控采用云端策略级审核 + EA 本地执行级防护的双层结构。
+[[Heading2]] 9.2 风控检查顺序
+[[ListNumber]] 系统级：全局停止、维护窗口、服务状态、数据时间戳。
+[[ListNumber]] 账户级：账户绑定、交易权限、账户状态、日亏损、最大回撤、保证金水平。
+[[ListNumber]] 品种级：交易模式、交易时段、点差、报价新鲜度、规格版本。
+[[ListNumber]] 组合级：同向敞口、品种相关性、最大持仓数、策略冲突。
+[[ListNumber]] 订单级：手数、止损、最大滑点、预估亏损、保证金占用。
+[[ListNumber]] 执行级：EA 本地硬限制、订单请求检查和服务器返回码。
+[[Heading2]] 9.3 仓位计算
+风险金额优先由账户净值或余额乘以风险比例计算；具体采用哪一种基数必须由账户配置明确。止损距离换算为账户货币的损失金额，应优先使用 MT5 的 OrderCalcProfit 或经验证的经纪商计算规则，不应简单假设所有品种的 pip value 一致。
+[[CodeBlock]] risk_budget = risk_basis * risk_fraction
+[[CodeBlock]] loss_per_lot = abs(
+[[CodeBlock]]     OrderCalcProfit(direction, symbol, 1.0, entry_price, stop_price)
+[[CodeBlock]] )
+[[CodeBlock]] raw_volume = risk_budget / loss_per_lot
+[[CodeBlock]] volume = floor_to_step(raw_volume, volume_step)
+[[CodeBlock]] volume = min(volume, symbol_volume_max, account_hard_max_volume)
+[[CodeBlock]] if volume < symbol_volume_min:
+[[CodeBlock]]     REJECT("VOLUME_BELOW_MIN")
+实际执行时还必须校验手续费、滑点缓冲、汇率换算、最小止损距离、保证金、volume step 和服务器端规则。若无法可靠计算预估损失，拒绝新增交易。
+[[Heading2]] 9.4 风控规则清单
+规则
+计算/判断
+触发动作
+单笔风险上限
+按止损预估亏损/风险基数
+拒绝或缩小手数
+每日亏损上限
+按配置的日切时区和起始净值/余额计算
+停止新开仓；按策略管理已有仓位
+最大回撤
+从指定峰值权益/净值计算回撤
+账户级熔断
+最大持仓数
+当前有效持仓数量
+拒绝新开仓
+最大品种敞口
+按品种/方向/账户换算风险敞口
+拒绝或缩小
+最大点差
+当前 spread 与品种阈值比较
+拒绝新开仓
+报价过期
+tick timestamp 与当前时间差
+拒绝新开仓
+滑点保护
+成交价格与请求/参考价格差
+撤销后续动作/报警；按成交事实对账
+连续亏损
+已结算交易序列
+冷却/暂停策略
+保证金水平
+margin level/free margin
+拒绝新增风险
+断线/身份不匹配
+心跳、账户身份、terminal 状态
+停止新开仓
+[[Heading2]] 9.5 熔断状态机
+[[CodeBlock]] NORMAL
+[[CodeBlock]]   -> WARNING (接近阈值)
+[[CodeBlock]]   -> STOP_NEW_RISK (禁止新增风险)
+[[CodeBlock]]   -> CANCEL_PENDING (可选：撤销未成交挂单)
+[[CodeBlock]]   -> MANAGE_EXISTING (按预先配置管理已有仓位)
+[[CodeBlock]]   -> LOCKED (需要人工解除)
+[[Heading2]] 9.6 风控配置原则
+[[ListBullet]] 首版建议将单笔风险默认设为 0，或账户处于模拟模式；由用户显式配置后才能启用。
+[[ListBullet]] 提供建议范围而不是硬编码收益/风险承诺；阈值必须按账户和品种配置。
+[[ListBullet]] AI 和策略服务没有修改风控硬上限的权限。
+[[ListBullet]] 风控规则变更必须二次确认、记录审计并生成新版本。
+[[ListBullet]] 全局停止与账户停止均应支持离线/本地触发。
+[[Heading1]] 10. 多账户与品种适配
+[[Heading2]] 10.1 账户模型
+[[CodeBlock]] Tenant (future commercial)
+[[CodeBlock]]   └── User
+[[CodeBlock]]        └── TradingNode
+[[CodeBlock]]             └── MT5Terminal
+[[CodeBlock]]                  └── TradingAccount
+[[CodeBlock]]                       ├── AccountRiskProfile
+[[CodeBlock]]                       ├── StrategyInstances
+[[CodeBlock]]                       ├── Positions / Orders / Deals
+[[CodeBlock]]                       └── EAInstances
+[[Heading2]] 10.2 账户状态
+状态
+含义
+DISCOVERED
+终端/账户被发现，尚未完成绑定
+OBSERVE_ONLY
+只读观察，不允许新增交易
+SIMULATED
+模拟环境，允许测试命令
+ARMED
+用户显式授权实盘，但仍需每条命令通过风控
+PAUSED
+暂停新交易
+STOP_NEW_RISK
+风控熔断，禁止新增风险
+DISCONNECTED
+终端或节点不可用
+IDENTITY_MISMATCH
+实际登录账户与绑定身份不一致
+ERROR_LOCKED
+关键错误，需要人工处理
+[[Heading2]] 10.3 账户隔离要求
+[[ListBullet]] 命令、风险、队列、EA magic、日志和数据均需带 account_id。
+[[ListBullet]] 数据库所有账户查询必须执行租户/用户权限过滤；商业化阶段增加数据库 RLS 或等价隔离。
+[[ListBullet]] 每账户设置独立最大风险、最大订单数、允许品种、策略集合。
+[[ListBullet]] 不同账户不可共享券商凭据；不同终端不可假设同一品种规格相同。
+[[Heading2]] 10.4 全品种发现流程
+[[CodeBlock]] EA/Agent startup:
+[[CodeBlock]]   enumerate terminal symbols
+[[CodeBlock]]   for each symbol:
+[[CodeBlock]]       read trade mode, volume rules, tick size/value, calc mode,
+[[CodeBlock]]       stops/freeze level, filling modes, sessions where available
+[[CodeBlock]]       mark visible/selectable/tradable status
+[[CodeBlock]]       calculate stable spec_hash
+[[CodeBlock]]       publish symbol catalog snapshot
+[[CodeBlock]] Backend:
+[[CodeBlock]]   store broker-specific symbol alias and specification version
+[[CodeBlock]]   map normalized instrument identity separately from broker symbol name
+[[CodeBlock]]   reject signals for unknown/stale spec versions
+统一品种身份不能只依赖字符串 EURUSD；不同券商可能使用 EURUSD.a、EURUSDm、EURUSD.pro 等名称。建议建立 canonical_instrument（如 FX:EUR/USD）与 broker_symbol（实际终端名称）的映射，并允许人工校正。
+[[Heading1]] 11. Windows 客户端与 Web 后台
+[[Heading2]] 11.1 技术建议
+层
+选型
+说明
+前端框架
+Vue 3 + TypeScript + Vite
+Web 与桌面端复用组件
+桌面容器
+Tauri 2
+调用本地 Agent 的受控命令，不将交易密码暴露给前端
+UI
+Element Plus 或 Naive UI
+选定一个，不混用多个设计系统
+图表
+TradingView Lightweight Charts
+行情与净值曲线；核查其许可证和使用条款
+状态管理
+Pinia
+账户、节点、UI 状态
+数据请求
+TanStack Query for Vue 或封装 fetch
+缓存、重试、失效管理
+实时更新
+WebSocket/SSE
+订单、账户状态和告警推送
+[[Heading2]] 11.2 Windows 客户端功能
+[[ListBullet]] 安装向导：检查 Windows 版本、运行权限、磁盘空间、网络和 MT5 安装。
+[[ListBullet]] 终端管理：扫描、添加、启动、停止、绑定、检测版本。
+[[ListBullet]] EA 管理：部署 EA 文件、配置参数、核对版本和运行状态。
+[[ListBullet]] 本地 Agent：安装为服务、启动/停止、健康状态、日志和诊断。
+[[ListBullet]] 连接管理：API 地址、节点注册、设备认证、网络诊断。
+[[ListBullet]] 安全管理：本地密钥保护、敏感信息脱敏、权限确认。
+[[Heading2]] 11.3 Web 后台功能
+[[ListBullet]] 账户与节点总览、账户组筛选、策略实例监控。
+[[ListBullet]] 实时持仓、订单、成交和盈亏视图。
+[[ListBullet]] 风控规则、停止开仓、告警和审计。
+[[ListBullet]] 策略目录、参数版本、信号和回测结果。
+[[ListBullet]] AI 分析、模型状态、调用成本和降级状态。
+[[ListBullet]] 用户、角色和授权管理（商业化阶段）。
+[[Heading2]] 11.4 UI 关键交互约束
+[[ListBullet]] 所有交易类按钮明确区分“停止新开仓”“撤销挂单”“平仓全部”，不得使用含糊的“停止”单一按钮。
+[[ListBullet]] 危险操作显示账户/账户组数量、影响范围、预计动作，并要求二次确认。
+[[ListBullet]] 实时数据标记更新时间和连接状态；过期数据不可伪装成实时。
+[[ListBullet]] 显示账户货币和时区；汇总不同账户货币时明确换算汇率与时间。
+[[Heading1]] 12. 数据库设计与数据字典
+[[Heading2]] 12.1 数据库约定
+[[ListBullet]] 主键统一 UUID；外部 MT5 ticket 使用 BIGINT/字符串保存，避免误用为内部主键。
+[[ListBullet]] 所有时间存 UTC timestamptz；展示时按用户时区转换。
+[[ListBullet]] 金额采用 NUMERIC/Decimal，不用 float 存储资金和价格。
+[[ListBullet]] 交易事件和审计日志只追加，不原地覆盖；修正通过新事件或投影重建。
+[[ListBullet]] 关键业务表包含 created_at、updated_at、version；支持乐观锁。
+[[ListBullet]] 原始 MT5 payload 可保留 JSONB，但必须同时规范化核心字段。
+[[Heading2]] 12.2 核心表
+表
+主要字段
+说明
+users
+id, email, status, created_at
+用户
+roles / permissions
+id, code, description
+RBAC
+trading_nodes
+id, owner_id, device_id, status, version, last_seen_at
+本地节点
+mt5_terminals
+id, node_id, terminal_path_hash, data_path_hash, server, version, status
+MT5 终端
+trading_accounts
+id, terminal_id, login_ref, server, currency, margin_mode, account_mode, status
+账户；敏感登录凭据不存云端
+account_snapshots
+id, account_id, balance, equity, margin, free_margin, currency, captured_at
+账户快照
+symbols
+id, canonical_instrument, asset_class
+规范化品种
+broker_symbols
+id, account_id, broker_symbol, canonical_symbol_id, enabled
+经纪商实际品种
+symbol_specs
+id, broker_symbol_id, spec_json, spec_hash, observed_at
+品种规格版本
+strategies
+id, code, name, description, status
+策略定义
+strategy_versions
+id, strategy_id, version, artifact_hash, config_schema
+不可变版本
+strategy_instances
+id, account_id, strategy_version_id, symbol_id, timeframe, config, status
+策略实例
+strategy_signals
+id, account_id, strategy_instance_id, signal_json, generated_at, expires_at
+信号
+ai_analyses
+id, account_id, model_provider, model_id, prompt_version, input_hash, output_json
+AI 分析
+risk_profiles
+id, account_id, version, config_json, status
+风控配置版本
+risk_decisions
+id, signal_id, decision, reason_codes, risk_snapshot, decided_at
+风控决定
+trade_commands
+id, account_id, command_type, payload, status, expires_at, idempotency_key
+交易指令
+execution_reports
+id, command_id, terminal_id, status, retcode, order_ticket, deal_ticket, payload
+EA 执行回报
+orders
+id, account_id, broker_ticket, status, symbol, volume, price, source_command_id
+订单投影
+deals
+id, account_id, broker_deal_ticket, order_ticket, position_ticket, volume, price, commission, swap, profit
+成交
+positions
+id, account_id, broker_position_ticket, symbol, direction, volume, price_open, sl, tp, updated_at
+持仓投影
+backtest_jobs
+id, strategy_version_id, account_id, symbol, timeframe, range, config, status
+回测任务
+backtest_results
+id, job_id, metrics_json, report_uri, created_at
+回测结果
+audit_logs
+id, actor_id, action, object_type, object_id, before_json, after_json, request_id
+审计
+system_events
+id, source, event_type, severity, payload, occurred_at
+系统事件
+[[Heading2]] 12.3 关键约束与索引
+[[CodeBlock]] UNIQUE (trade_commands.account_id, trade_commands.idempotency_key)
+[[CodeBlock]] UNIQUE (trading_nodes.device_id)
+[[CodeBlock]] UNIQUE (mt5_terminals.node_id, mt5_terminals.terminal_path_hash)
+[[CodeBlock]] INDEX  (trade_commands.account_id, status, created_at)
+[[CodeBlock]] INDEX  (orders.account_id, broker_ticket)
+[[CodeBlock]] INDEX  (deals.account_id, broker_deal_ticket)
+[[CodeBlock]] INDEX  (positions.account_id, broker_position_ticket)
+[[CodeBlock]] INDEX  (strategy_signals.account_id, generated_at)
+[[CodeBlock]] INDEX  (audit_logs.object_type, object_id, created_at)
+[[CodeBlock]] INDEX  (system_events.severity, occurred_at)
+实际数据库迁移中应根据 PostgreSQL 语法定义外键、CHECK、部分唯一索引和 ON DELETE 行为。对交易历史与审计数据优先限制删除；用户删除应走脱敏/保留策略，而不是级联删除财务交易记录。
+[[Heading1]] 13. API 与消息协议
+[[Heading2]] 13.1 API 设计原则
+[[ListBullet]] REST API 用于配置、查询、命令创建和管理操作；WebSocket/SSE 用于状态推送。
+[[ListBullet]] 所有写操作携带 Idempotency-Key 和 X-Request-ID。
+[[ListBullet]] 统一响应 envelope：data、error、request_id、timestamp。
+[[ListBullet]] 版本前缀 /api/v1；破坏性变更使用新版本。
+[[ListBullet]] 金额、价格和手数在 JSON 中使用 decimal 字符串，避免二进制浮点误差。
+[[ListBullet]] 分页使用 cursor 或 limit/offset；大规模事件查询优先 cursor。
+[[Heading2]] 13.2 API 路由草案
+方法/路径
+用途
+权限
+POST /api/v1/nodes/register
+节点注册
+device enrollment
+POST /api/v1/nodes/heartbeat
+节点心跳
+node identity
+GET /api/v1/nodes
+节点列表
+owner/admin
+POST /api/v1/terminals
+添加终端
+owner
+GET /api/v1/accounts
+账户列表
+account:read
+GET /api/v1/accounts/{id}/snapshot
+账户快照
+account:read
+GET /api/v1/accounts/{id}/positions
+持仓
+account:read
+GET /api/v1/accounts/{id}/orders
+订单
+account:read
+POST /api/v1/strategies/instances
+创建策略实例
+strategy:write
+POST /api/v1/strategies/instances/{id}/enable
+启用策略
+strategy:operate
+POST /api/v1/strategies/instances/{id}/disable
+停用策略
+strategy:operate
+POST /api/v1/risk/profiles
+创建风控版本
+risk:admin
+POST /api/v1/accounts/{id}/kill-switch
+账户熔断
+risk:emergency
+POST /api/v1/commands
+创建受控交易命令
+trade:request
+GET /api/v1/commands/{id}
+查询命令状态
+trade:read
+POST /api/v1/backtests
+创建回测
+backtest:run
+GET /api/v1/backtests/{id}
+回测报告
+backtest:read
+GET /api/v1/audit-logs
+审计查询
+audit:read
+[[Heading2]] 13.3 Trade Command 标准结构
+[[CodeBlock]] {
+[[CodeBlock]]   "command_id": "UUID",
+[[CodeBlock]]   "idempotency_key": "UUID",
+[[CodeBlock]]   "schema_version": "1.0",
+[[CodeBlock]]   "account_id": "UUID",
+[[CodeBlock]]   "terminal_id": "UUID",
+[[CodeBlock]]   "ea_instance_id": "UUID",
+[[CodeBlock]]   "command_type": "OPEN_MARKET",
+[[CodeBlock]]   "created_at": "2026-10-30T12:00:00Z",
+[[CodeBlock]]   "expires_at": "2026-10-30T12:00:10Z",
+[[CodeBlock]]   "risk_profile_version": 12,
+[[CodeBlock]]   "symbol_spec_hash": "sha256:...",
+[[CodeBlock]]   "strategy_instance_id": "UUID",
+[[CodeBlock]]   "signal_id": "UUID",
+[[CodeBlock]]   "payload": {
+[[CodeBlock]]     "symbol": "EURUSD",
+[[CodeBlock]]     "side": "BUY",
+[[CodeBlock]]     "volume": "0.10",
+[[CodeBlock]]     "stop_loss": "1.08200",
+[[CodeBlock]]     "take_profit": "1.09100",
+[[CodeBlock]]     "max_deviation_points": 15,
+[[CodeBlock]]     "magic_number": 9001001
+[[CodeBlock]]   },
+[[CodeBlock]]   "correlation_id": "UUID",
+[[CodeBlock]]   "signature": "..."
+[[CodeBlock]] }
+[[Heading2]] 13.4 命令类型
+命令
+说明
+安全要求
+OPEN_MARKET
+市价开仓
+必须通过完整风控；默认关闭
+PLACE_PENDING
+挂单
+检查有效期、触发价、止损和品种规则
+MODIFY_POSITION
+修改 SL/TP
+必须指定 position ticket；不允许无意移除保护
+CLOSE_POSITION
+平仓指定持仓
+校验账户、position ticket、方向和剩余量
+CANCEL_ORDER
+撤销挂单
+必须指定 order ticket
+STOP_NEW_RISK
+停止新增风险
+高优先级，幂等，必须本地持久化
+RECONCILE
+触发对账
+只读操作
+[[Heading2]] 13.5 命令状态与超时语义
+API 创建命令成功只表示命令已被持久化，不表示已发送给 MT5，更不表示已成交。前端必须展示 QUEUED、DELIVERED、VALIDATED、SENT、ACCEPTED、PARTIALLY_FILLED、FILLED、REJECTED、EXPIRED、UNKNOWN 等真实状态。
+[[Heading2]] 13.6 NATS Subject 建议
+[[CodeBlock]] node.<node_id>.heartbeat
+[[CodeBlock]] node.<node_id>.events
+[[CodeBlock]] node.<node_id>.commands
+[[CodeBlock]] account.<account_id>.snapshot
+[[CodeBlock]] account.<account_id>.orders
+[[CodeBlock]] account.<account_id>.positions
+[[CodeBlock]] account.<account_id>.risk
+[[CodeBlock]] strategy.<strategy_instance_id>.signals
+[[CodeBlock]] ai.<account_id>.analysis
+[[CodeBlock]] system.alerts
+NATS Core 可用于瞬时状态通知；需要持久化、重放和确认的交易命令/事件使用 JetStream。JetStream 默认至少一次投递，消费者必须幂等；不要把消息系统的投递语义误认为券商订单的 exactly-once。应用层仍需 command ID、数据库唯一约束和 MT5 状态对账。
+[[Heading1]] 14. 安全、可靠性与故障恢复
+[[Heading2]] 14.1 安全威胁模型
+威胁
+缓解措施
+券商密码泄露
+优先保留在 MT5 本地凭据库；云端不采集主密码；本地 OS 安全存储
+伪造交易命令
+TLS、节点身份认证、短期 token、签名/消息认证、账户绑定校验
+重复命令
+唯一 command_id、幂等表、EA 本地持久化去重、订单对账
+越权操作
+RBAC、账户级授权、敏感操作二次确认、审计
+AI prompt injection/错误输出
+AI 无交易工具权限；结构化输出校验；数据源隔离；风控二次审核
+供应链风险
+锁定依赖版本、SBOM、漏洞扫描、签名安装包
+节点失陷
+最小权限、Windows 更新、防火墙、服务账户隔离、日志审计
+数据泄漏
+字段级脱敏、传输加密、数据库备份加密、最小化采集
+[[Heading2]] 14.2 故障模式与处理
+故障
+系统行为
+AI API 超时
+AI 输出 UNKNOWN；切换 OFF/ADVISORY；不阻塞 EA
+策略服务故障
+停止新信号；现有仓位按既定止损/管理规则运行
+云端断网
+Agent/EA 停止新增风险；本地硬风控继续；事件缓存在本地
+MT5 终端断开券商
+账户标记 DISCONNECTED；不假定订单状态；重连后先对账
+Agent 重启
+读取本地 outbox、终端身份和账户状态；未决命令进入 reconcile
+服务器命令重复投递
+返回已存在 command 状态，不重复执行
+订单请求超时
+标记 UNKNOWN，查订单/成交历史；不直接重发
+账户身份改变
+IDENTITY_MISMATCH，停止新增风险并报警
+数据库不可用
+不接受新的交易命令；EA 本地止损保护继续有效
+品种规格改变
+刷新规格 hash；旧规格命令过期或拒绝
+[[Heading2]] 14.3 可观测性
+[[ListBullet]] 结构化日志字段：timestamp、level、service、node_id、terminal_id、account_id、command_id、signal_id、trace_id、event_code。
+[[ListBullet]] 指标：EA 心跳延迟、节点连接、命令排队时长、下单请求耗时、成交确认耗时、拒单率、UNKNOWN 数量、对账差异、AI 调用延迟/成本。
+[[ListBullet]] 告警：账户身份错配、EA 离线、连续拒单、命令过期、日亏损触发、回撤触发、数据过期、队列积压。
+[[ListBullet]] 日志不记录密码、完整 token、API key、个人敏感信息。
+[[Heading1]] 15. 回测、仿真与策略验证
+[[Heading2]] 15.1 测试层次
+层次
+目标
+工具/方法
+Unit Test
+指标、信号、仓位和规则计算正确
+pytest / MQL5 test harness
+Contract Test
+EA/Agent/API 消息结构一致
+JSON Schema、固定样例
+Integration Test
+Agent 与 MT5 终端连接和回报
+MT5 Demo、隔离 Windows VM
+Strategy Backtest
+历史策略表现
+MT5 Strategy Tester
+Walk-forward
+训练窗口与验证窗口滚动
+Python 实验流水线
+Monte Carlo
+交易序列扰动、滑点/成本扰动
+Python
+Paper Trading
+实时行情不使用真实资金验证
+Demo account
+Small Live Pilot
+极小风险验证执行链
+人工审批、严格限额
+Soak Test
+长时间稳定性和重连
+24/72 小时或更长运行
+[[Heading2]] 15.2 回测必须控制的偏差
+[[ListBullet]] Look-ahead bias：禁止使用信号生成时尚未可知的数据。
+[[ListBullet]] Survivorship bias：品种列表和历史数据需考虑退市/不可交易样本的可用性。
+[[ListBullet]] Overfitting：参数优化必须分训练、验证、样本外区间。
+[[ListBullet]] Data snooping：限制重复试验造成的选择偏差，保留实验记录。
+[[ListBullet]] Execution bias：纳入点差、佣金、swap、滑点、延迟、拒单和部分成交假设。
+[[ListBullet]] Timezone/session bias：明确服务器时间、UTC、夏令时和交易日切分。
+[[Heading2]] 15.3 回测报告最低指标
+指标
+定义/注意
+Net Profit
+扣除交易成本后的净利润
+Max Drawdown
+明确按余额还是净值、绝对或百分比
+Profit Factor
+Gross Profit / abs(Gross Loss)
+Win Rate
+盈利交易数/总已平仓交易数；不代表期望收益
+Expectancy
+平均每笔交易净期望
+Sharpe / Sortino
+明确收益频率、无风险利率和年化方式
+Recovery Factor
+净利润/最大回撤，需说明口径
+Exposure / Holding Time
+市场敞口与持仓时间
+Trade Count
+样本量，避免少量交易得出强结论
+Cost Breakdown
+点差、佣金、swap、滑点分别列示
+[[Heading2]] 15.4 MT5 与 Python 回测分工
+MT5 Strategy Tester 优先用于验证最终 MQL5 EA 的交易行为和经纪商执行模型；Python 用于数据研究、统计分析、模型训练和组合实验。两边必须使用相同的策略定义、参数、时区和成本假设，并对固定测试区间做结果对照。
+[[Heading2]] 15.5 发布门槛
+[[ListBullet]] 单元/集成测试全部通过；不存在未处理的 P0/P1 缺陷。
+[[ListBullet]] 样本外测试报告齐全；结果不以单一最佳参数为依据。
+[[ListBullet]] Demo 运行期间无重复开仓、无无法解释的账户状态差异。
+[[ListBullet]] 断线、重启、超时、重复消息、部分成交和拒单场景均完成演练。
+[[ListBullet]] 实盘默认关闭；启用必须由 Owner 显式操作并确认账户与风险参数。
+[[Heading1]] 16. 技术栈、开源选型与许可证
+领域
+首选
+替代/备注
+EA
+MQL5 / MT5 原生
+MT5 专有终端；MQL5 代码自研
+Agent
+Python 3.12+
+后续性能关键路径可评估 Rust
+Backend
+FastAPI + Pydantic
+REST/OpenAPI；后台任务独立 worker
+Frontend
+Vue 3 + TypeScript + Vite
+Web 与 Tauri 复用
+Desktop
+Tauri 2
+Windows 安装与本地 Agent 管理
+Database
+PostgreSQL
+NUMERIC、JSONB、约束、事务
+Messaging
+NATS + JetStream
+命令/事件持久化；消费者幂等
+Cache
+首版可不引入独立 Redis
+需要缓存时评估 Valkey/Redis 许可证
+Analytics
+NumPy / Pandas / Polars
+按数据规模选择
+ML
+scikit-learn / PyTorch
+模型训练与推理
+Charts
+TradingView Lightweight Charts
+核查具体版本许可证与再分发条款
+Observability
+OpenTelemetry + Prometheus + Grafana
+日志可选 Loki
+Deployment
+Docker Compose 起步
+规模化后再考虑 Kubernetes
+Secrets
+Windows DPAPI / OS Credential Manager + 服务端 secret manager
+绝不明文保存
+[[Heading2]] 16.1 许可证核查清单
+[[ListBullet]] 每个依赖固定版本和 commit/tag；记录许可证、版权声明和源码地址。
+[[ListBullet]] MIT、Apache-2.0、BSD、PostgreSQL License 等通常较适合商业集成，但仍需遵守 NOTICE、署名、专利和再分发条款。
+[[ListBullet]] GPL/AGPL/SSPL/RSAL 等需逐项评估分发和网络服务义务；不要因“能免费使用”就认定可闭源商业集成。
+[[ListBullet]] MT5、经纪商接口、数据源、AI API、图表组件和第三方模型有各自的服务条款，不能仅看开源许可证。
+[[ListBullet]] 发布前生成 SBOM，并由法律/合规人员审核商业分发方式。
+[[Heading1]] 17. 项目目录结构与代码规范
+[[Heading2]] 17.1 Monorepo 建议
+[[CodeBlock]] quantpilot-ai/
+[[CodeBlock]] ├── README.md
+[[CodeBlock]] ├── LICENSE
+[[CodeBlock]] ├── NOTICE
+[[CodeBlock]] ├── SECURITY.md
+[[CodeBlock]] ├── CONTRIBUTING.md
+[[CodeBlock]] ├── docs/
+[[CodeBlock]] │   ├── PRD.md
+[[CodeBlock]] │   ├── ARCHITECTURE.md
+[[CodeBlock]] │   ├── API_SPEC.md
+[[CodeBlock]] │   ├── EA_PROTOCOL.md
+[[CodeBlock]] │   ├── RISK_SPEC.md
+[[CodeBlock]] │   ├── DB_SCHEMA.md
+[[CodeBlock]] │   ├── RUNBOOK.md
+[[CodeBlock]] │   └── ADR/
+[[CodeBlock]] ├── apps/
+[[CodeBlock]] │   ├── web/                 # Vue Web 管理后台
+[[CodeBlock]] │   └── desktop/             # Tauri Windows 客户端
+[[CodeBlock]] ├── services/
+[[CodeBlock]] │   ├── api/                 # FastAPI
+[[CodeBlock]] │   ├── strategy/            # 策略引擎
+[[CodeBlock]] │   ├── ai/                  # AI Provider 与分析
+[[CodeBlock]] │   ├── risk/                # 独立风控
+[[CodeBlock]] │   ├── command/             # 命令服务/outbox
+[[CodeBlock]] │   ├── market-data/         # 数据标准化/特征
+[[CodeBlock]] │   └── backtest/            # 回测编排/报告
+[[CodeBlock]] ├── agent/
+[[CodeBlock]] │   ├── supervisor/
+[[CodeBlock]] │   ├── mt5_adapter/
+[[CodeBlock]] │   ├── ipc/
+[[CodeBlock]] │   ├── local_store/
+[[CodeBlock]] │   └── installer/
+[[CodeBlock]] ├── mt5/
+[[CodeBlock]] │   ├── Experts/QuantPilotEA/
+[[CodeBlock]] │   ├── Include/QuantPilot/
+[[CodeBlock]] │   ├── Scripts/Diagnostics/
+[[CodeBlock]] │   └── tests/
+[[CodeBlock]] ├── packages/
+[[CodeBlock]] │   ├── contracts/           # JSON Schema / OpenAPI
+[[CodeBlock]] │   ├── common-python/
+[[CodeBlock]] │   ├── common-ts/
+[[CodeBlock]] │   └── strategy-sdk/
+[[CodeBlock]] ├── infra/
+[[CodeBlock]] │   ├── docker/
+[[CodeBlock]] │   ├── compose/
+[[CodeBlock]] │   ├── nats/
+[[CodeBlock]] │   ├── postgres/
+[[CodeBlock]] │   └── monitoring/
+[[CodeBlock]] ├── tests/
+[[CodeBlock]] │   ├── contract/
+[[CodeBlock]] │   ├── integration/
+[[CodeBlock]] │   ├── e2e/
+[[CodeBlock]] │   └── fixtures/
+[[CodeBlock]] └── scripts/
+[[Heading2]] 17.2 编码规范
+[[ListBullet]] Python：类型标注、Pydantic schema、ruff/black、pytest、mypy/pyright；业务逻辑不得依赖 FastAPI Request 对象。
+[[ListBullet]] TypeScript：strict mode、ESLint/Prettier、API 类型由 OpenAPI 生成或共享 schema。
+[[ListBullet]] MQL5：封装交易调用、检查返回码、避免重复代码；每个关键分支写日志码；所有交易路径有模拟测试。
+[[ListBullet]] 数据库：使用 Alembic 迁移；禁止手工修改生产 schema；迁移可回滚或有恢复计划。
+[[ListBullet]] 提交：小步提交、清晰 commit message；PR 必须关联需求编号和测试结果。
+[[ListBullet]] 配置：环境变量/配置文件分层；不把密钥写入代码、日志或 Git。
+[[Heading1]] 18. 测试策略与验收标准
+[[Heading2]] 18.1 MVP 验收标准
+编号
+验收项
+通过标准
+AT-001
+MT5 终端发现
+能列出本机指定目录下终端，识别版本和数据目录
+AT-002
+账户绑定
+读取 login/server/currency/account mode 并与绑定信息一致
+AT-003
+品种目录
+动态读取终端可用品种及关键交易规格，生成 spec hash
+AT-004
+模拟交易
+Demo 环境完成开仓、止损止盈、平仓和回报闭环
+AT-005
+幂等
+同一 command_id 重复投递不产生第二笔开仓
+AT-006
+超时未知
+模拟请求超时后进入 UNKNOWN 并对账，不盲目重发
+AT-007
+风控
+超过单笔风险/日亏损/点差/最大持仓限制时拒绝
+AT-008
+断网
+云端断开后禁止新增风险，恢复后先对账
+AT-009
+多账户隔离
+至少 3 个独立终端并行运行，故障互不影响
+AT-010
+AI 故障
+AI 超时/错误 JSON 时降级，不允许绕过风控
+AT-011
+审计
+每个命令可追溯到信号、策略版本、风控决定、操作者和回报
+AT-012
+恢复
+Agent/后台重启后能从实际 MT5 状态恢复账户投影
+[[Heading2]] 18.2 故障注入测试
+[[ListBullet]] 在发送命令后、收到回执前杀死 Agent。
+[[ListBullet]] 在 OrderSend 后断开网络，模拟“请求可能已到达服务器”的不确定状态。
+[[ListBullet]] 重复投递同一 command_id 100 次。
+[[ListBullet]] 将 MT5 登录账户切换为另一个账户，检查身份错配熔断。
+[[ListBullet]] 修改品种 volume step / stops level，检查旧命令拒绝。
+[[ListBullet]] 让 AI 服务返回超时、空响应、错误 JSON、过期结果和恶意文本。
+[[ListBullet]] 让 PostgreSQL 暂时不可用，确认系统不接受新交易命令。
+[[ListBullet]] 模拟部分成交、拒单、市场关闭、无报价、保证金不足。
+[[ListBullet]] 重启 MT5 终端并检查持仓/订单对账。
+[[ListBullet]] 同时触发账户级与全局停止，验证优先级和恢复权限。
+[[Heading2]] 18.3 质量门槛
+[[ListBullet]] 关键交易与风控逻辑单元测试覆盖率建议不低于 85%；覆盖率不是正确性的替代。
+[[ListBullet]] 所有 command schema、EA 回执 schema 有 contract tests。
+[[ListBullet]] 每个 P0 需求都有验收用例和可重复测试数据。
+[[ListBullet]] 每次发布生成版本号、构建 hash、变更清单、SBOM 和测试报告。
+[[Heading1]] 19. 部署、运维与监控
+[[Heading2]] 19.1 开发环境
+[[CodeBlock]] Developer PC:
+[[CodeBlock]]   Windows 11
+[[CodeBlock]]   MetaTrader 5 Demo terminal(s)
+[[CodeBlock]]   MetaEditor / MQL5
+[[CodeBlock]]   Python 3.12+
+[[CodeBlock]]   Node.js LTS + pnpm
+[[CodeBlock]]   Docker Desktop (PostgreSQL + NATS + API)
+[[CodeBlock]]   VS Code / Cursor / Codex
+[[Heading2]] 19.2 测试环境
+[[ListBullet]] 独立 Windows VM/VPS，安装多个 Demo MT5 终端。
+[[ListBullet]] 独立 Linux 测试服务器，运行 API、数据库、NATS、AI/策略服务。
+[[ListBullet]] 使用合成账户和测试品种数据；严禁把测试密钥混入生产。
+[[Heading2]] 19.3 生产环境
+服务
+部署建议
+可用性要求
+API Gateway/API
+Linux Docker 服务
+健康检查、滚动发布、限流
+PostgreSQL
+持久化磁盘、定期备份
+恢复演练；交易记录可重建但不丢审计
+NATS JetStream
+持久化卷、认证、TLS
+监控 stream/consumer lag
+AI/Strategy/Risk
+独立 worker 服务
+故障隔离、超时、熔断
+Windows Agent/MT5
+Windows VPS 或用户主机
+服务自动启动、账户隔离、状态检查
+监控
+Prometheus/Grafana/OpenTelemetry
+告警路由和历史留存
+[[Heading2]] 19.4 备份和恢复
+[[ListBullet]] PostgreSQL 定期全量备份 + WAL/PITR 策略；定期执行恢复演练。
+[[ListBullet]] 节点本地 outbox 和关键审计事件需加密备份或可靠补传。
+[[ListBullet]] 策略版本、风控版本、EA 构建产物和配置文件纳入版本控制。
+[[ListBullet]] 灾难恢复时先恢复账户身份、风控状态和实际持仓，再恢复自动交易。
+[[ListBullet]] 任何恢复流程默认进入 OBSERVE_ONLY，人工确认后再重新 ARMED。
+[[Heading1]] 20. 24 周开发路线与里程碑
+阶段
+周次
+开发内容
+里程碑
+S0 工程底座
+第 1 周
+仓库、CI、规范、schema、开发环境、Demo 终端
+可重复构建
+S1 EA 执行闭环
+第 2-4 周
+EA 生命周期、品种属性、命令、订单、成交事件、对账
+单账户 Demo 闭环
+S2 量化策略
+第 5-8 周
+策略接口、首批策略、信号、版本和回测适配
+策略可独立运行
+S3 风控与多账户
+第 9-12 周
+风控服务、Agent、多终端、账户隔离、熔断
+至少 3 账户隔离运行
+S4 AI 双引擎
+第 13-16 周
+Provider、市场状态、策略评分、信号过滤、模型治理
+AI 辅助模式
+S5 管理端
+第 17-20 周
+Web、Tauri、账户/策略/风控/交易页面、告警
+可操作管理平台
+S6 稳定性/商业化
+第 21-24 周
+安全、授权、安装、升级、故障注入、Demo soak test
+Release Candidate
+[[Heading2]] 20.1 每阶段 Definition of Done
+[[ListBullet]] 代码已合并到主分支，CI 通过，依赖锁定。
+[[ListBullet]] 需求、API、数据库和用户界面文档同步更新。
+[[ListBullet]] 单元、契约、集成测试通过。
+[[ListBullet]] 无未处理 P0/P1 缺陷；已知限制写入 release notes。
+[[ListBullet]] 部署脚本、回滚说明和日志指标齐全。
+[[ListBullet]] 涉及交易的改动已在 Demo 环境验证，不以编译成功代替运行验收。
+[[Heading1]] 21. AI 编程代理工作规范
+[[Heading2]] 21.1 总规则
+AI 编程工具必须以本文件和仓库 docs/ 中的最新版本为准。不得自行重构系统边界、替换核心技术、删除风控或把 Python 交易接口改为实盘执行主路径。遇到规格冲突先提出 ADR（架构决策记录），不得默默猜测。
+[[Heading2]] 21.2 开发顺序
+[[ListNumber]] 先阅读 PRD、ARCHITECTURE、API_SPEC、EA_PROTOCOL、RISK_SPEC。
+[[ListNumber]] 先建立 contracts/schema 和数据库迁移，再实现服务。
+[[ListNumber]] 先实现只读终端发现和账户绑定，再实现模拟交易。
+[[ListNumber]] 先完成 command idempotency 和 UNKNOWN 对账，再开放真实订单路径。
+[[ListNumber]] 先完成基础风控，再开发策略和 AI 过滤。
+[[ListNumber]] 先实现单账户，再实现多账户并行。
+[[ListNumber]] 先 Demo 测试，再小风险实盘候选；实盘功能必须显式开关。
+[[ListNumber]] 每次只实现一个可验收的垂直切片，避免一次生成整个仓库。
+[[Heading2]] 21.3 AI 代理禁止事项
+[[ListBullet]] 禁止把 API key、券商密码、token、私钥写入代码或提交到 Git。
+[[ListBullet]] 禁止默认开启实盘交易、默认启用自动开仓或默认设置非零风险。
+[[ListBullet]] 禁止 AI/LLM 直接调用下单函数或修改风控硬上限。
+[[ListBullet]] 禁止在网络超时后盲目重发开仓命令。
+[[ListBullet]] 禁止仅凭 OrderSend 布尔返回值判定成交。
+[[ListBullet]] 禁止将价格/金额/手数用 float 作为数据库精确金额类型。
+[[ListBullet]] 禁止跳过数据库迁移、schema 验证、日志和测试。
+[[ListBullet]] 禁止虚构 MT5 API、枚举、品种属性或经纪商能力；必须核对官方文档。
+[[ListBullet]] 禁止将回测利润或胜率作为系统验收唯一标准。
+[[ListBullet]] 禁止未经用户批准连接真实券商账户或进行真实交易。
+[[Heading2]] 21.4 每个 AI 开发任务的交付格式
+[[CodeBlock]] 任务编号：
+[[CodeBlock]] 对应 PRD/架构章节：
+[[CodeBlock]] 本次目标（只做一个范围）：
+[[CodeBlock]] 不在本次范围内：
+[[CodeBlock]] 涉及文件：
+[[CodeBlock]] 接口/数据库变更：
+[[CodeBlock]] 安全与交易风险：
+[[CodeBlock]] 实现说明：
+[[CodeBlock]] 测试命令：
+[[CodeBlock]] 测试结果：
+[[CodeBlock]] 人工验收步骤：
+[[CodeBlock]] 未完成事项：
+[[CodeBlock]] 回滚方式：
+[[Heading2]] 21.5 推荐 AI 开发提示词模板
+[[CodeBlock]] 你是 QuantPilot AI 项目的资深软件工程师。
+[[CodeBlock]] 必须先阅读仓库 docs/ 中的 PRD、ARCHITECTURE、API_SPEC、
+[[CodeBlock]] EA_PROTOCOL、RISK_SPEC 和当前任务关联文档。
+[[CodeBlock]] 本次只完成指定任务，不要擅自扩大范围或改变技术架构。
+[[CodeBlock]] 交易安全原则：
+[[CodeBlock]] 1. MT5 MQL5 EA 是唯一正式交易执行端。
+[[CodeBlock]] 2. 风控拥有最终拒绝权。
+[[CodeBlock]] 3. AI 不得直接下单或修改硬风控上限。
+[[CodeBlock]] 4. 命令必须幂等、可过期、可审计。
+[[CodeBlock]] 5. 超时后状态不确定时必须对账，不能盲目重发。
+[[CodeBlock]] 6. 默认 OBSERVE_ONLY，测试使用 Demo 环境。
+[[CodeBlock]] 开始编码前：
+[[CodeBlock]] - 列出你理解的需求和验收标准；
+[[CodeBlock]] - 列出将修改的文件；
+[[CodeBlock]] - 识别安全风险和未决问题；
+[[CodeBlock]] - 若文档冲突，先提出问题，不自行猜测。
+[[CodeBlock]] 完成后：
+[[CodeBlock]] - 提供代码变更摘要；
+[[CodeBlock]] - 提供测试命令和真实测试结果；
+[[CodeBlock]] - 更新文档与 schema；
+[[CodeBlock]] - 列出尚未完成事项；
+[[CodeBlock]] - 不得声称未实际运行的测试已经通过。
+[[Heading1]] 22. 风险清单、未决事项与决策记录
+[[Heading2]] 22.1 项目风险清单
+风险
+影响
+应对
+券商执行规则差异
+订单拒绝、手数/止损错误
+账户级品种规格动态读取，Demo 兼容性测试
+MT5 终端断线/重启
+状态未知、命令重复
+UNKNOWN 状态、对账、停止新风险
+AI 输出不稳定
+误判市场或信号过滤
+schema、过期机制、影子模式、降级
+回测过拟合
+实盘表现偏离
+样本外、walk-forward、Monte Carlo、成本压力测试
+多账户状态串线
+错误账户下单
+独立终端、身份指纹、account_id 强校验
+消息重复投递
+重复订单
+幂等键、唯一约束、EA 本地去重
+数据源时间/时区差异
+指标与日亏损计算错误
+UTC 存储、服务器时间映射、时区测试
+许可证/商业条款
+商业发布受限
+SBOM、逐组件法律审查
+监管合规
+销售或服务模式可能受监管
+按目标国家/地区咨询专业法律意见
+[[Heading2]] 22.2 需要在编码前确定的配置
+事项
+建议基线
+备注
+首发交易账户
+Demo only
+实盘启用单独审批
+首发操作系统
+Windows 11 / Windows Server
+核对 MT5 与券商支持环境
+首发账户数量
+3 个独立终端
+用于验证隔离，不是产品上限
+策略执行周期
+先以 M15/H1 等收盘驱动为主
+避免首版追求 Tick 高频
+AI 模式
+ADVISORY 起步
+完成评估后再启用 FILTER
+账户风险默认值
+0 / disabled
+用户明确配置后才启用
+消息可靠性
+JetStream + DB Outbox + Consumer Idempotency
+交易命令不依赖单一消息语义
+本地交易执行
+EA only
+Python MT5 package 只读/研究用途
+[[Heading2]] 22.3 架构决策记录 ADR
+ADR
+决策
+原因
+ADR-001
+MQL5 EA 是唯一正式交易执行端
+减少双执行路径和状态不一致
+ADR-002
+每账户独立 MT5 终端/执行上下文
+隔离登录状态和故障
+ADR-003
+AI 与风控分离
+模型不稳定性不能影响硬风控
+ADR-004
+命令采用持久化 + 幂等 + UNKNOWN 对账
+处理网络不确定性和重复投递
+ADR-005
+PostgreSQL 作为业务权威存储
+事务、约束、审计和关系模型
+ADR-006
+NATS JetStream 用于可靠事件/命令传递
+持久化和消费确认；应用仍需幂等
+ADR-007
+Vue + Tauri 复用 UI
+降低桌面/Web 双端开发成本
+ADR-008
+先自用单租户，数据模型预留 tenant_id
+避免过早引入 SaaS 复杂度，同时降低后期迁移成本
+[[Heading1]] 附录 A：协议与代码示例
+[[Heading2]] A.1 风控决定示例
+[[CodeBlock]] {
+[[CodeBlock]]   "decision_id": "uuid",
+[[CodeBlock]]   "signal_id": "uuid",
+[[CodeBlock]]   "account_id": "uuid",
+[[CodeBlock]]   "decision": "REJECT",
+[[CodeBlock]]   "reason_codes": ["DAILY_LOSS_LIMIT_REACHED"],
+[[CodeBlock]]   "risk_profile_version": 3,
+[[CodeBlock]]   "checked_at": "2026-10-30T12:00:02Z",
+[[CodeBlock]]   "expires_at": "2026-10-30T12:00:10Z"
+[[CodeBlock]] }
+[[Heading2]] A.2 EA 执行回执示例
+[[CodeBlock]] {
+[[CodeBlock]]   "event_id": "uuid",
+[[CodeBlock]]   "command_id": "uuid",
+[[CodeBlock]]   "account_id": "uuid",
+[[CodeBlock]]   "terminal_id": "uuid",
+[[CodeBlock]]   "ea_instance_id": "uuid",
+[[CodeBlock]]   "event_type": "ORDER_REQUEST_RESULT",
+[[CodeBlock]]   "status": "ACCEPTED",
+[[CodeBlock]]   "retcode": 10009,
+[[CodeBlock]]   "broker_order_ticket": "123456789",
+[[CodeBlock]]   "broker_deal_ticket": "987654321",
+[[CodeBlock]]   "filled_volume": "0.10",
+[[CodeBlock]]   "average_price": "1.08512",
+[[CodeBlock]]   "occurred_at": "2026-10-30T12:00:03Z"
+[[CodeBlock]] }
+[[Heading2]] A.3 账户心跳示例
+[[CodeBlock]] {
+[[CodeBlock]]   "node_id": "uuid",
+[[CodeBlock]]   "terminal_id": "uuid",
+[[CodeBlock]]   "account_id": "uuid",
+[[CodeBlock]]   "terminal_version": "build-number",
+[[CodeBlock]]   "ea_version": "1.0.0",
+[[CodeBlock]]   "account_login_ref": "masked-or-reference",
+[[CodeBlock]]   "server": "Broker-Server",
+[[CodeBlock]]   "connected": true,
+[[CodeBlock]]   "trade_allowed": true,
+[[CodeBlock]]   "expert_allowed": true,
+[[CodeBlock]]   "balance": "10000.00",
+[[CodeBlock]]   "equity": "9980.00",
+[[CodeBlock]]   "currency": "USD",
+[[CodeBlock]]   "open_positions": 2,
+[[CodeBlock]]   "observed_at": "2026-10-30T12:00:00Z"
+[[CodeBlock]] }
+[[Heading2]] A.4 错误码建议
+错误码
+含义
+处理
+ACCOUNT_IDENTITY_MISMATCH
+账户身份与绑定不一致
+账户锁定、停止新风险
+TERMINAL_NOT_CONNECTED
+MT5 未连接
+停止新风险、重连后对账
+SYMBOL_NOT_TRADABLE
+品种不可交易
+拒绝命令
+SYMBOL_SPEC_STALE
+品种规格过期
+刷新规格后重新评估
+VOLUME_INVALID
+手数不符合规则
+拒绝并记录规格
+PRICE_OUT_OF_DATE
+报价过期
+拒绝
+SPREAD_TOO_HIGH
+点差超限
+拒绝
+RISK_LIMIT_EXCEEDED
+风险超限
+拒绝/熔断
+COMMAND_EXPIRED
+命令过期
+不执行
+DUPLICATE_COMMAND
+重复命令
+返回已有结果
+EXECUTION_UNKNOWN
+执行结果未知
+进入对账，不重发
+BROKER_REJECTED
+服务器拒单
+保存 retcode 和说明
+[[Heading1]] 附录 B：官方技术参考
+以下官方资料是实现时核对 API、交易规则和消息语义的第一手参考。具体函数签名、枚举和版本行为应以实际安装的 MT5 build 及官方当前文档为准。
+[[ListBullet]] MQL5 Reference – Python Integration — https://www.mql5.com/en/docs/python_metatrader5。MT5 Python 模块与终端通信、行情/账户/订单接口。
+[[ListBullet]] MQL5 Python initialize — https://www.mql5.com/en/docs/python_metatrader5/mt5initialize_py。终端连接、路径、账户和连接参数。
+[[ListBullet]] MQL5 Python account_info — https://www.mql5.com/en/docs/python_metatrader5/mt5accountinfo_py。账户信息结构与状态字段。
+[[ListBullet]] MQL5 Python order_send — https://www.mql5.com/en/docs/python_metatrader5/mt5ordersend_py。交易请求字段、返回结构和订单操作。
+[[ListBullet]] MQL5 Strategy Tester — https://www.mql5.com/en/docs/runtime/testing。策略测试器相关运行时文档；具体入口以官方文档导航为准。
+[[ListBullet]] NATS Documentation — https://docs.nats.io/。NATS Core、JetStream、Streams 和 Consumers。
+[[ListBullet]] NATS JetStream Concepts — https://docs.nats.io/concepts/jetstream。持久化消息、消费者和确认语义。
+[[ListBullet]] FastAPI Documentation — https://fastapi.tiangolo.com/。API 框架、依赖注入、安全和部署。
+[[ListBullet]] PostgreSQL Documentation — https://www.postgresql.org/docs/。事务、约束、索引、备份和安全。
+[[ListBullet]] Vue Documentation — https://vuejs.org/guide/。Vue 3 应用开发。
+[[ListBullet]] Tauri 2 Documentation — https://v2.tauri.app/。桌面端、安全能力与打包。
+[[Heading1]] 文档结束：首个开发任务建议
+首个工程任务不要从 AI 模型或漂亮的后台页面开始。建议从“MT5 单终端只读接入 + 账户身份校验 + 品种规格采集 + 心跳上报”开始。该切片无真实交易风险，但能验证 Windows Agent、MT5 终端、EA、API、数据库和消息协议的基础连接。通过验收后，再开发 Demo 开仓/平仓闭环。
+任何实盘启用均应另设审批、风险限额和回滚步骤。本文档不构成投资建议，也不保证任何交易策略盈利。
