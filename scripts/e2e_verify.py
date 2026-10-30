@@ -34,6 +34,7 @@ TABLES = [
     "symbols",
     "broker_symbols",
     "symbol_specs",
+    "positions",
     "system_events",
 ]
 
@@ -98,6 +99,14 @@ def main() -> int:
     for srow in syms_data[:5]:
         print(f"       symbol: {srow.get('broker_symbol')} canonical={srow.get('canonical_instrument')} "
               f"spec_hash={str(srow.get('spec_hash'))[:16]}...")
+
+    poses = client.get(f"{API}/api/v1/accounts/{account_id}/positions")
+    poses_data = poses.json().get("data", [])
+    check("api.positions", poses.status_code == 200 and len(poses_data) >= 1,
+          f"status={poses.status_code} count={len(poses_data)}")
+    for prow in poses_data[:5]:
+        print(f"       position: ticket={prow.get('broker_position_ticket')} {prow.get('broker_symbol')} "
+              f"{prow.get('direction')} profit={prow.get('profit')} status={prow.get('status')}")
 
     # ---- 2. PostgreSQL row counts ------------------------------------------
     with psycopg.connect(PG_DSN) as conn:

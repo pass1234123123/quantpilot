@@ -141,7 +141,52 @@ def main() -> int:
         },
     )
 
-    # 5. commands endpoint must exist and be empty (OBSERVE_ONLY)
+    # 5. positions snapshot A: two open positions (900001, 900002)
+    def position(ticket: int, symbol_name: str, direction: str, profit: str) -> dict:
+        return {
+            "broker_position_ticket": str(ticket),
+            "broker_symbol": symbol_name,
+            "direction": direction,
+            "volume": "0.10000000",
+            "price_open": "1.08123000",
+            "current_price": "1.08245000",
+            "sl": "1.07900000",
+            "tp": None,
+            "profit": profit,
+            "swap": "-0.02",
+            "open_time": iso_now(),
+        }
+
+    post(
+        "/ea/v1/positions",
+        {
+            "ea_version": "1.0.0",
+            "terminal": terminal(),
+            "account": account(),
+            "positions": [
+                position(900001, "EURUSD", "BUY", "12.20"),
+                position(900002, "GBPUSD", "SELL", "-3.40"),
+            ],
+            "observed_at": iso_now(),
+        },
+    )
+
+    # 6. positions snapshot B: only 900001 left -> 900002 must be marked CLOSED
+    import time
+
+    time.sleep(1)
+    post(
+        "/ea/v1/positions",
+        {
+            "ea_version": "1.0.0",
+            "terminal": terminal(),
+            "account": account(),
+            "positions": [position(900001, "EURUSD", "BUY", "13.10")],
+            "observed_at": iso_now(),
+        },
+    )
+
+    # 7. commands endpoint must exist and be empty (OBSERVE_ONLY)
     r = client.get(AGENT + "/ea/v1/commands", headers=HEADERS)
     body = r.json()
     empty = body.get("commands") == []

@@ -1,46 +1,108 @@
 <script setup lang="ts">
-// 示例数据：交易日志需成交数据（orders/deals 表），本切片尚无交易执行
-const trades = [
-  { id: 1, symbol: 'XAUUSD', type: '买入', mode: 'AI', profit: 68.4, rr: 2.1, open: '05.20 08:12', close: '05.20 09:45', dur: '1时33分', exit: '止盈触发' },
-  { id: 2, symbol: 'EURUSD', type: '卖出', mode: '量化', profit: -21.5, rr: 1.0, open: '05.20 06:40', close: '05.20 07:55', dur: '1时15分', exit: '止损触发' },
-  { id: 3, symbol: 'GBPUSD', type: '买入', mode: 'AI', profit: 45.2, rr: 1.8, open: '05.19 14:22', close: '05.19 16:08', dur: '1时46分', exit: '信号平仓' },
-  { id: 4, symbol: 'USDCAD', type: '卖出', mode: '量化', profit: 12.8, rr: 1.5, open: '05.19 09:30', close: '05.19 11:02', dur: '1时32分', exit: '信号平仓' },
-  { id: 5, symbol: 'USDJPY', type: '买入', mode: 'AI', profit: 89.6, rr: 2.4, open: '05.18 15:05', close: '05.18 18:44', dur: '3时39分', exit: '止盈触发' },
-]
+import { computed } from 'vue'
+import { useDashboardStore } from '../../stores/dashboard'
+import { num } from '../../api'
+
+const store = useDashboardStore()
+
+const rows = computed(() => store.positions)
+const openRows = computed(() => rows.value.filter((r) => r.status === 'OPEN'))
+
+// 浮动盈亏 = 仓位利润 + 库存费（swap）
+function floating(row: { profit: string | null; swap: string | null }): number | null {
+  const p = num(row.profit)
+  const s = num(row.swap)
+  if (p === null) return null
+  return p + (s ?? 0)
+}
+
+const openFloatingTotal = computed(() =>
+  openRows.value.reduce((acc, r) => acc + (floating(r) ?? 0), 0),
+)
+
+function fmt(value: number | null, digits = 2): string {
+  if (value === null) return '—'
+  return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+function fmtPrice(row: { current_price: string | null }): string {
+  const n = num(row.current_price)
+  return n === null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 5 })
+}
+
+function fmtTime(iso: string | null): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '—'
+  return d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function directionLabel(d: 'BUY' | 'SELL'): string {
+  return d === 'BUY' ? '买入' : '卖出'
+}
 </script>
 
 <template>
   <div class="qp-panel">
     <div class="qp-panel__title">
-      交易日志（自动记录）
-      <span class="qp-sample-badge">示例数据</span>
+      持仓明细（EA 实时同步）
+      <span v-if="openRows.length > 0" class="tj__total" :class="openFloatingTotal >= 0 ? 'qp-up' : 'qp-down'">
+        持仓浮动盈亏 {{ openFloatingTotal >= 0 ? '+' : '' }}{{ fmt(openFloatingTotal) }}
+        {{ store.snapshot?.currency ?? '' }}
+      </span>
     </div>
 
-    <el-table :data="trades" size="small" class="tj__table">
-      <el-table-column prop="id" label="序号" width="60" />
-      <el-table-column prop="symbol" label="品种" width="90" />
-      <el-table-column label="类型" width="80">
+    <el-table v-if="rows.length > 0" :data="rows" size="small" class="tj__table" row-key="position_id">
+      <el-table-column prop="broker_position_ticket" label="持仓号" width="110" />
+      <el-table-column prop="broker_symbol" label="品种" width="100" />
+      <el-table-column label="方向" width="70">
         <template #default="{ row }">
-          <span :class="row.type === '买入' ? 'qp-up' : 'qp-down'">{{ row.type }}</span>
+          <span :class="row.direction === 'BUY' ? 'qp-up' : 'qp-down'">{{ directionLabel(row.direction) }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="mode" label="模式" width="80" />
-      <el-table-column label="净盈亏" width="110" align="right">
+      <el-table-column label="手数" width="80" align="right">
+        <template #default="{ row }">{{ fmt(num(row.volume)) }}</template>
+      </el-table-column>
+      <el-table-column label="开仓价" width="100" align="right">
+        <template #default="{ row }">{{ fmt(num(row.price_open)) }}</template>
+      </el-table-column>
+      <el-table-column label="现价" width="100" align="right">
+        <template #default="{ row }">{{ fmtPrice(row) }}</template>
+      </el-table-column>
+      <el-table-column label="止损/止盈" width="130" align="right">
         <template #default="{ row }">
-          <span :class="row.profit >= 0 ? 'qp-up' : 'qp-down'">
-            {{ row.profit >= 0 ? '+' : '' }}${{ row.profit.toFixed(2) }}
+          {{ row.sl === null ? '—' : fmt(num(row.sl)) }} / {{ row.tp === null ? '—' : fmt(num(row.tp)) }}
+        </template>
+      </el-table-column>
+      <el-table-column label="浮动盈亏" width="120" align="right">
+        <template #default="{ row }">
+          <span :class="(floating(row) ?? 0) >= 0 ? 'qp-up' : 'qp-down'">
+            {{ (floating(row) ?? 0) >= 0 ? '+' : '' }}{{ fmt(floating(row)) }}
           </span>
         </template>
       </el-table-column>
-      <el-table-column prop="rr" label="盈亏比" width="80" align="right" />
-      <el-table-column prop="open" label="开仓时间" width="120" />
-      <el-table-column prop="close" label="平仓时间" width="120" />
-      <el-table-column prop="dur" label="持仓时长" width="100" />
-      <el-table-column prop="exit" label="平仓原因" min-width="100" />
+      <el-table-column label="开仓时间" width="120">
+        <template #default="{ row }">{{ fmtTime(row.open_time) }}</template>
+      </el-table-column>
+      <el-table-column label="状态" min-width="90">
+        <template #default="{ row }">
+          <el-tag v-if="row.status === 'OPEN'" type="success" size="small" effect="dark">持仓中</el-tag>
+          <el-tag v-else type="info" size="small">已平仓 {{ fmtTime(row.closed_at) }}</el-tag>
+        </template>
+      </el-table-column>
     </el-table>
+
+    <el-empty v-else description="当前账户暂无持仓记录（EA 每 10 秒同步一次）" :image-size="60" />
   </div>
 </template>
 
 <style scoped>
-.tj__table { width: 100%; }
+.tj__table {
+  width: 100%;
+}
+.tj__total {
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 12px;
+}
 </style>

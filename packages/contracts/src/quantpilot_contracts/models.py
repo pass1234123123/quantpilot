@@ -151,6 +151,45 @@ class EaShutdownData(BaseModel):
     observed_at: datetime
 
 
+class PositionSnapshot(BaseModel):
+    """One open position as observed via PositionGet* (read-only, doc 12.2).
+
+    sl/tp are None when the broker reports 0 (not set). profit is the current
+    floating profit, not realized P/L (deals arrive with the order slice).
+    """
+
+    model_config = StrictModel
+
+    broker_position_ticket: str = Field(description="PositionGetInteger(POSITION_TICKET) as string")
+    broker_symbol: str
+    direction: Literal["BUY", "SELL"]
+    volume: Money
+    price_open: Money
+    current_price: Money
+    sl: Money | None = None
+    tp: Money | None = None
+    profit: Money = Field(default=Decimal("0"))
+    swap: Money = Field(default=Decimal("0"))
+    open_time: datetime
+
+
+class EaPositionsData(BaseModel):
+    """Event ea.positions payload: full open-position snapshot for one account.
+
+    The list is the complete set of open positions at observed_at; the cloud
+    consumer marks tickets missing from the snapshot as CLOSED (state-based
+    sync, doc 4.4/5.2 reconciliation).
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    positions: list[PositionSnapshot]
+    observed_at: datetime
+
+
 class NodeEventEnvelope(BaseModel):
     """Wrapper published to JetStream subject node.<node_id>.events."""
 

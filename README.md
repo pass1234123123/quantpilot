@@ -3,7 +3,7 @@
 EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL 的只读数据链路。
 
 **OBSERVE_ONLY**：本切片 EA 不含任何交易执行代码（无 OrderSend / OrderCheck / CTrade），
-仅上报终端/账户身份、心跳快照与品种规格。新账户默认 `OBSERVE_ONLY` 状态。
+仅上报终端/账户身份、心跳快照、品种规格与开仓持仓快照。新账户默认 `OBSERVE_ONLY` 状态。
 
 ## 目录结构
 
@@ -13,7 +13,7 @@ agent/                本地节点：终端发现 + HTTP 接收(8787) + JetStrea
 services/api/         FastAPI：节点注册/心跳 + JetStream 消费者入库 + 查询路由
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
-infra/postgres/       Alembic 迁移（0001 建表 + 0002 broker_symbols.selected）
+infra/postgres/       Alembic 迁移（0001 建表 + 0002 selected + 0003 positions）
 scripts/              开发工具（隧道/冒烟/验收/部署）
 ```
 
@@ -40,8 +40,8 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 冒烟与验收：
 
 ```powershell
-.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（401/注册/心跳/规格/命令）
-.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 六端点 + 8 张表落库
+.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（401/注册/心跳/规格/持仓/命令）
+.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 七端点 + 9 张表落库
 ```
 
 ## Web 仪表盘（frontend/）
@@ -56,10 +56,11 @@ pnpm dev        # http://127.0.0.1:5173
 pnpm build      # 类型检查 + 产线构建
 ```
 
-- **真实数据面板**：KPI 带（余额/净值/保证金等 ← 最新快照）、Equity & Balance Graph
-  （快照历史，`GET /api/v1/accounts/{id}/snapshots`）、Market Watch（品种发现）、
+- **真实数据面板**：KPI 带（余额/净值/浮动盈亏/保证金等 ← 最新快照）、持仓明细
+  （EA 实时同步，`GET /api/v1/accounts/{id}/positions`，每 10s 随心跳刷新）、
+  Equity & Balance Graph（快照历史）、Market Watch（品种发现）、
   Permission Signal / Trading Status / Account Info、侧栏 System Status；每 30s 自动刷新。
-- **示例数据面板**：Trade Journal、Performance、Risk Management、Profit Monitor、
+- **示例数据面板**：Performance、Risk Management、Profit Monitor、
   Filtering / Expert Settings、News Filter 等标注"示例数据"——对应数据链路（成交/风控/命令通道）
   在后续切片实现。
 

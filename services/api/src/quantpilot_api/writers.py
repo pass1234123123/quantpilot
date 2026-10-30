@@ -368,6 +368,92 @@ def handle_symbols(data: dict[str, Any]) -> None:
                 )
 
 
+def handle_positions(data: dict[str, Any]) -> None:
+    """State-based open-position sync (doc 4.4 projection, 5.2 reconcile).
+
+    The event carries the COMPLETE set of open positions at observed_at:
+      - reported tickets are upserted as OPEN
+      - previously OPEN tickets missing from the snapshot are marked CLOSED
+    JetStream redelivery / out-of-order delivery is guarded by
+    last_reported_at: a snapshot older than the last one applied is a no-op.
+    """
+    terminal_id, account_id = _resolve(data)
+    observed_at = _ts(data.get("observed_at"))
+    tickets: list[str] = []
+    with db.conn() as connection:
+        for pos in data.get("positions") or []:
+            ticket = str(pos.get("broker_position_ticket", ""))
+            if not ticket:
+                continue
+            tickets.append(ticket)
+            connection.execute(
+                """
+                INSERT INTO positions
+                       (account_id, broker_position_ticket, broker_symbol, direction,
+                        volume, price_open, current_price, sl, tp, profit, swap,
+                        open_time, status, last_reported_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s)
+                ON CONFLICT (account_id, broker_position_ticket) DO UPDATE
+                   SET broker_symbol  = EXCLUDED.broker_symbol,
+                       direction      = EXCLUDED.direction,
+                       volume          = EXCLUDED.volume,
+                       price_open      = EXCLUDED.price_open,
+                       current_price   = EXCLUDED.current_price,
+                       sl              = EXCLUDED.sl,
+                       tp              = EXCLUDED.tp,
+                       profit          = EXCLUDED.profit,
+                       swap            = EXCLUDED.swap,
+                       open_time       = EXCLUDED.open_time,
+                       status          = 'OPEN',
+                       last_reported_at = EXCLUDED.last_reported_at,
+                       closed_at       = NULL,
+                       updated_at      = now(),
+                       version         = positions.version + 1
+                 WHERE positions.last_reported_at IS NULL
+                    OR positions.last_reported_at <= EXCLUDED.last_reported_at
+                """,
+                (
+                    _uuid(account_id),
+                    ticket,
+                    str(pos.get("broker_symbol", "")),
+                    str(pos.get("direction", "")),
+                    _dec(pos.get("volume")),
+                    _dec(pos.get("price_open")),
+                    _dec(pos.get("current_price")),
+                    _dec(pos.get("sl")),
+                    _dec(pos.get("tp")),
+                    _dec(pos.get("profit")),
+                    _dec(pos.get("swap")),
+                    _ts(pos.get("open_time")) if pos.get("open_time") else None,
+                    observed_at,
+                ),
+            )
+        # tickets missing from this snapshot -> CLOSED (only if not newer-stamped)
+        if tickets:
+            connection.execute(
+                """
+                UPDATE positions
+                   SET status = 'CLOSED', closed_at = now(), updated_at = now(),
+                       version = version + 1
+                 WHERE account_id = %s AND status = 'OPEN'
+                   AND broker_position_ticket <> ALL(%s)
+                   AND (last_reported_at IS NULL OR last_reported_at <= %s)
+                """,
+                (_uuid(account_id), tickets, observed_at),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE positions
+                   SET status = 'CLOSED', closed_at = now(), updated_at = now(),
+                       version = version + 1
+                 WHERE account_id = %s AND status = 'OPEN'
+                   AND (last_reported_at IS NULL OR last_reported_at <= %s)
+                """,
+                (_uuid(account_id), observed_at),
+            )
+
+
 def handle_shutdown(data: dict[str, Any]) -> None:
     terminal_id, account_id = _resolve(data)
     add_system_event(
@@ -387,5 +473,6 @@ HANDLERS = {
     "ea.registered": handle_registered,
     "ea.heartbeat": handle_heartbeat,
     "ea.symbols": handle_symbols,
+    "ea.positions": handle_positions,
     "ea.shutdown": handle_shutdown,
 }

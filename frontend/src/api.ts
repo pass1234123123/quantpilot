@@ -86,6 +86,25 @@ export interface SymbolRow {
   observed_at: string | null
 }
 
+export interface PositionRow {
+  position_id: string
+  account_id: string
+  broker_position_ticket: string
+  broker_symbol: string
+  direction: 'BUY' | 'SELL'
+  volume: string
+  price_open: string
+  current_price: string | null
+  sl: string | null
+  tp: string | null
+  profit: string | null
+  swap: string | null
+  open_time: string | null
+  status: 'OPEN' | 'CLOSED'
+  last_reported_at: string | null
+  closed_at: string | null
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
   if (!res.ok) {
@@ -107,6 +126,7 @@ export const api = {
   snapshots: (accountId: string, limit = 500) =>
     get<SnapshotPoint[]>(`/api/v1/accounts/${accountId}/snapshots?limit=${limit}`),
   symbols: (accountId: string) => get<SymbolRow[]>(`/api/v1/accounts/${accountId}/symbols`),
+  positions: (accountId: string) => get<PositionRow[]>(`/api/v1/accounts/${accountId}/positions`),
 }
 
 /** Parse API decimal strings ("9980.00000000", "0E-8") safely. */

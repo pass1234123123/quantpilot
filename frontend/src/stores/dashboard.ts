@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountInfo, type AccountSnapshot, type NodeInfo, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
+import { api, num, type AccountInfo, type AccountSnapshot, type NodeInfo, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -13,6 +13,7 @@ export const useDashboardStore = defineStore('dashboard', {
     snapshot: null as AccountSnapshot | null,
     snapshotHistory: [] as SnapshotPoint[],
     symbols: [] as SymbolRow[],
+    positions: [] as PositionRow[],
     lastRefreshAt: '' as string,
   }),
   getters: {
@@ -74,15 +75,18 @@ export const useDashboardStore = defineStore('dashboard', {
       this.snapshot = null
       this.snapshotHistory = []
       this.symbols = []
-      const [snapshot, history, symbols] = await Promise.all([
+      this.positions = []
+      const [snapshot, history, symbols, positions] = await Promise.all([
         api.snapshot(accountId).catch(() => null),
         api.snapshots(accountId, 500).catch(() => [] as SnapshotPoint[]),
         api.symbols(accountId).catch(() => [] as SymbolRow[]),
+        api.positions(accountId).catch(() => [] as PositionRow[]),
       ])
       if (this.selectedAccountId !== accountId) return
       this.snapshot = snapshot
       this.snapshotHistory = history
       this.symbols = symbols
+      this.positions = positions
     },
     async selectAccount(accountId: string) {
       this.selectedAccountId = accountId

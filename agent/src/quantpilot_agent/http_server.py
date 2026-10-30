@@ -5,6 +5,7 @@ Endpoints (all JSON):
     POST /ea/v1/register       account + terminal identity  -> ea.registered
     POST /ea/v1/heartbeat      doc A.3 heartbeat            -> ea.heartbeat
     POST /ea/v1/symbols        symbol spec batch            -> ea.symbols
+    POST /ea/v1/positions      open-position snapshot       -> ea.positions
     GET  /ea/v1/commands       S1: always empty list (command channel reserved)
 
 The agent is OBSERVE_ONLY in this slice: it never returns trade commands and
@@ -22,12 +23,14 @@ from typing import Any
 
 from quantpilot_contracts.constants import (
     EVENT_EA_HEARTBEAT,
+    EVENT_EA_POSITIONS,
     EVENT_EA_REGISTERED,
     EVENT_EA_SHUTDOWN,
     EVENT_EA_SYMBOLS,
 )
 from quantpilot_contracts.models import (
     EaHeartbeatData,
+    EaPositionsData,
     EaRegisteredData,
     EaShutdownData,
     EaSymbolsData,
@@ -140,6 +143,9 @@ class AgentHttpServer:
                         data = model.model_dump(mode="json")
                         _stamp_spec_hashes(data)
                         event_type = EVENT_EA_SYMBOLS
+                    elif route == "/ea/v1/positions":
+                        data = EaPositionsData.model_validate(body).model_dump(mode="json")
+                        event_type = EVENT_EA_POSITIONS
                     elif route == "/ea/v1/shutdown":
                         data = EaShutdownData.model_validate(body).model_dump(mode="json")
                         event_type = EVENT_EA_SHUTDOWN

@@ -6,6 +6,7 @@
 //|   - reports terminal/account identity to the local agent          |
 //|   - reports symbol trading specifications (PRD 5.4)                |
 //|   - sends doc A.3 account heartbeats on a timer                  |
+//|   - sends open-position snapshots (doc 12.2 projection, read-only)|
 //|   - sends a shutdown note on removal                             |
 //|                                                                   |
 //| What it MUST NOT contain (PRD 21.3):                             |
@@ -233,6 +234,69 @@ bool QpSendHeartbeat()
   }
 
 //+------------------------------------------------------------------+
+//| ISO-8601 UTC timestamp from an arbitrary datetime                 |
+//+------------------------------------------------------------------+
+string QpIsoTime(const datetime t)
+  {
+   string s = TimeToString(t, TIME_DATE | TIME_SECONDS);
+   StringReplace(s, ".", "-");
+   StringReplace(s, " ", "T");
+   return(s + "Z");
+  }
+
+//+------------------------------------------------------------------+
+//| Open positions snapshot (doc 12.2 projection, read-only)         |
+//| PositionGetTicket(i) selects position i; no trade calls anywhere.|
+//+------------------------------------------------------------------+
+bool QpSendPositions()
+  {
+   string positions_json = "";
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      string name = PositionGetString(POSITION_SYMBOL);
+      int digits = (int)SymbolInfoInteger(name, SYMBOL_DIGITS);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+
+      QpJsonObject p;
+      p.Clear();
+      p.AddStr("broker_position_ticket", IntegerToString((long)ticket));
+      p.AddStr("broker_symbol", name);
+      p.AddStr("direction", PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL");
+      p.AddNumStr("volume", DoubleToString(PositionGetDouble(POSITION_VOLUME), 8));
+      p.AddNumStr("price_open", DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits));
+      p.AddNumStr("current_price", DoubleToString(PositionGetDouble(POSITION_PRICE_CURRENT), digits));
+      if(sl != 0.0)
+         p.AddNumStr("sl", DoubleToString(sl, digits));
+      if(tp != 0.0)
+         p.AddNumStr("tp", DoubleToString(tp, digits));
+      p.AddNumStr("profit", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+      p.AddNumStr("swap", DoubleToString(PositionGetDouble(POSITION_SWAP), 2));
+      p.AddStr("open_time", QpIsoTime((datetime)PositionGetInteger(POSITION_TIME)));
+
+      if(i > 0)
+         positions_json += ",";
+      positions_json += p.Dump();
+     }
+
+   QpJsonObject o;
+   o.Clear();
+   o.AddStr("ea_version", QP_EA_VERSION);
+   o.AddRaw("terminal", g_terminal_json);
+   o.AddRaw("account", QpAccountJson());
+   o.AddRaw("positions", "[" + positions_json + "]");
+   o.AddStr("observed_at", QpIsoNow());
+   if(!QpHttpPost("/ea/v1/positions", o.Dump()))
+      return(false);
+   QpLog("DEBUG", "reported " + IntegerToString(total) + " open position(s)");
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| Symbol specs (PRD 5.4) in batches                                |
 //+------------------------------------------------------------------+
 bool QpSendSymbolSpecs()
@@ -410,5 +474,8 @@ void OnTimer()
      }
 
    QpSendHeartbeat();
+
+   // position snapshot every heartbeat tick (read-only reconcile, doc 5.2)
+   QpSendPositions();
   }
 //+------------------------------------------------------------------+

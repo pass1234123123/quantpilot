@@ -176,6 +176,29 @@ def account_snapshots_history(account_id: str, request: Request, limit: int = 50
     return ok(db.jsonable(rows), request)
 
 
+@app.get("/api/v1/accounts/{account_id}/positions")
+def account_positions(account_id: str, request: Request) -> JSONResponse:
+    """Open + recently closed position projection (doc 13.2, read-only).
+
+    profit is the last observed floating profit (realized P/L needs deals).
+    """
+    rows = db.query(
+        """
+        SELECT p.id::text AS position_id, p.account_id::text AS account_id,
+               p.broker_position_ticket, p.broker_symbol, p.direction,
+               p.volume, p.price_open, p.current_price, p.sl, p.tp,
+               p.profit, p.swap, p.open_time, p.status,
+               p.last_reported_at, p.closed_at
+          FROM positions p
+         WHERE p.account_id = %s
+         ORDER BY (p.status = 'OPEN') DESC, p.open_time DESC
+         LIMIT 500
+        """,
+        (account_id,),
+    )
+    return ok(db.jsonable(rows), request)
+
+
 @app.get("/api/v1/accounts/{account_id}/symbols")
 def account_symbols(account_id: str, request: Request) -> JSONResponse:
     rows = db.query(
