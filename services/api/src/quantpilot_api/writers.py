@@ -604,6 +604,69 @@ def handle_orders(data: dict[str, Any]) -> None:
             )
 
 
+def handle_calendar(data: dict[str, Any]) -> None:
+    """Economic-calendar projection from the MT5 built-in calendar (doc 12.2).
+
+    Upsert by (account_id, event_uid): re-reports of the same window update
+    actual/forecast/previous once values are released. The IS DISTINCT FROM
+    guard keeps JetStream redeliveries of identical payloads no-ops
+    (version stays put, PRD 4.5 idempotency).
+    """
+    terminal_id, account_id = _resolve(data)
+    observed_at = _ts(data.get("observed_at"))
+    with db.conn() as connection:
+        for ev in data.get("events") or []:
+            uid = str(ev.get("event_uid", ""))
+            name = str(ev.get("name", ""))
+            if not uid or not name:
+                continue
+            connection.execute(
+                """
+                INSERT INTO calendar_events
+                       (account_id, event_uid, country_code, currency, name,
+                        importance, multiplier, digits, event_time,
+                        actual, forecast, previous, observed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (account_id, event_uid) DO UPDATE
+                   SET country_code = EXCLUDED.country_code,
+                       currency     = EXCLUDED.currency,
+                       name         = EXCLUDED.name,
+                       importance   = EXCLUDED.importance,
+                       multiplier   = EXCLUDED.multiplier,
+                       digits       = EXCLUDED.digits,
+                       event_time   = EXCLUDED.event_time,
+                       actual       = EXCLUDED.actual,
+                       forecast     = EXCLUDED.forecast,
+                       previous     = EXCLUDED.previous,
+                       observed_at  = EXCLUDED.observed_at,
+                       updated_at   = now(),
+                       version      = calendar_events.version + 1
+                 WHERE (calendar_events.actual, calendar_events.forecast,
+                        calendar_events.previous, calendar_events.importance,
+                        calendar_events.event_time)
+                       IS DISTINCT FROM
+                       (EXCLUDED.actual, EXCLUDED.forecast,
+                        EXCLUDED.previous, EXCLUDED.importance,
+                        EXCLUDED.event_time)
+                """,
+                (
+                    _uuid(account_id),
+                    uid,
+                    str(ev.get("country_code", "")),
+                    str(ev.get("currency", "")),
+                    name,
+                    str(ev.get("importance", "NONE")),
+                    str(ev.get("multiplier", "NONE")),
+                    _int(ev.get("digits")) or 0,
+                    _ts(ev.get("event_time")),
+                    _dec(ev.get("actual")),
+                    _dec(ev.get("forecast")),
+                    _dec(ev.get("previous")),
+                    observed_at,
+                ),
+            )
+
+
 def handle_shutdown(data: dict[str, Any]) -> None:
     terminal_id, account_id = _resolve(data)
     add_system_event(
@@ -626,5 +689,6 @@ HANDLERS = {
     "ea.positions": handle_positions,
     "ea.deals": handle_deals,
     "ea.orders": handle_orders,
+    "ea.calendar": handle_calendar,
     "ea.shutdown": handle_shutdown,
 }

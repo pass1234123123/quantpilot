@@ -9,6 +9,7 @@
 //|   - sends open-position snapshots (doc 12.2 projection, read-only)|
 //|   - sends pending-order snapshots (doc 12.2 orders projection)   |
 //|   - sends account history deals incrementally (read-only)        |
+//|   - sends the MT5 built-in economic calendar (read-only)         |
 //|   - polls the cloud-side account config every 60s and LOGS it    |
 //|     (informational only - it is never applied, OBSERVE_ONLY)     |
 //|   - sends a shutdown note on removal                             |
@@ -23,24 +24,28 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.2.0"
+#define QP_EA_VERSION        "1.3.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
 #define QP_DEALS_PER_BATCH   200
 #define QP_DEALS_REFRESH_SEC 60    // incremental history-deal poll
 #define QP_CONFIG_REFRESH_SEC 60   // config poll (informational only)
+#define QP_CALENDAR_REFRESH_SEC 600 // re-report the calendar window (10 min)
+#define QP_CALENDAR_PER_BATCH 200
+#define QP_CALENDAR_PAST_SEC  7200  // include releases from the past 2h
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
 input string AgentToken       = "";                     // Shared local token (X-QP-Token)
 input int    HeartbeatSeconds = 10;                     // Heartbeat interval, 5..15s (PRD 5.7)
 input int    MaxSymbols       = 100;                    // Max Market Watch symbols to report
+input int    CalendarWindowHours = 48;                  // Economic calendar lookahead (hours)
 input string LogLevel         = "INFO";                 // DEBUG | INFO | ERROR
 
 //--- runtime state
@@ -52,6 +57,7 @@ datetime g_last_specs_at   = 0;
 datetime g_last_deal_time  = 0;    // max deal time already reported (0 = full backfill)
 datetime g_last_deals_at   = 0;    // when the deals channel last succeeded
 datetime g_last_config_at  = 0;    // when the config poll last succeeded
+datetime g_last_calendar_at = 0;  // when the calendar report last succeeded
 
 //+------------------------------------------------------------------+
 //| Logging                                                          |
@@ -551,6 +557,125 @@ bool QpSendConfigPoll()
   }
 
 //+------------------------------------------------------------------+
+//| Economic calendar (MT5 built-in, read-only)                       |
+//+------------------------------------------------------------------+
+string QpCalendarImportanceLabel(const long importance)
+  {
+   switch((int)importance)
+     {
+      case CALENDAR_IMPORTANCE_NONE:     return("NONE");
+      case CALENDAR_IMPORTANCE_LOW:      return("LOW");
+      case CALENDAR_IMPORTANCE_MODERATE: return("MODERATE");
+      case CALENDAR_IMPORTANCE_HIGH:     return("HIGH");
+     }
+   return("UNKNOWN_" + IntegerToString(importance));
+  }
+
+string QpCalendarMultiplierLabel(const long multiplier)
+  {
+   switch((int)multiplier)
+     {
+      case CALENDAR_MULTIPLIER_NONE:      return("NONE");
+      case CALENDAR_MULTIPLIER_THOUSANDS: return("THOUSANDS");
+      case CALENDAR_MULTIPLIER_MILLIONS:  return("MILLIONS");
+      case CALENDAR_MULTIPLIER_BILLIONS:  return("BILLIONS");
+      case CALENDAR_MULTIPLIER_TRILLIONS: return("TRILLIONS");
+     }
+   return("UNKNOWN_" + IntegerToString(multiplier));
+  }
+
+// Terminal marks unset calendar values with extreme long sentinels
+// (|LONG_MIN/LONG_MAX| ~ 9.2e18); real figures stay far below this bound.
+bool QpCalendarValueSane(const long value)
+  {
+   return(value <= 1000000000000000 && value >= -1000000000000000);
+  }
+
+bool QpSendCalendar()
+  {
+   // window on the trade-server clock: calendar times follow it (the same
+   // documented approximation as the deals channel - MQL5 has no API to
+   // query the server timezone)
+   datetime now  = TimeTradeServer();
+   datetime from = now - QP_CALENDAR_PAST_SEC;
+   datetime to   = now + (datetime)CalendarWindowHours * 3600;
+
+   MqlCalendarValue values[];
+   ResetLastError();
+   if(!CalendarValueHistory(values, from, to))
+     {
+      // unavailable calendar (broker/terminal) is a data condition, not a
+      // transport failure - nothing to report, refresh retries later
+      QpLog("INFO", "calendar unavailable (broker/terminal), err=" +
+            IntegerToString(GetLastError()));
+      return(true);
+     }
+
+   int total = ArraySize(values);
+   int batch_total = (total + QP_CALENDAR_PER_BATCH - 1) / QP_CALENDAR_PER_BATCH;
+   if(batch_total == 0)
+      batch_total = 1;
+
+   int sent = 0;
+   for(int batch_index = 0; batch_index < batch_total; batch_index++)
+     {
+      string events_json = "";
+      int in_batch = 0;
+      for(int i = batch_index * QP_CALENDAR_PER_BATCH;
+          i < (batch_index + 1) * QP_CALENDAR_PER_BATCH && i < total; i++)
+        {
+         MqlCalendarEvent ev;
+         if(!CalendarEventById(values[i].event_id, ev))
+            continue;
+         MqlCalendarCountry country;
+         if(!CalendarCountryById(ev.country_id, country))
+            continue;
+
+         QpJsonObject e;
+         e.Clear();
+         e.AddStr("event_uid", IntegerToString((long)values[i].id));
+         e.AddStr("country_code", country.code);
+         e.AddStr("currency", country.currency);
+         e.AddStr("name", ev.name);
+         e.AddStr("importance", QpCalendarImportanceLabel(ev.importance));
+         e.AddStr("multiplier", QpCalendarMultiplierLabel(ev.multiplier));
+         e.AddInt("digits", ev.digits);
+         e.AddStr("event_time", QpIsoTime(values[i].time));
+         if(QpCalendarValueSane(values[i].actual_value))
+            e.AddNumStr("actual", IntegerToString(values[i].actual_value));
+         if(QpCalendarValueSane(values[i].forecast_value))
+            e.AddNumStr("forecast", IntegerToString(values[i].forecast_value));
+         if(QpCalendarValueSane(values[i].prev_value))
+            e.AddNumStr("previous", IntegerToString(values[i].prev_value));
+         if(in_batch > 0)
+            events_json += ",";
+         events_json += e.Dump();
+         in_batch++;
+        }
+      if(in_batch == 0)
+         continue;
+
+      QpJsonObject o;
+      o.Clear();
+      o.AddStr("ea_version", QP_EA_VERSION);
+      o.AddRaw("terminal", g_terminal_json);
+      o.AddRaw("account", QpAccountJson());
+      o.AddInt("batch_index", batch_index);
+      o.AddInt("batch_total", batch_total);
+      o.AddStr("window_from", QpIsoTime(from));
+      o.AddStr("window_to", QpIsoTime(to));
+      o.AddRaw("events", "[" + events_json + "]");
+      o.AddStr("observed_at", QpIsoNow());
+      if(!QpHttpPost("/ea/v1/calendar", o.Dump()))
+         return(false);
+      sent += in_batch;
+     }
+   QpLog("INFO", "reported " + IntegerToString(sent) + " calendar event(s) in " +
+         IntegerToString(batch_total) + " batch(es)");
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| Symbol specs (PRD 5.4) in batches                                |
 //+------------------------------------------------------------------+
 bool QpSendSymbolSpecs()
@@ -680,6 +805,8 @@ int OnInit()
       g_last_deal_time = 0; // new account context -> full history backfill
       if(QpSendSymbolSpecs())
          g_last_specs_at = TimeGMT();
+      if(QpSendCalendar())
+         g_last_calendar_at = TimeGMT();
      }
    else
       QpLog("INFO", "initial register failed; will retry on timer");
@@ -719,6 +846,8 @@ void OnTimer()
          g_last_deal_time = 0; // new account context -> full history backfill
          if(QpSendSymbolSpecs())
             g_last_specs_at = TimeGMT();
+         if(QpSendCalendar())
+            g_last_calendar_at = TimeGMT();
         }
       return;
      }
@@ -749,6 +878,13 @@ void OnTimer()
      {
       if(QpSendConfigPoll())
          g_last_config_at = TimeGMT();
+     }
+
+   // economic calendar window (read-only; actual values arrive after release)
+   if(g_last_calendar_at == 0 || TimeGMT() - g_last_calendar_at >= QP_CALENDAR_REFRESH_SEC)
+     {
+      if(QpSendCalendar())
+         g_last_calendar_at = TimeGMT();
      }
   }
 //+------------------------------------------------------------------+

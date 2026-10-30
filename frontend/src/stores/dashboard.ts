@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type CalendarEventRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -16,6 +16,7 @@ export const useDashboardStore = defineStore('dashboard', {
     positions: [] as PositionRow[],
     deals: [] as DealRow[],
     orders: [] as OrderRow[],
+    calendar: [] as CalendarEventRow[],
     performance: null as PerformanceData | null,
     config: null as AccountConfigData | null,
     configSaving: false,
@@ -83,15 +84,17 @@ export const useDashboardStore = defineStore('dashboard', {
       this.positions = []
       this.deals = []
       this.orders = []
+      this.calendar = []
       this.performance = null
       this.config = null
-      const [snapshot, history, symbols, positions, deals, orders, performance, config] = await Promise.all([
+      const [snapshot, history, symbols, positions, deals, orders, calendar, performance, config] = await Promise.all([
         api.snapshot(accountId).catch(() => null),
         api.snapshots(accountId, 500).catch(() => [] as SnapshotPoint[]),
         api.symbols(accountId).catch(() => [] as SymbolRow[]),
         api.positions(accountId).catch(() => [] as PositionRow[]),
         api.deals(accountId, 500).catch(() => [] as DealRow[]),
         api.orders(accountId).catch(() => [] as OrderRow[]),
+        api.calendar(accountId, 48).catch(() => [] as CalendarEventRow[]),
         api.performance(accountId, 30).catch(() => null),
         api.getConfig(accountId).catch(() => null),
       ])
@@ -102,6 +105,7 @@ export const useDashboardStore = defineStore('dashboard', {
       this.positions = positions
       this.deals = deals
       this.orders = orders
+      this.calendar = calendar
       this.performance = performance
       this.config = config
     },

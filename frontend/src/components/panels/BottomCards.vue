@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
 import { num } from '../../api'
 
@@ -16,9 +16,54 @@ const allOperational = computed(
 const yesNo = (v: boolean | undefined) => (v ? '是' : '否')
 const onOff = (v: boolean | undefined) => (v === undefined ? '—' : v ? '开启' : '关闭')
 
-// 新闻过滤配置状态（云端 risk_profiles；日历数据源本切片未接入）
+// 新闻过滤配置状态（云端 risk_profiles）
 const newsFilter = computed(() => config.value?.config.filters.news_filter)
 const highImpactOnly = computed(() => config.value?.config.filters.high_impact_only)
+
+// 财经日历：EA 上报的 MT5 内置日历（真实经纪商数据），倒计时每秒刷新
+const nowMs = ref(Date.now())
+let tick: number | undefined
+onMounted(() => {
+  tick = window.setInterval(() => {
+    nowMs.value = Date.now()
+  }, 1000)
+})
+onUnmounted(() => {
+  if (tick !== undefined) window.clearInterval(tick)
+})
+
+const upcomingEvents = computed(() =>
+  store.calendar.filter((e) => new Date(e.event_time).getTime() > nowMs.value),
+)
+const nextEvent = computed(() => upcomingEvents.value[0] ?? null)
+const laterEvents = computed(() => upcomingEvents.value.slice(1, 4))
+
+const countdown = computed(() => {
+  const ev = nextEvent.value
+  if (!ev) return ''
+  const diff = Math.max(0, Math.floor((new Date(ev.event_time).getTime() - nowMs.value) / 1000))
+  const d = Math.floor(diff / 86400)
+  const h = Math.floor((diff % 86400) / 3600)
+  const m = Math.floor((diff % 3600) / 60)
+  const s = diff % 60
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return d > 0 ? `${d}天 ${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(h)}:${pad(m)}:${pad(s)}`
+})
+
+const importanceLabel: Record<string, string> = {
+  NONE: '无',
+  LOW: '低',
+  MODERATE: '中',
+  HIGH: '高',
+}
+const eventTimeText = (iso: string) =>
+  new Date(iso).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
 
 // 点差与滑点配置状态
 const maxSpread = computed(() => config.value?.config.filters.max_spread)
@@ -54,19 +99,40 @@ const currency = computed(() => snap.value?.currency ?? '')
 
 <template>
   <div class="bc">
-    <!-- 新闻过滤（云端配置；日历数据源待接入） -->
+    <!-- 新闻过滤（云端配置 + EA 上报的 MT5 内置日历） -->
     <div class="qp-panel bc__card">
       <div class="qp-panel__title">
         新闻过滤
-        <span class="qp-live-badge">配置真实</span>
+        <span class="qp-live-badge">配置+日历真实</span>
       </div>
       <div class="bc__news">
         <div class="bc__news-row"><span>新闻过滤</span><b :class="newsFilter ? 'qp-up' : 'qp-dim'">{{ onOff(newsFilter) }}</b></div>
         <div class="bc__news-row"><span>仅高影响事件</span><b :class="highImpactOnly ? 'qp-up' : 'qp-dim'">{{ onOff(highImpactOnly) }}</b></div>
         <div class="bc__countdown">
-          <div class="bc__countdown-label">财经日历数据源</div>
-          <div class="bc__countdown-name">待接入：本切片暂无新闻日历供应商</div>
-          <div class="bc__countdown-name bc__dim">以上为云端配置开关的真实状态</div>
+          <template v-if="nextEvent">
+            <div class="bc__countdown-label">下一财经事件（MT5 内置日历）</div>
+            <div class="bc__countdown-time">{{ countdown }}</div>
+            <div class="bc__countdown-name">
+              <span class="bc__imp" :class="`bc__imp--${nextEvent.importance.toLowerCase()}`">
+                {{ importanceLabel[nextEvent.importance] ?? nextEvent.importance }}
+              </span>
+              {{ nextEvent.currency || nextEvent.country_code }} {{ nextEvent.name }}
+            </div>
+            <div class="bc__countdown-name bc__dim">{{ eventTimeText(nextEvent.event_time) }}（经纪商服务器时间）</div>
+          </template>
+          <template v-else>
+            <div class="bc__countdown-label">下一财经事件</div>
+            <div class="bc__countdown-name">
+              {{ store.calendar.length > 0 ? '未来 48 小时内无事件' : '待上报（EA 每 10 分钟刷新日历）' }}
+            </div>
+          </template>
+        </div>
+        <div v-for="ev in laterEvents" :key="ev.event_uid" class="bc__news-row">
+          <span class="bc__event-later">
+            {{ eventTimeText(ev.event_time) }}
+            <b class="bc__imp-inline" :class="`bc__imp--${ev.importance.toLowerCase()}`">{{ importanceLabel[ev.importance] ?? ev.importance }}</b>
+            {{ ev.currency || ev.country_code }} {{ ev.name }}
+          </span>
         </div>
       </div>
     </div>
@@ -186,6 +252,32 @@ const currency = computed(() => snap.value?.currency ?? '')
 .bc__countdown-time { font-size: 20px; font-weight: 700; color: var(--qp-warn); font-variant-numeric: tabular-nums; }
 .bc__countdown-name { font-size: 10px; color: var(--qp-text-dim); }
 .bc__dim { opacity: 0.65; }
+
+.bc__imp {
+  display: inline-block;
+  padding: 0 5px;
+  margin-right: 4px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  vertical-align: 1px;
+  color: var(--qp-text);
+  background: rgba(148, 163, 184, 0.18);
+}
+.bc__imp--high { background: rgba(239, 68, 68, 0.25); }
+.bc__imp--moderate { background: rgba(245, 158, 11, 0.25); }
+.bc__imp-inline { font-weight: 700; margin: 0 3px; }
+.bc__imp-inline.bc__imp--high, .bc__imp--high.bc__imp-inline { color: var(--qp-down); }
+.bc__imp-inline.bc__imp--moderate { color: var(--qp-warn); }
+.bc__event-later {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--qp-text-dim);
+}
 
 .bc__shield {
   text-align: center;

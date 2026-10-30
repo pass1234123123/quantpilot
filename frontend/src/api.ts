@@ -192,6 +192,22 @@ export interface PerformanceData {
   period: PerfPeriod
 }
 
+export interface CalendarEventRow {
+  calendar_event_id: string
+  event_uid: string
+  country_code: string
+  currency: string
+  name: string
+  importance: 'NONE' | 'LOW' | 'MODERATE' | 'HIGH'
+  multiplier: string
+  digits: number
+  event_time: string
+  actual: string | null
+  forecast: string | null
+  previous: string | null
+  observed_at: string
+}
+
 export interface FiltersConfig {
   news_filter: boolean
   high_impact_only: boolean
@@ -266,6 +282,8 @@ export const api = {
   orders: (accountId: string) => get<OrderRow[]>(`/api/v1/accounts/${accountId}/orders`),
   performance: (accountId: string, days = 30) =>
     get<PerformanceData>(`/api/v1/accounts/${accountId}/performance?days=${days}`),
+  calendar: (accountId: string, hours = 48) =>
+    get<CalendarEventRow[]>(`/api/v1/accounts/${accountId}/calendar?hours=${hours}`),
   getConfig: (accountId: string) => get<AccountConfigData>(`/api/v1/accounts/${accountId}/config`),
   saveConfig: (accountId: string, config: { filters: FiltersConfig; expert: ExpertConfig }) =>
     send<AccountConfigData>(`/api/v1/accounts/${accountId}/config`, 'PUT', config),

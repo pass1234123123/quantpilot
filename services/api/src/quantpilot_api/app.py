@@ -405,6 +405,31 @@ def account_symbols(account_id: str, request: Request) -> JSONResponse:
     return ok(db.jsonable(rows), request)
 
 
+@app.get("/api/v1/accounts/{account_id}/calendar")
+def account_calendar(account_id: str, request: Request, hours: int = 48) -> JSONResponse:
+    """Economic calendar reported by the EA (MT5 built-in, read-only).
+
+    Window: past 2 hours (recent releases keep their actual values) through
+    `hours` ahead, oldest-first. Values are raw broker figures; multiplier
+    and digits are included for display formatting.
+    """
+    hours = max(1, min(hours, 168))
+    rows = db.query(
+        """
+        SELECT c.id::text AS calendar_event_id, c.event_uid, c.country_code,
+               c.currency, c.name, c.importance, c.multiplier, c.digits,
+               c.event_time, c.actual, c.forecast, c.previous, c.observed_at
+          FROM calendar_events c
+         WHERE c.account_id = %s
+           AND c.event_time >= now() - interval '2 hours'
+           AND c.event_time <= now() + make_interval(hours => %s)
+         ORDER BY c.event_time
+        """,
+        (account_id, hours),
+    )
+    return ok(db.jsonable(rows), request)
+
+
 # --------------------------------------------------------------------------
 # account config (doc 12.2 risk_profiles) - OBSERVE_ONLY slice: the config is
 # stored and served for observation; nothing in this system enforces it.

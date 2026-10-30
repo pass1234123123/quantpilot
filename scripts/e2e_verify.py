@@ -38,6 +38,7 @@ TABLES = [
     "positions",
     "deals",
     "orders",
+    "calendar_events",
     "risk_profiles",
     "system_events",
 ]
@@ -160,6 +161,24 @@ def main() -> int:
                   f"net={stats.get('net_profit')}")
             check("api.performance_daily", len(pdata.get("daily", [])) == 30,
                   f"buckets={len(pdata.get('daily', []))}")
+
+        # calendar: sim_ea posts 3 events (1 past with actual, 2 future)
+        cal = client.get(f"{API}/api/v1/accounts/{sim_id}/calendar")
+        cal_ok = cal.status_code == 200
+        cal_data = cal.json().get("data", []) if cal_ok else []
+        fields_ok = all(
+            e.get("event_uid") and e.get("name") and e.get("event_time") and e.get("importance")
+            for e in cal_data
+        )
+        has_future = any(e.get("event_uid") == "sim-cal-002" for e in cal_data)
+        check("api.calendar", cal_ok and fields_ok and len(cal_data) >= 3 and has_future,
+              f"status={cal.status_code} count={len(cal_data)}")
+        for crow in cal_data[:3]:
+            print(f"       calendar: {crow.get('currency')} {crow.get('name')} "
+                  f"importance={crow.get('importance')} @{str(crow.get('event_time'))[:16]}")
+        past = next((e for e in cal_data if e.get("event_uid") == "sim-cal-001"), None)
+        check("api.calendar_past_actual", past is not None and past.get("actual") is not None,
+              f"actual={past.get('actual') if past else '-'}")
 
         # config: PUT must bump the version; lookup must resolve the sim identity
         cfg0 = client.get(f"{API}/api/v1/accounts/{sim_id}/config")

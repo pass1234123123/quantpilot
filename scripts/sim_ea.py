@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -294,6 +294,63 @@ def main() -> int:
     print(f"[config] agent lookup: {'OK' if cfg_ok else 'FAIL'} resolved={resolved} version={version}")
     if not cfg_ok:
         failures += 1
+
+    # 12. economic calendar batch (same payload shape as QpSendCalendar)
+    now = datetime.now(timezone.utc)
+    post(
+        "/ea/v1/calendar",
+        {
+            "ea_version": "1.0.0",
+            "terminal": terminal(),
+            "account": account(),
+            "batch_index": 0,
+            "batch_total": 1,
+            "window_from": (now - timedelta(hours=2)).isoformat(),
+            "window_to": (now + timedelta(hours=48)).isoformat(),
+            "events": [
+                {
+                    "event_uid": "sim-cal-001",
+                    "country_code": "US",
+                    "currency": "USD",
+                    "name": "Core CPI m/m (sim)",
+                    "importance": "HIGH",
+                    "multiplier": "MILLION",
+                    "digits": 1,
+                    "event_time": (now - timedelta(minutes=30)).isoformat(),
+                    "actual": "312000",
+                    "forecast": "310000",
+                    "previous": "308000",
+                },
+                {
+                    "event_uid": "sim-cal-002",
+                    "country_code": "US",
+                    "currency": "USD",
+                    "name": "Non-Farm Employment Change (sim)",
+                    "importance": "HIGH",
+                    "multiplier": "NONE",
+                    "digits": 0,
+                    "event_time": (now + timedelta(hours=2)).isoformat(),
+                    "actual": None,
+                    "forecast": "185000",
+                    "previous": "179000",
+                },
+                {
+                    "event_uid": "sim-cal-003",
+                    "country_code": "DE",
+                    "currency": "EUR",
+                    "name": "Manufacturing PMI (sim)",
+                    "importance": "MODERATE",
+                    "multiplier": "NONE",
+                    "digits": 1,
+                    "event_time": (now + timedelta(hours=5)).isoformat(),
+                    "actual": None,
+                    "forecast": "43.2",
+                    "previous": "43.1",
+                },
+            ],
+            "observed_at": iso_now(),
+        },
+    )
 
     print(f"\nagent-side failures: {failures}")
     return failures

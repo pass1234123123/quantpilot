@@ -267,6 +267,52 @@ class EaOrdersData(BaseModel):
     observed_at: datetime
 
 
+class CalendarEventRecord(BaseModel):
+    """One economic-calendar event from the MT5 built-in calendar (read-only).
+
+    Values are the broker-reported raw longs (MQL5 MqlCalendarValue); the
+    multiplier/digits needed to format them travel alongside (MqlCalendarEvent).
+    Unset values are omitted by the EA (the terminal marks them with extreme
+    long sentinels, which never pass the sanity bound).
+    """
+
+    model_config = StrictModel
+
+    event_uid: str = Field(description="MqlCalendarValue.id as string (stable per occurrence)")
+    country_code: str = Field(default="", description="MqlCalendarCountry.code")
+    currency: str = Field(default="", description="affected currency (country currency)")
+    name: str
+    importance: Literal["NONE", "LOW", "MODERATE", "HIGH"] = "NONE"
+    multiplier: str = Field(default="NONE", description="MqlCalendarEvent.multiplier label")
+    digits: int = Field(default=0, description="display digits (MqlCalendarEvent.digits)")
+    event_time: datetime
+    actual: Money | None = None
+    forecast: Money | None = None
+    previous: Money | None = None
+
+
+class EaCalendarData(BaseModel):
+    """Event ea.calendar payload: economic-calendar window for one account.
+
+    Events come from the MT5 built-in calendar (broker-provided); the cloud
+    upserts by (account_id, event_uid), so redeliveries and overlapping
+    windows are idempotent. actual values arrive after release, so a
+    re-report of the same window updates - not duplicates - the row.
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    batch_index: int = 0
+    batch_total: int = 1
+    window_from: datetime
+    window_to: datetime
+    events: list[CalendarEventRecord]
+    observed_at: datetime
+
+
 class NodeEventEnvelope(BaseModel):
     """Wrapper published to JetStream subject node.<node_id>.events."""
 
