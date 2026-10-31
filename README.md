@@ -1,19 +1,32 @@
-# QuantPilot AI — 首切片（只读接入）
+# QuantPilot AI — 外汇 EA 云端平台（开发中）
 
-EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL 的只读数据链路。
+EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL 的完整数据链路。
 
-**OBSERVE_ONLY**：本切片 EA 不含任何交易执行代码（无 OrderSend / OrderCheck / CTrade），
-仅上报终端/账户身份、心跳快照、品种规格与开仓持仓快照。新账户默认 `OBSERVE_ONLY` 状态。
+**OBSERVE_ONLY**：EA 不含任何交易执行代码（无 OrderSend / OrderCheck / CTrade），
+仅上报终端/账户身份、心跳快照、品种规格、持仓/挂单/成交与日历事件。新账户默认
+`OBSERVE_ONLY` 状态。云端命令通道已通（下发/确认/幂等/对账），但 EA 收到后仅回执
+（`OBSERVE_ONLY_ACK`），不执行任何交易；风险增加型命令在下发前过云端风控闸门。
+
+## 已完成切片
+
+- 只读接入：注册/心跳/规格/持仓/挂单/成交/日历事件落库 + 查询 API + Web 仪表盘
+- 品种报价：每账户每品种最新 bid/ask/点差投影（`symbol_quotes`）
+- 云端配置：`risk_profiles` 配置下发（EA 侧仅日志，不解析执行）
+- 命令通道：`commands` 状态机（QUEUED→DELIVERED→ACKED / EXPIRED / UNKNOWN / REJECTED）、
+  command_id 幂等、UNKNOWN 对账（迟到 ack / EA recently-acked 回显，永不盲重发）
+- 风控引擎（执行侧）：创建时闸门按 PRD 9.2 顺序检查；拒绝即落终态 REJECTED（永不投递）
+  + `risk_decisions` 审计；全局/账户级 STOP_NEW_RISK / LOCKED 持久状态（PRD 3.3/9.5）
 
 ## 目录结构
 
 ```
 packages/contracts/   Pydantic 数据契约 + NATS subject + 共享常量
 agent/                本地节点：终端发现 + HTTP 接收(8787) + JetStream 发布
-services/api/         FastAPI：节点注册/心跳 + JetStream 消费者入库 + 查询路由
+services/api/         FastAPI：JetStream 消费入库 + 查询路由 + 命令通道 + 风控闸门
+                     （risk.py 闸门 / account_config.py 账户配置模型）
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
-infra/postgres/       Alembic 迁移（0001 建表 + 0002 selected + 0003 positions）
+infra/postgres/       Alembic 迁移（0001–0009，含 risk_states / risk_decisions）
 scripts/              开发工具（隧道/冒烟/验收/部署）
 ```
 
@@ -40,8 +53,8 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 冒烟与验收：
 
 ```powershell
-.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（401/注册/心跳/规格/持仓/命令）
-.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 七端点 + 9 张表落库
+.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（注册/心跳/规格/持仓/命令/风控闸门 16 场景）
+.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 端点 + 16 张表落库 + 风控不变量
 ```
 
 ## Web 仪表盘（frontend/）
@@ -58,11 +71,28 @@ pnpm build      # 类型检查 + 产线构建
 
 - **真实数据面板**：KPI 带（余额/净值/浮动盈亏/保证金等 ← 最新快照）、持仓明细
   （EA 实时同步，`GET /api/v1/accounts/{id}/positions`，每 10s 随心跳刷新）、
-  Equity & Balance Graph（快照历史）、Market Watch（品种发现）、
-  Permission Signal / Trading Status / Account Info、侧栏 System Status；每 30s 自动刷新。
-- **示例数据面板**：Performance、Risk Management、Profit Monitor、
-  Filtering / Expert Settings、News Filter 等标注"示例数据"——对应数据链路（成交/风控/命令通道）
-  在后续切片实现。
+  Equity & Balance Graph（快照历史）、Market Watch（品种发现 + 实时点差）、
+  Performance（成交统计/日盈亏）、Risk Management（`risk_profiles` 配置 + 停止状态）、
+  News Filter（日历事件）、Permission Signal / Trading Status / Account Info、
+  侧栏 System Status；每 30s 自动刷新。
+- **示例数据面板**：Profit Monitor、Filtering / Expert Settings 等——对应数据链路
+  （策略引擎/命令下发 UI）在后续切片实现。
+
+## 命令通道与风控 API（本阶段）
+
+- `POST /api/v1/commands`：创建命令（command_id 幂等；OPEN_MARKET / PLACE_PENDING
+  先过云端风控闸门，REJECT 直接落终态 `REJECTED`，响应附 `risk_decision`）
+- `GET /api/v1/commands/{id}`：查询状态（QUEUED / DELIVERED / ACKED / EXPIRED /
+  UNKNOWN / REJECTED）
+- `GET|PUT /api/v1/accounts/{id}/config`：配置读取/更新（filters / expert / risk 三段，
+  版本号单调递增，PUT 即全量替换）
+- `GET /api/v1/risk/state`、`POST /api/v1/risk/stop`、`POST /api/v1/risk/resume`：
+  全局/账户级停止状态（LOCKED 恢复需 `confirm_locked=true`，PRD 9.5）
+- `GET /api/v1/risk/decisions`：闸门决定审计（account_id / command_id 过滤）
+
+风控闸门检查顺序遵循 PRD 9.2（停止状态 → 快照新鲜度/权限 → 日亏/回撤/保证金/连亏
+→ 仓位数/周末/日单数 → 规格/手数 → 强制止损/单笔风险估算）；无法可靠估算风险时拒绝
+（PRD 9.3）。点差/即时报价类检查留给 EA 执行级（PRD 9.1 双层结构）。
 
 数据库变更（如换库）：
 
