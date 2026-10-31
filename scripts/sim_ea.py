@@ -685,12 +685,12 @@ def main() -> int:
         account_id = sim_acc["account_id"]
 
         # 13a. bind instances; 409 = already bound from a previous run
-        def bind_instance(code: str, timeframe: str) -> None:
+        def bind_instance(code: str, timeframe: str, config: dict | None = None) -> None:
             nonlocal failures
             r = client.post(
                 f"{API}/api/v1/accounts/{account_id}/strategy-instances",
                 json={"strategy_code": code, "broker_symbol": "EURUSD",
-                      "timeframe": timeframe, "config": {}},
+                      "timeframe": timeframe, "config": config or {}},
             )
             ok = r.status_code in (200, 409)
             print(f"[signals] bind {code}/{timeframe}: {'OK' if ok else 'FAIL'} {r.text[:100]}")
@@ -700,6 +700,10 @@ def main() -> int:
         bind_instance("ma_cross", "M15")
         bind_instance("trend_following", "M15")
         bind_instance("rsi_momentum", "M30")  # no M30 bars ever: control instance
+        # task-3 strategies: M30 control instances too (no M30 bars posted),
+        # bound with custom configs to prove config validation + round-trip
+        bind_instance("breakout", "M30", {"lookback_period": 10, "squeeze_width_max": "3"})
+        bind_instance("mean_reversion", "M30", {"entry_z": "1.5"})
 
         instances = client.get(
             f"{API}/api/v1/accounts/{account_id}/strategy-instances"
@@ -723,6 +727,19 @@ def main() -> int:
             print(f"[signals] rsi status/config: {'OK' if toggled else 'FAIL'} "
                   f"({r1.status_code}/{r2.status_code}/{r3.status_code})")
             if not toggled:
+                failures += 1
+
+        # 13a2. task-3 strategies: persisted config must round-trip exactly
+        # (Decimal fields serialized as strings, 7.6 config schema)
+        for code, expect in (
+            ("breakout", {"lookback_period": 10, "squeeze_width_max": "3"}),
+            ("mean_reversion", {"entry_z": "1.5"}),
+        ):
+            inst = next((i for i in instances if i["strategy_code"] == code), None)
+            cfg = (inst or {}).get("config") or {}
+            cfg_ok = inst is not None and all(cfg.get(k) == v for k, v in expect.items())
+            print(f"[signals] {code} config round-trip: {'OK' if cfg_ok else 'FAIL'} {cfg}")
+            if not cfg_ok:
                 failures += 1
 
         # 13b. deterministic V-path, M15 bars 0..134
@@ -783,9 +800,10 @@ def main() -> int:
         for s in sigs:
             by_code.setdefault(s["signal_json"]["strategy_id"], []).append(s)
         ma_sigs, tf_sigs = by_code.get("ma_cross", []), by_code.get("trend_following", [])
-        count_ok = len(sigs) == 2 and len(ma_sigs) == 1 and len(tf_sigs) == 1
+        stray = len(by_code.get("breakout", [])) + len(by_code.get("mean_reversion", []))
+        count_ok = len(sigs) == 2 and len(ma_sigs) == 1 and len(tf_sigs) == 1 and stray == 0
         print(f"[signals] count={len(sigs)} ma={len(ma_sigs)} tf={len(tf_sigs)} "
-              f"{'OK' if count_ok else 'FAIL'}")
+              f"stray(breakout+mr)={stray} {'OK' if count_ok else 'FAIL'}")
         if not count_ok:
             failures += 1
         for label, group, edge_bar, reasons in (

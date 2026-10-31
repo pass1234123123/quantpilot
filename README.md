@@ -24,8 +24,10 @@ Decimal 风险预算和同一风控闸门生成持久命令，但 EA 仍只回�
   ≥100% → STOP_NEW_RISK，只升不降、不碰人工态）
 - 策略引擎（PRD 7）：EA v1.5.0 按周期上报已收盘 bar（`symbol_bars` 投影，回填/增量/
   重同步幂等）→ 无状态窗口重放评估 → `strategy_signals`（边沿触发，UNIQUE 去重，
-  doc 7.5）；首批 3 策略 ma_cross / rsi_momentum / trend_following；坏 bar 跳过并
-  发 `ea.bars_dropped` 防重投死循环；实例绑定固定版本 + config_revision 只增（doc 7.6）
+  doc 7.5）；内置 5 策略 ma_cross / rsi_momentum / trend_following / breakout /
+  mean_reversion（doc 7.3 五种风格齐备：突破带波动压缩过滤、均值回归带 ADX 强趋势
+  闸门）；坏 bar 跳过并发 `ea.bars_dropped` 防重投死循环；实例绑定固定版本 +
+  config_revision 只增（doc 7.6）
 - AI 分析引擎（PRD 8）：统计特征版 Market Regime（ATR/波动率比、Wilder ADX、
   EMA20/50 → TREND_UP/TREND_DOWN/RANGE/HIGH_VOL/UNKNOWN）+ Strategy Evaluator
   适用评分；`ai_analyses` 落库严格 doc 8.4 结构；input_hash 幂等（重投不重复）；
@@ -46,7 +48,7 @@ services/api/         FastAPI：JetStream 消费入库 + 查询路由 + 命令�
                      （signal_pipeline.py 聚合 / command_service.py 共用命令核心）
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
-infra/postgres/       Alembic 迁移（0001–0012，含 risk / 策略 / AI / 回测表）
+infra/postgres/       Alembic 迁移（0001–0014，含 risk / 策略 / AI / 回测表）
 scripts/              开发工具（隧道/冒烟/验收/部署）
 ```
 

@@ -208,6 +208,71 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertIn("recovery_factor", first["metrics"])
         self.assertEqual(len(first["equity_curve"]), len(bars))
 
+    def test_breakout_backtest_fills_next_open_and_exits_take_profit(self) -> None:
+        from quantpilot_api.backtest_engine import BacktestCostModel, run_backtest
+        from quantpilot_api.strategies import Breakout
+
+        # 13 flat bars (compressed range), close-through breakout, follow-through
+        bars = [bar(i, "100", "100.1", "99.9", "100") for i in range(13)]
+        bars.append(bar(13, "100", "100.6", "99.9", "100.5"))  # breakout edge
+        bars.append(bar(14, "100.5", "102", "100.4", "101.5"))  # entry bar, TP hit
+        strategy = Breakout()
+        config = strategy.validate_config({"lookback_period": 6, "atr_period": 5})
+
+        report = run_backtest(
+            bars=bars,
+            strategy=strategy,
+            config=config,
+            timeframe="M15",
+            initial_balance=D("10000"),
+            volume=D("1"),
+            cost_model=BacktestCostModel(contract_size=D("100")),
+        )
+
+        self.assertEqual(report["metrics"]["trade_count"], 1)
+        trade = report["trades"][0]
+        self.assertEqual(trade["direction"], "BUY")
+        self.assertEqual(trade["exit_reason"], "TAKE_PROFIT")
+        self.assertEqual(trade["source_bar_time"], bars[13].bar_time)
+        self.assertEqual(trade["entry_time"], bars[14].bar_time)
+        self.assertEqual(trade["entry_price"], D("100.5"))
+        self.assertEqual(trade["exit_price"], D("101.4"))
+        self.assertEqual(trade["reason_codes"],
+                         ["RANGE_BREAKOUT_UP", "VOLATILITY_COMPRESSION"])
+
+    def test_mean_reversion_backtest_fades_the_stretch(self) -> None:
+        from quantpilot_api.backtest_engine import BacktestCostModel, run_backtest
+        from quantpilot_api.strategies import MeanReversion
+
+        bars = [bar(i, "100", "100.02", "99.98", "100") for i in range(46)]
+        bars.append(bar(46, "100", "130.5", "100", "130"))  # 3-sigma stretch
+        bars.append(bar(47, "130", "131", "124", "125"))  # reversion edge -> SELL
+        bars.append(bar(48, "125", "129", "123", "128"))  # entry bar, still open
+        strategy = MeanReversion()
+        config = strategy.validate_config(
+            {"bollinger_period": 10, "adx_period": 14, "atr_period": 5, "entry_z": "1.2"}
+        )
+
+        report = run_backtest(
+            bars=bars,
+            strategy=strategy,
+            config=config,
+            timeframe="M15",
+            initial_balance=D("10000"),
+            volume=D("1"),
+            cost_model=BacktestCostModel(contract_size=D("100")),
+        )
+
+        self.assertEqual(report["metrics"]["trade_count"], 1)
+        trade = report["trades"][0]
+        self.assertEqual(trade["direction"], "SELL")
+        self.assertEqual(trade["exit_reason"], "END_OF_TEST")
+        self.assertEqual(trade["source_bar_time"], bars[47].bar_time)
+        self.assertEqual(trade["entry_time"], bars[48].bar_time)
+        self.assertEqual(trade["entry_price"], D("125"))
+        self.assertEqual(trade["reason_codes"],
+                         ["BOLLINGER_DEVIATION", "Z_SCORE_REVERSION", "RANGE_STABILITY"])
+
 
 if __name__ == "__main__":
     unittest.main()

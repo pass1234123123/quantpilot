@@ -239,14 +239,28 @@ def main() -> int:
         strategies = client.get(f"{API}/api/v1/strategies").json()["data"]
         codes = {s.get("code") for s in strategies}
         check("api.strategies",
-              {"ma_cross", "rsi_momentum", "trend_following"} <= codes,
+              {"ma_cross", "rsi_momentum", "trend_following",
+               "breakout", "mean_reversion"} <= codes,
               f"codes={sorted(c for c in codes if c)}")
+        strat_by_code = {s.get("code"): s for s in strategies}
+        for code, must_have in (
+            ("breakout", {"lookback_period", "squeeze_width_max"}),
+            ("mean_reversion", {"bollinger_period", "entry_z", "adx_threshold"}),
+        ):
+            row = strat_by_code.get(code) or {}
+            props = set(((row.get("config_schema") or {}).get("properties")) or {})
+            check(f"api.strategy_catalog_{code}",
+                  row.get("status") == "ACTIVE" and row.get("version") == "1.0.0"
+                  and must_have <= props,
+                  f"status={row.get('status')} version={row.get('version')} "
+                  f"props={sorted(props)}")
 
         instances = client.get(
             f"{API}/api/v1/accounts/{sim_id}/strategy-instances").json()["data"]
         inst_codes = {i.get("strategy_code") for i in instances}
         check("api.strategy_instances",
-              {"ma_cross", "trend_following", "rsi_momentum"} <= inst_codes,
+              {"ma_cross", "trend_following", "rsi_momentum",
+               "breakout", "mean_reversion"} <= inst_codes,
               f"count={len(instances)}")
         rsi_inst = next((i for i in instances if i.get("strategy_code") == "rsi_momentum"), None)
         if rsi_inst is not None:
@@ -269,6 +283,11 @@ def main() -> int:
         check("api.signals_count",
               len(sigs) == 2 and len(ma_sigs) == 1 and len(tf_sigs) == 1,
               f"total={len(sigs)} ma={len(ma_sigs)} tf={len(tf_sigs)}")
+        # task-3 M30 control instances never receive bars -> must stay silent
+        check("api.signals_new_strategies_quiet",
+              not by_code.get("breakout") and not by_code.get("mean_reversion"),
+              f"breakout={len(by_code.get('breakout') or [])} "
+              f"mean_reversion={len(by_code.get('mean_reversion') or [])}")
         if ma_sigs:
             j = ma_sigs[0]["signal_json"]
             src = _utc(ma_sigs[0].get("source_bar_time"))

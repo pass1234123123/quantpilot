@@ -11,7 +11,9 @@ naming of actual behavior).
 from __future__ import annotations
 
 from .base import Bar, Strategy, StrategySignal
+from .breakout import Breakout, BreakoutConfig
 from .ma_cross import MaCrossConfig, MovingAverageCross
+from .mean_reversion import MeanReversion, MeanReversionConfig
 from .rsi_momentum import RsiMacdMomentum, RsiMomentumConfig
 from .trend_following import TrendFollowing, TrendFollowingConfig
 
@@ -20,13 +22,19 @@ REGISTRY: dict[str, type[Strategy]] = {
     "ma_cross": MovingAverageCross,
     "rsi_momentum": RsiMacdMomentum,
     "trend_following": TrendFollowing,
+    "breakout": Breakout,
+    "mean_reversion": MeanReversion,
 }
 
 __all__ = [
     "Bar",
     "REGISTRY",
+    "Breakout",
+    "BreakoutConfig",
     "MaCrossConfig",
     "MovingAverageCross",
+    "MeanReversion",
+    "MeanReversionConfig",
     "RsiMacdMomentum",
     "RsiMomentumConfig",
     "Strategy",

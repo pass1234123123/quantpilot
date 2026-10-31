@@ -4,7 +4,8 @@ Every function returns a series aligned to the input: warmup slots are None
 so strategies can read both the latest value and the previous one for
 edge-triggered signals. EMA/SMA/RSI follow standard definitions; ATR/ADX
 use Wilder smoothing; MACD is fast/slow EMA difference with an EMA signal
-line. 28-digit Decimal context; bar windows are a few hundred rows at
+line; Bollinger bands use the rolling population standard deviation.
+28-digit Decimal context; bar windows are a few hundred rows at
 bar-close frequency, so this stays cheap.
 """
 
@@ -186,3 +187,51 @@ def macd_series(
         if macd[i] is not None and signal[i] is not None:
             hist[i] = macd[i] - signal[i]
     return macd, signal, hist
+
+
+def stddev_series(values: list[Decimal], period: int) -> list[Decimal | None]:
+    """Rolling population standard deviation; first value at index period-1.
+
+    Exact Decimal math via rolling sum / sum-of-squares identities; a
+    numerically negative variance (all-equal windows) folds to 0.
+    """
+    if period <= 0:
+        raise ValueError("period must be positive")
+    n = len(values)
+    out: list[Decimal | None] = [None] * n
+    if n < period:
+        return out
+    p = Decimal(period)
+    window_sum = sum(values[:period], D0)
+    window_sq = sum((value * value for value in values[:period]), D0)
+
+    def _std(suma: Decimal, sumsq: Decimal) -> Decimal:
+        mean = suma / p
+        variance = sumsq / p - mean * mean
+        return variance.sqrt() if variance > 0 else D0
+
+    out[period - 1] = _std(window_sum, window_sq)
+    for i in range(period, n):
+        old, new = values[i - period], values[i]
+        window_sum += new - old
+        window_sq += new * new - old * old
+        out[i] = _std(window_sum, window_sq)
+    return out
+
+
+def bollinger_series(
+    closes: list[Decimal], period: int, multiple: Decimal
+) -> tuple[list[Decimal | None], list[Decimal | None], list[Decimal | None]]:
+    """(middle, upper, lower) band series; middle is the SMA, band offset is
+    `multiple` population standard deviations. First values at period-1."""
+    middle = sma_series(closes, period)
+    std = stddev_series(closes, period)
+    upper: list[Decimal | None] = [
+        None if (m is None or s is None) else m + multiple * s
+        for m, s in zip(middle, std)
+    ]
+    lower: list[Decimal | None] = [
+        None if (m is None or s is None) else m - multiple * s
+        for m, s in zip(middle, std)
+    ]
+    return middle, upper, lower
