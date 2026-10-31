@@ -71,7 +71,7 @@ function toggle(i: { instance_id: string; status: 'ENABLED' | 'DISABLED' }) {
     <div v-else class="sp__empty">当前账户暂无策略实例（通过 API POST /strategy-instances 绑定）</div>
 
     <div class="sp__foot">
-      信号为建议性（PRD 7.1），实例启停仅影响云端评估，EA 保持 OBSERVE_ONLY
+      信号为建议性（PRD 7.1），实例启停仅影响云端评估；EA 实际执行行为由其运行模式决定（见「设置」页）
     </div>
   </div>
 </template>

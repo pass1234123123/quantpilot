@@ -47,12 +47,12 @@ type ViewKey =
 const activeView = ref<ViewKey>('dashboard')
 
 const viewMeta: Record<ViewKey, { title: string; sub: string }> = {
-  dashboard: { title: '主仪表盘', sub: '账户管理 · OBSERVE_ONLY 只读观察切片' },
-  performance: { title: '绩效分析', sub: '基于真实成交历史统计 · OBSERVE_ONLY' },
+  dashboard: { title: '主仪表盘', sub: '账户管理 · 多账户状态总览' },
+  performance: { title: '绩效分析', sub: '基于真实成交历史统计' },
   risk: { title: '风险管理', sub: '账户风险指标 · 真实快照数据' },
   strategies: { title: '策略引擎', sub: '策略目录与实例绑定 · 建议性信号' },
   signals: { title: '交易信号', sub: '云端收盘 bar 评估 · 边沿触发去重' },
-  commands: { title: '命令通道', sub: '命令状态机与风控闸门审计 · OBSERVE_ONLY' },
+  commands: { title: '命令通道', sub: '命令状态机与风控闸门审计' },
   backtests: { title: '回测研究', sub: '可复现历史回测任务与指标报告' },
   ai: { title: 'AI 分析', sub: '市场状态识别与策略适用性 · ADVISORY 建议性 · 不参与交易许可' },
   audit: { title: '审计日志', sub: '状态变更操作留痕 · best-effort 写入 · X-API-Key 网关之后' },

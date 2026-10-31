@@ -63,6 +63,19 @@ async function testConn() {
 const timeText = (iso: string | null) =>
   iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '—'
 
+// EA 运行模式（phase-3 P2）：真实值来自 EA 心跳上报（run_mode 字段），
+// 不再硬编码；显示随所选账户最新快照变化
+const RUN_MODE_LABELS: Record<string, string> = {
+  OBSERVE_ONLY: 'OBSERVE_ONLY（只读观察，不执行）',
+  DRY_RUN: 'DRY_RUN（预检回执，不下单）',
+  LIVE: 'LIVE（真实执行，仅限模拟账户）',
+}
+const runModeText = computed(() => {
+  const mode = snap.value?.ea_run_mode
+  if (!mode) return '—（等待 EA 心跳上报）'
+  return RUN_MODE_LABELS[mode] ?? `${mode}（未知模式，请核对 EA 版本）`
+})
+
 // 用户登录（phase-3 R2）：JWT 通道，与服务密钥通道并存
 const loginUser = ref<AuthUser | null>(api.currentUser())
 const loginName = ref('')
@@ -141,7 +154,7 @@ function doLogout() {
         <span class="qp-live-badge">真实数据</span>
       </div>
       <div class="settings__rows">
-        <div class="settings__row"><span>系统模式</span><b class="qp-up">OBSERVE_ONLY（只读观察）</b></div>
+        <div class="settings__row"><span>EA 运行模式</span><b :class="snap?.ea_run_mode ? 'qp-up' : 'qp-dim'">{{ runModeText }}</b></div>
         <div class="settings__row"><span>Agent 版本</span><b>{{ node?.agent_version ?? '—' }}</b></div>
         <div class="settings__row"><span>EA 版本</span><b>{{ snap?.ea_version ?? '—' }}</b></div>
         <div class="settings__row"><span>终端 build</span><b>{{ snap?.terminal_version ?? terminal?.terminal_build ?? '—' }}</b></div>

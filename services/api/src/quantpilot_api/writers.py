@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID
 
 from . import db
+from quantpilot_contracts.constants import EA_RUN_MODES
 
 logger = logging.getLogger("quantpilot.writers")
 
@@ -266,9 +267,20 @@ def handle_registered(data: dict[str, Any]) -> None:
     )
 
 
+def _reported_run_mode(value: Any) -> str | None:
+    """Phase-3 P2: keep exactly the mode the EA reported.
+
+    Only the three contract run modes are stored verbatim; anything else
+    (spoofed labels, future values) degrades to NULL so the UI shows
+    unknown instead of a guess."""
+    mode = str(value) if value is not None else ""
+    return mode if mode in EA_RUN_MODES else None
+
+
 def handle_heartbeat(data: dict[str, Any]) -> None:
     terminal_id, account_id = _resolve(data)
     captured_at = _ts(data.get("observed_at"))
+    ea_run_mode = _reported_run_mode(data.get("run_mode"))
     with db.conn() as connection:
         # idempotent on (account_id, captured_at): JetStream redelivery safe
         connection.execute(
@@ -276,8 +288,8 @@ def handle_heartbeat(data: dict[str, Any]) -> None:
             INSERT INTO account_snapshots
                    (account_id, balance, equity, margin, free_margin, currency,
                     open_positions, connected, trade_allowed, expert_allowed,
-                    terminal_version, ea_version, captured_at)
-            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    terminal_version, ea_version, ea_run_mode, captured_at)
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
              WHERE NOT EXISTS (
                    SELECT 1 FROM account_snapshots
                     WHERE account_id = %s AND captured_at = %s
@@ -296,6 +308,7 @@ def handle_heartbeat(data: dict[str, Any]) -> None:
                 bool(data.get("expert_allowed")),
                 str((data.get("terminal") or {}).get("build") or ""),
                 data.get("ea_version"),
+                ea_run_mode,
                 captured_at,
                 _uuid(account_id),
                 captured_at,

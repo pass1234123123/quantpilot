@@ -2,13 +2,24 @@
 
 EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL 的完整数据链路。
 
-**OBSERVE_ONLY**：EA 不含任何交易执行代码（无 OrderSend / OrderCheck / CTrade），
-仅上报终端/账户身份、心跳快照、品种规格、持仓/挂单/成交、日历事件与已收盘 K 线
-（M15/H1 基线，PRD 22.2）。新账户默认 `OBSERVE_ONLY` 状态。云端命令通道已通
-（下发/确认/幂等/对账），但 EA 收到后仅回执（`OBSERVE_ONLY_ACK`），不执行任何
-交易；风险增加型命令在下发前过云端风控闸门。云端策略引擎消费收盘 bar 产生**建议
-性信号**（PRD 7.1：策略不直接下单）；显式开启账户级自动生成后，信号可经聚合、
-Decimal 风险预算和同一风控闸门生成持久命令，但 EA 仍只回执、不执行。
+**运行模式（单一契约定义：`packages/contracts` 的 `derive_ea_run_mode`）**：EA 按
+`DryRunMode / LiveTrading` 输入参数处于三种模式之一，并在每次心跳向云端上报
+`run_mode`（设置页"EA 运行模式"显示的即该真实上报值，不硬编码）：
+
+- `OBSERVE_ONLY`（默认，两开关全关）：EA 收到命令仅回执（`OBSERVE_ONLY_ACK`），
+  不执行任何交易。
+- `DRY_RUN`（`DryRunMode=true`）：执行前预检后回执 `DRY_RUN_PASSED` /
+  `DRY_RUN_REJECTED`，**绝不发送订单**（优先级高于 LiveTrading）。
+- `LIVE`（`DryRunMode=false` 且 `LiveTrading=true`）：通过 CTrade 真实执行市价 /
+  挂单 / 改仓 / 平仓并回报订单与成交 Ticket，**硬性拒绝真实账户**
+  （`LIVE_REFUSED_NOT_DEMO`）；仅限 DEMO 模拟账户，实盘安全验收通过前禁止用于真实资金。
+
+EA 上报终端/账户身份、心跳快照、品种规格、持仓/挂单/成交、日历事件与已收盘 K 线
+（M15/H1 基线，PRD 22.2）。新账户默认 `OBSERVE_ONLY` 状态。云端命令通道（下发 /
+确认 / 幂等 / 对账 / 断线恢复）已通；风险增加型命令在下发前过云端风控闸门。云端策略
+引擎消费收盘 bar 产生**建议性信号**（PRD 7.1：策略不直接下单）；显式开启账户级
+自动生成后，信号可经聚合、Decimal 风险预算和同一风控闸门生成持久命令，命令的实际
+执行语义由 EA 当前运行模式决定。
 
 ## 已完成切片
 
@@ -48,7 +59,7 @@ services/api/         FastAPI：JetStream 消费入库 + 查询路由 + 命令�
                      （signal_pipeline.py 聚合 / command_service.py 共用命令核心）
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
-infra/postgres/       Alembic 迁移（0001–0014，含 risk / 策略 / AI / 回测表）
+infra/postgres/       Alembic 迁移（0001–0018，含 risk / 策略 / AI / 回测 / 审计 / 用户权限 / 执行对账表）
 scripts/              开发工具（隧道/冒烟/验收/部署）
 ```
 
@@ -72,10 +83,11 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 .venv\Scripts\python -m quantpilot_agent         # Agent    127.0.0.1:8787
 ```
 
-安全（PRD 14）：云端 API 所有 `/api/*` 路由要求 `X-API-Key` 请求头（fail-closed：
-未配置 `QP_API_KEY` 时拒绝全部 API 流量，`/healthz` 保持公开）。Agent、`sim_ea.py`、
-`e2e_verify.py` 与 Vite dev proxy 均从 `.env` 读取该 key；RBAC/用户体系按 PRD 属
-商业化阶段（P2）。
+安全（PRD 14）：云端 API 所有 `/api/*` 路由要求认证（fail-closed：未配置
+`QP_API_KEY` 时拒绝全部 API 流量，`/healthz` 保持公开）。三条通道并存：服务密钥
+`X-API-Key`（机器通道：Agent / sim_ea / e2e / 开发代理）、用户 JWT（登录接口签发，
+四角色 ADMIN / TRADER / ANALYST / VIEWER）与用户级 API Key（`qpk_` 前缀，sha256
+落库、可撤销）；非管理员用户仅能访问被授权的账户（列表级隔离）。
 
 冒烟与验收：
 
@@ -107,10 +119,10 @@ pnpm build      # 类型检查 + 产线构建
   `POST .../strategy-instances/{iid}/status`）、交易信号（`strategy_signals` 边沿触发
   流，方向/强度/参考价/SL/TP/触发原因）、命令通道（`commands` 状态机流 +
   `risk_decisions` 审计，REJECTED 永不投递）、回测研究（任务列表 + 点击行内联加载
-  `GET /api/v1/backtests/{id}` 完整指标报告）；信号为建议性（PRD 7.1），EA 保持
-  OBSERVE_ONLY。
+  `GET /api/v1/backtests/{id}` 完整指标报告）；信号为建议性（PRD 7.1），命令的实际
+  执行语义由 EA 运行模式决定（OBSERVE_ONLY 仅回执 / DRY_RUN 预检 / LIVE 模拟账户真实执行）。
 - **配置面板**：Profit Monitor、Filtering / Expert Settings（`risk_profiles.config_json`
-  filters/expert 段，云端版本号展示 + PUT 保存）；OBSERVE_ONLY 下仅存储与展示。
+  filters/expert 段，云端版本号展示 + PUT 保存）；配置仅存储与展示，EA 侧仅记录。
 
 ## 命令通道与风控 API（本阶段）
 
@@ -183,7 +195,8 @@ signal_decision 等仅写入 `risk_decisions.risk_snapshot.ai` 供审计，绝�
 - 同向多信号只建一单，强度最高者为 primary（signal_id 确定性打破平局），全部
   signal_id 写入风险快照；同 bar 反向信号记 `signal.conflict`，不建单。
 - command_id 由账户/品种/周期/source bar/direction 确定性生成，重放返回原命令；
-  REJECT 以 `REJECTED` 持久化且永不投递。EA 始终保持 OBSERVE_ONLY。
+  REJECT 以 `REJECTED` 持久化且永不投递。命令的最终执行语义由 EA 运行模式决定
+  （见顶部"运行模式"），执行结果含订单/成交 Ticket 全量回报与云端对账。
 
 ## 历史回测 API（本阶段）
 
@@ -220,7 +233,9 @@ cd infra\postgres
 3. 在 MT5 中刷新导航器，将 QuantPilotBridge 拖到任意图表。
 4. 输入参数 `AgentToken` 填 `.env` 里的 `QP_AGENT_TOKEN`（其余默认即可）。
 5. 验证：`python scripts\e2e_verify.py`；或浏览器访问
-   `http://127.0.0.1:8000/api/v1/accounts`，`status` 应为 `OBSERVE_ONLY`。
+   `http://127.0.0.1:8000/api/v1/accounts`，账户 `status` 应为 `OBSERVE_ONLY`；
+   `GET /api/v1/accounts/{id}/snapshot` 的 `ea_run_mode` 应与 EA 输入参数派生的
+   模式一致（默认 `OBSERVE_ONLY`）。
 
 ## 安全约定
 

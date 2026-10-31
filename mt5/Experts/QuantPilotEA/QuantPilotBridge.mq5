@@ -78,7 +78,7 @@
 #include <QuantPilot\QpJson.mqh>
 #include <Trade\Trade.mqh>
 
-#define QP_EA_VERSION        "1.8.0"
+#define QP_EA_VERSION        "1.9.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
@@ -199,6 +199,22 @@ string QpAccountModeLabel(const long mode)
       case ACCOUNT_TRADE_MODE_REAL:    return("REAL");
      }
    return("UNKNOWN");
+  }
+
+//+------------------------------------------------------------------+
+//| Run mode label (phase-3 P2: the single mode definition, mirrored |
+//| by contracts.derive_ea_run_mode). Reported in every heartbeat so |
+//| the cloud/UI show the REAL mode instead of a hardcoded label.   |
+//| DryRunMode takes precedence over LiveTrading (QpHandleCommand    |
+//| short-circuits the same way).                                    |
+//+------------------------------------------------------------------+
+string QpRunMode()
+  {
+   if(DryRunMode)
+      return("DRY_RUN");
+   if(LiveTrading)
+      return("LIVE");
+   return("OBSERVE_ONLY");
   }
 
 string QpMarginModeLabel(const long mode)
@@ -334,6 +350,7 @@ bool QpSendHeartbeat()
    o.AddNumStr("free_margin", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
    o.AddStr("currency", AccountInfoString(ACCOUNT_CURRENCY));
    o.AddInt("open_positions", PositionsTotal());
+   o.AddStr("run_mode", QpRunMode());
    o.AddStr("observed_at", QpIsoNow());
    return(QpHttpPost("/ea/v1/heartbeat", o.Dump()));
   }

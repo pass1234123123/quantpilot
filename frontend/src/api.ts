@@ -64,6 +64,7 @@ export interface AccountSnapshot {
   expert_allowed: boolean
   terminal_version: string | null
   ea_version: string | null
+  ea_run_mode: string | null
   captured_at: string
 }
 

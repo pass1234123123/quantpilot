@@ -574,7 +574,7 @@ def account_snapshot(account_id: str, request: Request) -> JSONResponse:
         SELECT s.id::text AS snapshot_id, s.account_id::text AS account_id,
                s.balance, s.equity, s.margin, s.free_margin, s.currency,
                s.open_positions, s.connected, s.trade_allowed, s.expert_allowed,
-               s.terminal_version, s.ea_version, s.captured_at
+               s.terminal_version, s.ea_version, s.ea_run_mode, s.captured_at
           FROM account_snapshots s
          WHERE s.account_id = %s
          ORDER BY s.captured_at DESC

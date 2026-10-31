@@ -29,6 +29,25 @@ ACCOUNT_STATUS_OBSERVE_ONLY = "OBSERVE_ONLY"
 NODE_STATUS_ONLINE = "ONLINE"
 NODE_STATUS_OFFLINE = "OFFLINE"
 
+# --- EA run modes (phase-3 P2: the single mode definition) ---
+# Derived from the EA's own DryRunMode / LiveTrading inputs and reported in
+# every heartbeat. README wording, UI status rows and docs must be driven
+# by this definition (or the reported value) - never hardcoded. The EA
+# (QpRunMode) mirrors this mapping exactly; DryRunMode takes precedence.
+EA_RUN_MODE_OBSERVE_ONLY = "OBSERVE_ONLY"  # both inputs off: receipt-only
+EA_RUN_MODE_DRY_RUN = "DRY_RUN"            # pre-trade checks, never an order
+EA_RUN_MODE_LIVE = "LIVE"                 # real CTrade, DEMO accounts only
+EA_RUN_MODES = frozenset({EA_RUN_MODE_OBSERVE_ONLY, EA_RUN_MODE_DRY_RUN, EA_RUN_MODE_LIVE})
+
+
+def derive_ea_run_mode(dry_run: bool, live_trading: bool) -> str:
+    """Map the EA inputs (DryRunMode, LiveTrading) to the wire run mode."""
+    if dry_run:
+        return EA_RUN_MODE_DRY_RUN
+    if live_trading:
+        return EA_RUN_MODE_LIVE
+    return EA_RUN_MODE_OBSERVE_ONLY
+
 # --- Command channel (PRD 13.3-13.5, ADR-004) ---
 # Slice-1 lifecycle: QUEUED -> DELIVERED -> ACKED (EA receipt ack,
 # OBSERVE_ONLY - no execution). EXPIRED = never delivered in time;

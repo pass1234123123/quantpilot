@@ -89,7 +89,7 @@ const decisionClass = (d: string) => (d === 'ALLOW' ? 'is-acked' : 'is-rejected'
     </table>
 
     <div class="cm__foot">
-      OBSERVE_ONLY：EA 收到命令仅回执，不执行任何交易；REJECTED 永不投递
+      EA 按自身运行模式回执命令：OBSERVE_ONLY 仅回执；DRY_RUN 预检（不下单）；LIVE 真实执行（仅限模拟账户，真实账户硬性拒绝）。当前模式见「设置」页 EA 运行模式；REJECTED 永不投递
     </div>
   </div>
 </template>
