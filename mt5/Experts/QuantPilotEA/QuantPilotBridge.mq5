@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //| QuantPilotBridge.mq5                                             |
-//| QuantPilot AI - MT5 EA bridge, SLICE 1: OBSERVE_ONLY telemetry.   |
+//| QuantPilot AI - MT5 EA bridge, OBSERVE_ONLY telemetry.           |
 //|                                                                   |
 //| What this EA does (and ALL it does in this slice):               |
 //|   - reports terminal/account identity to the local agent          |
@@ -10,6 +10,8 @@
 //|   - sends pending-order snapshots (doc 12.2 orders projection)   |
 //|   - sends account history deals incrementally (read-only)        |
 //|   - sends the MT5 built-in economic calendar (read-only)         |
+//|   - sends closed bars for the configured timeframes (read-only;  |
+//|     PRD 7 market-data input for the cloud strategy engine)       |
 //|   - polls the cloud-side account config every 60s and LOGS it    |
 //|     (informational only - it is never applied, OBSERVE_ONLY)     |
 //|   - polls the cloud command channel and ACKS each command         |
@@ -37,17 +39,18 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.40"
+#property version   "1.50"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.4.0"
+#define QP_EA_VERSION        "1.5.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
 #define QP_DEALS_PER_BATCH   200
 #define QP_DEALS_REFRESH_SEC 60    // incremental history-deal poll
+#define QP_BARS_PER_BATCH    100   // closed bars per /ea/v1/bars batch
 #define QP_CONFIG_REFRESH_SEC 60   // config poll (informational only)
 #define QP_CALENDAR_REFRESH_SEC 600 // re-report the calendar window (10 min)
 #define QP_CALENDAR_PER_BATCH 200
@@ -64,6 +67,8 @@ input int    HeartbeatSeconds = 10;                     // Heartbeat interval, 5
 input int    MaxSymbols       = 100;                    // Max Market Watch symbols to report
 input int    CalendarWindowHours = 48;                  // Economic calendar lookahead (hours)
 input int    CommandPollSeconds = 5;                    // Command poll interval, 1..120s
+input string BarTimeframes   = "M15,H1";                // Closed-bar timeframes: M5/M15/M30/H1/H4 (PRD 22.2)
+input int    BarHistoryCount = 500;                     // Initial closed-bar backfill per timeframe, 50..2000
 input string LogLevel         = "INFO";                 // DEBUG | INFO | ERROR
 
 //--- runtime state
@@ -78,6 +83,12 @@ datetime g_last_config_at  = 0;    // when the config poll last succeeded
 datetime g_last_calendar_at = 0;  // when the calendar report last succeeded
 datetime g_last_command_at = 0;   // when the command poll last succeeded
 string   g_recent_command_ids[]; // recently acked command_ids (echo ring)
+
+//--- closed-bar reporting state (one slot per configured timeframe)
+int         g_bar_count = 0;     // number of parsed BarTimeframes entries
+ENUM_TIMEFRAMES g_bar_tf[];     // parsed timeframe enums
+string      g_bar_labels[];     // labels sent to the cloud ("M15","H1",...)
+datetime    g_bar_last_closed[]; // max closed-bar open time reported (0 = backfill)
 
 //+------------------------------------------------------------------+
 //| Logging                                                          |
@@ -485,6 +496,192 @@ bool QpSendDeals()
       g_last_deal_time = max_time;
       QpLog("INFO", "reported " + IntegerToString(sent) + " deal(s) in " +
             IntegerToString(batch_total) + " batch(es)");
+     }
+   return(all_ok);
+  }
+
+//+------------------------------------------------------------------+
+//| Closed-bar reporting (PRD 7 market-data input, read-only).        |
+//| One channel per configured timeframe (BarTimeframes input).      |
+//| bar_time is the bar OPEN time in broker-server time, matching    |
+//| the deals channel convention (documented approximation).         |
+//| Only CLOSED bars are sent (shift >= 1); the cloud upserts them   |
+//| idempotently and evaluates strategies on the newest one.         |
+//+------------------------------------------------------------------+
+bool QpTimeframeToEnum(const string label, ENUM_TIMEFRAMES &tf)
+  {
+   if(label == "M5")  { tf = PERIOD_M5;  return(true); }
+   if(label == "M15") { tf = PERIOD_M15; return(true); }
+   if(label == "M30") { tf = PERIOD_M30; return(true); }
+   if(label == "H1")  { tf = PERIOD_H1;  return(true); }
+   if(label == "H4")  { tf = PERIOD_H4;  return(true); }
+   return(false);
+  }
+
+bool QpInitBarTimeframes()
+  {
+   g_bar_count = 0;
+   ArrayResize(g_bar_tf, 0);
+   ArrayResize(g_bar_labels, 0);
+   ArrayResize(g_bar_last_closed, 0);
+
+   string labels[];
+   int n = StringSplit(BarTimeframes, ',', labels);
+   for(int i = 0; i < n; i++)
+     {
+      string label = labels[i];
+      StringTrimLeft(label);
+      StringTrimRight(label);
+      if(label == "")
+         continue;
+      ENUM_TIMEFRAMES tf;
+      if(!QpTimeframeToEnum(label, tf))
+        {
+         QpLog("ERROR", "unsupported BarTimeframes entry '" + label +
+               "' (allowed: M5,M15,M30,H1,H4)");
+         return(false);
+        }
+      bool dup = false;
+      for(int j = 0; j < g_bar_count; j++)
+         if(g_bar_labels[j] == label)
+            dup = true;
+      if(dup)
+         continue;
+      ArrayResize(g_bar_tf, g_bar_count + 1);
+      ArrayResize(g_bar_labels, g_bar_count + 1);
+      ArrayResize(g_bar_last_closed, g_bar_count + 1);
+      g_bar_tf[g_bar_count] = tf;
+      g_bar_labels[g_bar_count] = label;
+      g_bar_last_closed[g_bar_count] = 0; // 0 = full backfill on first report
+      g_bar_count++;
+     }
+
+   if(g_bar_count == 0)
+     {
+      QpLog("ERROR", "BarTimeframes must list at least one of M5,M15,M30,H1,H4");
+      return(false);
+     }
+   return(true);
+  }
+
+void QpResetBarBackfill()
+  {
+   for(int i = 0; i < g_bar_count; i++)
+      g_bar_last_closed[i] = 0;
+  }
+
+bool QpSendBarsFor(const int idx)
+  {
+   ENUM_TIMEFRAMES tf = g_bar_tf[idx];
+   datetime newest_closed = iTime(_Symbol, tf, 1);
+   if(newest_closed == 0)
+     {
+      QpLog("DEBUG", "no bar data yet for " + _Symbol + " " + g_bar_labels[idx]);
+      return(true); // history not synced yet; retried on the next tick
+     }
+
+   int count = 0;
+   if(g_bar_last_closed[idx] == 0)
+     {
+      // initial backfill: the most recent closed bars (shift 0 is forming)
+      int avail = Bars(_Symbol, tf) - 1;
+      if(avail <= 0)
+         return(true);
+      count = (BarHistoryCount < avail ? BarHistoryCount : avail);
+     }
+   else if(newest_closed == g_bar_last_closed[idx])
+      return(true); // no new closed bar since the last report
+   else
+     {
+      int last_shift = iBarShift(_Symbol, tf, g_bar_last_closed[idx], true);
+      if(last_shift < 0)
+        {
+         // the last reported bar vanished (history resync) -> backfill again
+         QpLog("INFO", "bar history resync on " + _Symbol + " " +
+               g_bar_labels[idx] + "; backfilling");
+         g_bar_last_closed[idx] = 0;
+         return(QpSendBarsFor(idx));
+        }
+      count = last_shift - 1; // closed bars newer than the last reported one
+      if(count <= 0)
+        {
+         g_bar_last_closed[idx] = newest_closed;
+         return(true);
+        }
+      if(count > BarHistoryCount)
+         count = BarHistoryCount; // bound the catch-up payload
+     }
+
+   MqlRates rates[];
+   int copied = CopyRates(_Symbol, tf, 1, count, rates); // shift 1 = newest CLOSED bar
+   if(copied <= 0)
+     {
+      QpLog("DEBUG", "CopyRates failed for " + _Symbol + " " + g_bar_labels[idx] +
+            " err=" + IntegerToString(GetLastError()));
+      return(false);
+     }
+
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   string parts[];
+   ArrayResize(parts, copied);
+   datetime max_time = 0;
+   for(int i = 0; i < copied; i++)
+     {
+      QpJsonObject b;
+      b.Clear();
+      b.AddStr("bar_time", QpIsoTime(rates[i].time));
+      b.AddNumStr("open", DoubleToString(rates[i].open, digits));
+      b.AddNumStr("high", DoubleToString(rates[i].high, digits));
+      b.AddNumStr("low", DoubleToString(rates[i].low, digits));
+      b.AddNumStr("close", DoubleToString(rates[i].close, digits));
+      b.AddInt("tick_volume", rates[i].tick_volume);
+      parts[i] = b.Dump();
+      if(rates[i].time > max_time)
+         max_time = rates[i].time;
+     }
+
+   int batch_total = (copied + QP_BARS_PER_BATCH - 1) / QP_BARS_PER_BATCH;
+   for(int batch_index = 0; batch_index < batch_total; batch_index++)
+     {
+      int from = batch_index * QP_BARS_PER_BATCH;
+      int to = from + QP_BARS_PER_BATCH;
+      if(to > copied)
+         to = copied;
+      string bars_json = "";
+      for(int j = from; j < to; j++)
+        {
+         if(j > from)
+            bars_json += ",";
+         bars_json += parts[j];
+        }
+      QpJsonObject o;
+      o.Clear();
+      o.AddStr("ea_version", QP_EA_VERSION);
+      o.AddRaw("terminal", g_terminal_json);
+      o.AddRaw("account", QpAccountJson());
+      o.AddStr("broker_symbol", _Symbol);
+      o.AddStr("timeframe", g_bar_labels[idx]);
+      o.AddInt("batch_index", batch_index);
+      o.AddInt("batch_total", batch_total);
+      o.AddRaw("bars", "[" + bars_json + "]");
+      o.AddStr("observed_at", QpIsoNow());
+      if(!QpHttpPost("/ea/v1/bars", o.Dump()))
+         return(false); // state not advanced -> the same window retries
+     }
+
+   g_bar_last_closed[idx] = max_time;
+   QpLog("INFO", "reported " + IntegerToString(copied) + " closed bar(s) on " +
+         _Symbol + " " + g_bar_labels[idx]);
+   return(true);
+  }
+
+bool QpSendBars()
+  {
+   bool all_ok = true;
+   for(int idx = 0; idx < g_bar_count; idx++)
+     {
+      if(!QpSendBarsFor(idx))
+         all_ok = false;
      }
    return(all_ok);
   }
@@ -1133,6 +1330,13 @@ int OnInit()
       QpLog("ERROR", "CommandPollSeconds must be within 1..120");
       return(INIT_PARAMETERS_INCORRECT);
      }
+   if(BarHistoryCount < 50 || BarHistoryCount > 2000)
+     {
+      QpLog("ERROR", "BarHistoryCount must be within 50..2000");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(!QpInitBarTimeframes())
+      return(INIT_PARAMETERS_INCORRECT);
 
    EventSetTimer(HeartbeatSeconds);
 
@@ -1145,6 +1349,7 @@ int OnInit()
          g_last_specs_at = TimeGMT();
       if(QpSendCalendar())
          g_last_calendar_at = TimeGMT();
+      QpSendBars(); // initial closed-bar backfill; failures retry on timer
      }
    else
       QpLog("INFO", "initial register failed; will retry on timer");
@@ -1182,6 +1387,7 @@ void OnTimer()
         {
          g_registered = true;
          g_last_deal_time = 0; // new account context -> full history backfill
+         QpResetBarBackfill();
          if(QpSendSymbolSpecs())
             g_last_specs_at = TimeGMT();
          if(QpSendCalendar())
@@ -1210,6 +1416,10 @@ void OnTimer()
       if(QpSendDeals())
          g_last_deals_at = TimeGMT();
      }
+
+   // closed bars per configured timeframe (strategy-engine input,
+   // read-only; only new bars are sent, cloud upsert is idempotent - PRD 7)
+   QpSendBars();
 
    // cloud config poll (informational only, never applied - PRD 21.3)
    if(g_last_config_at == 0 || TimeGMT() - g_last_config_at >= QP_CONFIG_REFRESH_SEC)

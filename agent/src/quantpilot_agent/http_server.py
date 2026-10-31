@@ -9,6 +9,9 @@ Endpoints (all JSON):
     POST /ea/v1/deals          incremental history deals    -> ea.deals
     POST /ea/v1/orders         pending-order snapshot       -> ea.orders
     POST /ea/v1/calendar       MT5 built-in economic calendar -> ea.calendar
+    POST /ea/v1/bars           closed bars per symbol+timeframe  -> ea.bars
+                                (one closed-bar batch; cloud upserts
+                                idempotently and evaluates strategies)
     POST /ea/v1/config         identity -> cloud lookup -> config response
                                (synchronous; NOT an event; informational for
                                the EA, OBSERVE_ONLY - PRD 21.3)
@@ -35,6 +38,7 @@ from typing import Any
 import httpx
 
 from quantpilot_contracts.constants import (
+    EVENT_EA_BARS,
     EVENT_EA_CALENDAR,
     EVENT_EA_COMMAND_ACK,
     EVENT_EA_DEALS,
@@ -46,6 +50,7 @@ from quantpilot_contracts.constants import (
     EVENT_EA_SYMBOLS,
 )
 from quantpilot_contracts.models import (
+    EaBarsData,
     EaCalendarData,
     EaCommandAckData,
     EaCommandPollRequest,
@@ -306,6 +311,9 @@ class AgentHttpServer:
                     elif route == "/ea/v1/calendar":
                         data = EaCalendarData.model_validate(body).model_dump(mode="json")
                         event_type = EVENT_EA_CALENDAR
+                    elif route == "/ea/v1/bars":
+                        data = EaBarsData.model_validate(body).model_dump(mode="json")
+                        event_type = EVENT_EA_BARS
                     elif route == "/ea/v1/shutdown":
                         data = EaShutdownData.model_validate(body).model_dump(mode="json")
                         event_type = EVENT_EA_SHUTDOWN

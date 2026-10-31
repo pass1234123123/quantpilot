@@ -314,6 +314,48 @@ class EaCalendarData(BaseModel):
     observed_at: datetime
 
 
+class BarRecord(BaseModel):
+    """One CLOSED bar as observed via CopyRates (read-only, PRD 5.1 market
+    snapshot / 7.2 strategy input).
+
+    bar_time is the bar OPEN time in broker-server time; the forming bar is
+    never included, so every record is final (doc 7.3: avoid unclosed-bar
+    jitter). tick_volume is the number of price changes (real volume is 0 on
+    most FX brokers).
+    """
+
+    model_config = StrictModel
+
+    bar_time: datetime = Field(description="bar open time (closed bars only)")
+    open: Money
+    high: Money
+    low: Money
+    close: Money
+    tick_volume: int = Field(default=0, ge=0)
+
+
+class EaBarsData(BaseModel):
+    """Event ea.bars payload: closed bars for ONE symbol+timeframe.
+
+    Batches are per symbol+timeframe (unlike ea.symbols which mixes symbols);
+    the cloud upserts idempotently on (account, symbol, timeframe, bar_time),
+    so history backfill, new-bar updates and JetStream redeliveries are safe.
+    Strategy evaluation triggers on the newest closed bar of each batch.
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    broker_symbol: str
+    timeframe: str = Field(description="PERIOD label: M5/M15/M30/H1/H4")
+    batch_index: int = Field(default=0)
+    batch_total: int = Field(default=1)
+    bars: list[BarRecord]
+    observed_at: datetime
+
+
 class NodeEventEnvelope(BaseModel):
     """Wrapper published to JetStream subject node.<node_id>.events."""
 

@@ -20,7 +20,7 @@ from uuid import UUID
 import psycopg.errors
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from quantpilot_contracts.models import (
     NodeHeartbeatRequest,
@@ -32,6 +32,7 @@ from . import db, risk, writers
 from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
+from .strategies import REGISTRY as _STRATEGY_REGISTRY
 from .sweeper import CommandSweeper
 
 logger = logging.getLogger("quantpilot.api")
@@ -1153,6 +1154,269 @@ def risk_decisions(
         """,
         (*params, limit),
     )
+    return ok(db.jsonable(rows), request)
+
+
+# --------------------------------------------------------------------------
+# strategy engine (PRD 7): catalog + instances + signals + bars.
+# Strategies produce advisory signals only - no endpoint here creates a
+# command (7.1); the signal -> risk gate -> command wiring is a later slice.
+# Instance configs are validated against the version's Pydantic model and
+# every change produces a new config_revision (7.6: never overwritten).
+# --------------------------------------------------------------------------
+
+_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4")
+
+_INSTANCE_SELECT = """
+    SELECT si.id::text AS instance_id, si.account_id::text AS account_id,
+           s.code AS strategy_code, sv.version AS strategy_version,
+           sv.id::text AS strategy_version_id, si.broker_symbol, si.timeframe,
+           si.config, si.config_revision, si.status,
+           si.created_at, si.updated_at
+      FROM strategy_instances si
+      JOIN strategy_versions sv ON sv.id = si.strategy_version_id
+      JOIN strategies s ON s.id = sv.strategy_id
+"""
+
+
+class StrategyInstanceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_code: str
+    strategy_version: str = "1.0.0"
+    broker_symbol: str = Field(min_length=1)
+    timeframe: Literal["M5", "M15", "M30", "H1", "H4"]
+    config: dict = Field(default_factory=dict)
+    status: Literal["ENABLED", "DISABLED"] = "ENABLED"
+
+
+class StrategyInstanceStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ENABLED", "DISABLED"]
+
+
+class StrategyInstanceConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: dict
+
+
+def _validate_instance_config(strategy_code: str, config: dict) -> dict:
+    """Validate config against the registered implementation's Pydantic
+    model (7.6). Returns the JSON-mode dict (money-ish values as decimal
+    strings, matching the seeded config_schema)."""
+    cls = _STRATEGY_REGISTRY.get(strategy_code)
+    if cls is None:
+        raise HTTPException(400, f"no python implementation registered for strategy {strategy_code!r}")
+    try:
+        return cls.validate_config(config).model_dump(mode="json")
+    except ValidationError as exc:
+        raise HTTPException(400, f"invalid strategy config: {exc.errors()[0]['msg']} ({exc.errors()[0]['loc']})")
+
+
+@app.get("/api/v1/strategies")
+def list_strategies(request: Request) -> JSONResponse:
+    """Strategy catalog with versions + config schemas (doc 12.2)."""
+    rows = db.query(
+        """
+        SELECT s.id::text AS strategy_id, s.code, s.name, s.description, s.status,
+               v.id::text AS strategy_version_id, v.version, v.artifact_hash,
+               v.config_schema, v.created_at
+          FROM strategies s
+          JOIN strategy_versions v ON v.strategy_id = s.id
+         ORDER BY s.code, v.created_at
+        """
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/accounts/{account_id}/strategy-instances")
+def list_strategy_instances(account_id: str, request: Request) -> JSONResponse:
+    account_uuid = _account_or_404(account_id)
+    rows = db.query(
+        _INSTANCE_SELECT + " WHERE si.account_id = %s ORDER BY si.created_at",
+        (account_uuid,),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.post("/api/v1/accounts/{account_id}/strategy-instances")
+def create_strategy_instance(account_id: str, body: StrategyInstanceCreate, request: Request) -> JSONResponse:
+    """Bind (account, strategy version, symbol, timeframe, config revision).
+
+    One instance per binding (409 on duplicates). The config is validated
+    against the version's Pydantic model at creation and stored as revision
+    1; later updates append revisions (7.6: live configs never overwritten).
+    """
+    account_uuid = _account_or_404(account_id)
+    strategy = db.query_one(
+        "SELECT id::text AS strategy_id, code, status FROM strategies WHERE code = %s",
+        (body.strategy_code,),
+    )
+    if strategy is None:
+        raise HTTPException(404, f"strategy {body.strategy_code!r} not found")
+    if strategy["status"] != "ACTIVE":
+        raise HTTPException(400, f"strategy {body.strategy_code!r} is {strategy['status']}")
+    version = db.query_one(
+        """
+        SELECT id::text AS strategy_version_id, version
+          FROM strategy_versions
+         WHERE strategy_id = %s AND version = %s
+        """,
+        (strategy["strategy_id"], body.strategy_version),
+    )
+    if version is None:
+        raise HTTPException(404, f"strategy {body.strategy_code!r} has no version {body.strategy_version!r}")
+    config = _validate_instance_config(body.strategy_code, body.config)
+    try:
+        with db.conn() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_instances (account_id, strategy_version_id,
+                                                broker_symbol, timeframe, config,
+                                                config_revision, status)
+                VALUES (%s, %s, %s, %s, CAST(%s AS jsonb), 1, %s)
+                """,
+                (
+                    account_uuid,
+                    version["strategy_version_id"],
+                    body.broker_symbol,
+                    body.timeframe,
+                    json.dumps(config),
+                    body.status,
+                ),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(409, "an instance already binds this account+strategy+symbol+timeframe") from exc
+    row = db.query_one(
+        _INSTANCE_SELECT + " WHERE si.account_id = %s AND si.strategy_version_id = %s"
+        " AND si.broker_symbol = %s AND si.timeframe = %s",
+        (account_uuid, version["strategy_version_id"], body.broker_symbol, body.timeframe),
+    )
+    assert row is not None
+    return ok(db.jsonable(row), request)
+
+
+def _instance_or_404(account_uuid: UUID, instance_id: str) -> dict:
+    try:
+        instance_uuid = UUID(instance_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "strategy instance not found")
+    row = db.query_one(
+        _INSTANCE_SELECT + " WHERE si.id = %s AND si.account_id = %s",
+        (instance_uuid, account_uuid),
+    )
+    if row is None:
+        raise HTTPException(404, "strategy instance not found")
+    return row
+
+
+@app.get("/api/v1/accounts/{account_id}/strategy-instances/{instance_id}")
+def get_strategy_instance(account_id: str, instance_id: str, request: Request) -> JSONResponse:
+    account_uuid = _account_or_404(account_id)
+    return ok(db.jsonable(_instance_or_404(account_uuid, instance_id)), request)
+
+
+@app.post("/api/v1/accounts/{account_id}/strategy-instances/{instance_id}/status")
+def set_strategy_instance_status(
+    account_id: str, instance_id: str, body: StrategyInstanceStatusUpdate, request: Request
+) -> JSONResponse:
+    """Enable/disable evaluation for one instance (idempotent)."""
+    account_uuid = _account_or_404(account_id)
+    _instance_or_404(account_uuid, instance_id)
+    with db.conn() as connection:
+        connection.execute(
+            """
+            UPDATE strategy_instances
+               SET status = %s, updated_at = now(), version = version + 1
+             WHERE id = %s AND account_id = %s
+            """,
+            (body.status, UUID(instance_id), account_uuid),
+        )
+    return ok(db.jsonable(_instance_or_404(account_uuid, instance_id)), request)
+
+
+@app.put("/api/v1/accounts/{account_id}/strategy-instances/{instance_id}/config")
+def update_strategy_instance_config(
+    account_id: str, instance_id: str, body: StrategyInstanceConfigUpdate, request: Request
+) -> JSONResponse:
+    """Append a new config revision (7.6: configs are immutable - updates
+    produce a new revision, the old one stays in history via version)."""
+    account_uuid = _account_or_404(account_id)
+    instance = _instance_or_404(account_uuid, instance_id)
+    config = _validate_instance_config(instance["strategy_code"], body.config)
+    with db.conn() as connection:
+        connection.execute(
+            """
+            UPDATE strategy_instances
+               SET config = CAST(%s AS jsonb), config_revision = config_revision + 1,
+                   updated_at = now(), version = version + 1
+             WHERE id = %s AND account_id = %s
+            """,
+            (json.dumps(config), UUID(instance_id), account_uuid),
+        )
+    return ok(db.jsonable(_instance_or_404(account_uuid, instance_id)), request)
+
+
+@app.get("/api/v1/accounts/{account_id}/signals")
+def account_signals(
+    account_id: str, request: Request, instance_id: str | None = None, limit: int = 100
+) -> JSONResponse:
+    """Advisory signals produced by the strategy engine (doc 7.4 inside
+    signal_json), newest first."""
+    account_uuid = _account_or_404(account_id)
+    limit = max(1, min(limit, 500))
+    where = ["ss.account_id = %s"]
+    params: list = [account_uuid]
+    if instance_id is not None:
+        try:
+            params.append(UUID(instance_id))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(400, "invalid instance_id")
+        where.append("ss.strategy_instance_id = %s")
+    rows = db.query(
+        f"""
+        SELECT ss.id::text AS id, ss.signal_id::text AS signal_id,
+               ss.account_id::text AS account_id,
+               ss.strategy_instance_id::text AS strategy_instance_id,
+               ss.signal_json, ss.source_bar_time, ss.generated_at, ss.expires_at
+          FROM strategy_signals ss
+         WHERE {' AND '.join(where)}
+         ORDER BY ss.generated_at DESC
+         LIMIT %s
+        """,
+        (*params, limit),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/accounts/{account_id}/bars")
+def account_bars(
+    account_id: str,
+    request: Request,
+    symbol: str,
+    timeframe: str,
+    limit: int = 500,
+) -> JSONResponse:
+    """Closed-bar history for one (account, symbol, timeframe), oldest
+    first (chart-ready). Bars are immutable broker facts; the EA reports
+    closed bars only."""
+    account_uuid = _account_or_404(account_id)
+    if timeframe not in _TIMEFRAMES:
+        raise HTTPException(400, f"timeframe must be one of {_TIMEFRAMES}")
+    limit = max(1, min(limit, 2000))
+    rows = db.query(
+        """
+        SELECT b.bar_time, b.open, b.high, b.low, b.close, b.tick_volume
+          FROM symbol_bars b
+         WHERE b.account_id = %s AND b.broker_symbol = %s AND b.timeframe = %s
+         ORDER BY b.bar_time DESC
+         LIMIT %s
+        """,
+        (account_uuid, symbol, timeframe, limit),
+    )
+    rows.reverse()
     return ok(db.jsonable(rows), request)
 
 

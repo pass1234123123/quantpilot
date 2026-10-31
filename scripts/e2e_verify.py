@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -43,6 +45,11 @@ TABLES = [
     "risk_states",
     "risk_decisions",
     "commands",
+    "symbol_bars",
+    "strategies",
+    "strategy_versions",
+    "strategy_instances",
+    "strategy_signals",
     "system_events",
 ]
 
@@ -55,6 +62,10 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"[{tag}] {name}{(' ' + detail) if detail else ''}")
     if not ok:
         failures += 1
+
+
+def _utc(value) -> str:
+    return datetime.fromisoformat(str(value)).astimezone(timezone.utc).isoformat()
 
 
 def main() -> int:
@@ -216,6 +227,74 @@ def main() -> int:
               f"status={lk.status_code} resolved={lk_data.get('resolved')} "
               f"version={lk_data.get('version')}")
 
+        # ---- strategy engine (PRD 7): catalog + instances + signals + bars --
+        strategies = client.get(f"{API}/api/v1/strategies").json()["data"]
+        codes = {s.get("code") for s in strategies}
+        check("api.strategies",
+              {"ma_cross", "rsi_momentum", "trend_following"} <= codes,
+              f"codes={sorted(c for c in codes if c)}")
+
+        instances = client.get(
+            f"{API}/api/v1/accounts/{sim_id}/strategy-instances").json()["data"]
+        inst_codes = {i.get("strategy_code") for i in instances}
+        check("api.strategy_instances",
+              {"ma_cross", "trend_following", "rsi_momentum"} <= inst_codes,
+              f"count={len(instances)}")
+        rsi_inst = next((i for i in instances if i.get("strategy_code") == "rsi_momentum"), None)
+        if rsi_inst is not None:
+            check("api.instance_status_config",
+                  rsi_inst.get("status") == "ENABLED"
+                  and (rsi_inst.get("config_revision") or 0) >= 2
+                  and (rsi_inst.get("config") or {}).get("rsi_period") == 21,
+                  f"status={rsi_inst.get('status')} revision={rsi_inst.get('config_revision')} "
+                  f"rsi_period={(rsi_inst.get('config') or {}).get('rsi_period')}")
+
+        # sim_ea posts a deterministic V-path; the two edge bars (130 = ma_cross
+        # fast/slow cross, 133 = trend state flip) must each yield exactly one
+        # advisory BUY signal, and redeliveries must not duplicate them (7.5)
+        sigs = client.get(f"{API}/api/v1/accounts/{sim_id}/signals").json()["data"]
+        by_code: dict = {}
+        for s in sigs:
+            by_code.setdefault((s.get("signal_json") or {}).get("strategy_id"), []).append(s)
+        ma_sigs = by_code.get("ma_cross", [])
+        tf_sigs = by_code.get("trend_following", [])
+        check("api.signals_count",
+              len(sigs) == 2 and len(ma_sigs) == 1 and len(tf_sigs) == 1,
+              f"total={len(sigs)} ma={len(ma_sigs)} tf={len(tf_sigs)}")
+        if ma_sigs:
+            j = ma_sigs[0]["signal_json"]
+            src = _utc(ma_sigs[0].get("source_bar_time"))
+            check("api.signal_ma_cross",
+                  j.get("direction") == "BUY"
+                  and j.get("reason_codes") == ["MA_FAST_CROSSED_ABOVE"]
+                  and j.get("signal_type") == "ENTRY"
+                  and src == "2026-01-06T08:30:00+00:00"
+                  and Decimal(j["proposed_stop_loss"]) < Decimal(j["reference_price"])
+                  < Decimal(j["proposed_take_profit"]),
+                  f"dir={j.get('direction')} reasons={j.get('reason_codes')} @{src}")
+            print(f"       signal: ma_cross BUY strength={j.get('strength')} "
+                  f"ref={j.get('reference_price')}")
+        if tf_sigs:
+            j = tf_sigs[0]["signal_json"]
+            src = _utc(tf_sigs[0].get("source_bar_time"))
+            check("api.signal_trend_following",
+                  j.get("direction") == "BUY"
+                  and j.get("reason_codes") == ["EMA_TREND_UP", "ADX_ABOVE_THRESHOLD"]
+                  and src == "2026-01-06T09:15:00+00:00"
+                  and Decimal(j["proposed_stop_loss"]) < Decimal(j["reference_price"])
+                  < Decimal(j["proposed_take_profit"]),
+                  f"dir={j.get('direction')} reasons={j.get('reason_codes')} @{src}")
+            print(f"       signal: trend_following BUY strength={j.get('strength')} "
+                  f"ref={j.get('reference_price')}")
+
+        bars = client.get(f"{API}/api/v1/accounts/{sim_id}/bars",
+                          params={"symbol": "EURUSD", "timeframe": "M15", "limit": 2000})
+        bars_data = bars.json().get("data", []) if bars.status_code == 200 else []
+        times = [datetime.fromisoformat(str(b["bar_time"])) for b in bars_data]
+        ordered = all(times[i] < times[i + 1] for i in range(len(times) - 1))
+        check("api.bars", len(bars_data) == 135 and ordered,
+              f"status={bars.status_code} count={len(bars_data)} oldest_first={ordered}")
+
         # ---- risk engine (slice 2, PRD 9): stop states + gate audit -------
         st = client.get(f"{API}/api/v1/risk/state")
         st_data = st.json().get("data") or {}
@@ -346,6 +425,39 @@ def main() -> int:
         ).fetchone()[0]
         check("pg.risk_decisions_unique", dup_decisions == 0,
               f"duplicate_decisions={dup_decisions}")
+
+        # ---- 5. Strategy engine invariants (PRD 7.4/7.5) --------------------
+        # one advisory signal per (instance, source bar) even after batch
+        # redeliveries; poisoned bars are dropped and reported, not retried
+        dup_signals = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT strategy_instance_id, source_bar_time FROM strategy_signals
+                 GROUP BY strategy_instance_id, source_bar_time HAVING count(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+        check("pg.signals_dedup", dup_signals == 0, f"duplicates={dup_signals}")
+
+        orphan_signals = conn.execute(
+            """
+            SELECT count(*) FROM strategy_signals s
+             LEFT JOIN strategy_instances i ON i.id = s.strategy_instance_id
+             WHERE i.id IS NULL
+            """
+        ).fetchone()[0]
+        check("pg.signals_have_instances", orphan_signals == 0,
+              f"orphans={orphan_signals}")
+
+        bar_rows = conn.execute(
+            "SELECT count(*) FROM symbol_bars WHERE timeframe = 'M15'"
+        ).fetchone()[0]
+        check("pg.symbol_bars", bar_rows >= 135, f"rows={bar_rows}")
+
+        dropped = conn.execute(
+            "SELECT count(*) FROM system_events WHERE event_type = 'ea.bars_dropped'"
+        ).fetchone()[0]
+        check("pg.bars_dropped_event", dropped >= 1, f"events={dropped}")
 
     return finish()
 

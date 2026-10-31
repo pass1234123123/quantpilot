@@ -12,6 +12,7 @@ EVENT_EA_ORDERS = "ea.orders"
 EVENT_EA_CALENDAR = "ea.calendar"
 EVENT_EA_SHUTDOWN = "ea.shutdown"
 EVENT_EA_COMMAND_ACK = "ea.command_ack"
+EVENT_EA_BARS = "ea.bars"
 
 # --- Error codes (doc A.4) ---
 ERR_ACCOUNT_IDENTITY_MISMATCH = "ACCOUNT_IDENTITY_MISMATCH"

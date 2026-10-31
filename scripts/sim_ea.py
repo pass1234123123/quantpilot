@@ -646,6 +646,158 @@ def main() -> int:
         },
     )
 
+    # 13. strategy engine (PRD 7): closed bars -> advisory signals.
+    # Deterministic V-path (120 bars down, then up); batch endpoints land
+    # exactly on each strategy's edge bar (located empirically with the
+    # engine's window semantics): ma_cross BUY at bar 130, trend_following
+    # BUY at bar 133. Deterministic bar times make re-runs idempotent.
+    def utc_iso(value) -> str:
+        return datetime.fromisoformat(str(value)).astimezone(timezone.utc).isoformat()
+
+    accounts = client.get(API + "/api/v1/accounts").json()["data"]
+    sim_acc = next((a for a in accounts if a.get("login_ref") == "10001234"), None)
+    if sim_acc is None:
+        print("[signals] FAIL: sim account not registered")
+        failures += 1
+    else:
+        account_id = sim_acc["account_id"]
+
+        # 13a. bind instances; 409 = already bound from a previous run
+        def bind_instance(code: str, timeframe: str) -> None:
+            nonlocal failures
+            r = client.post(
+                f"{API}/api/v1/accounts/{account_id}/strategy-instances",
+                json={"strategy_code": code, "broker_symbol": "EURUSD",
+                      "timeframe": timeframe, "config": {}},
+            )
+            ok = r.status_code in (200, 409)
+            print(f"[signals] bind {code}/{timeframe}: {'OK' if ok else 'FAIL'} {r.text[:100]}")
+            if not ok:
+                failures += 1
+
+        bind_instance("ma_cross", "M15")
+        bind_instance("trend_following", "M15")
+        bind_instance("rsi_momentum", "M30")  # no M30 bars ever: control instance
+
+        instances = client.get(
+            f"{API}/api/v1/accounts/{account_id}/strategy-instances"
+        ).json()["data"]
+        rsi = next((i for i in instances if i["strategy_code"] == "rsi_momentum"), None)
+        if rsi is None:
+            print("[signals] FAIL: rsi_momentum instance missing")
+            failures += 1
+        else:
+            # status toggle + config update appends a new revision (7.6)
+            r1 = client.post(
+                f"{API}/api/v1/accounts/{account_id}/strategy-instances/{rsi['instance_id']}/status",
+                json={"status": "DISABLED"})
+            r2 = client.post(
+                f"{API}/api/v1/accounts/{account_id}/strategy-instances/{rsi['instance_id']}/status",
+                json={"status": "ENABLED"})
+            r3 = client.put(
+                f"{API}/api/v1/accounts/{account_id}/strategy-instances/{rsi['instance_id']}/config",
+                json={"config": {"rsi_period": 21}})
+            toggled = r1.status_code == 200 and r2.status_code == 200 and r3.status_code == 200
+            print(f"[signals] rsi status/config: {'OK' if toggled else 'FAIL'} "
+                  f"({r1.status_code}/{r2.status_code}/{r3.status_code})")
+            if not toggled:
+                failures += 1
+
+        # 13b. deterministic V-path, M15 bars 0..134
+        start = Decimal("1.20000")
+        down, up, wick = Decimal("0.00150"), Decimal("0.00220"), Decimal("0.00010")
+        closes = [start]
+        for _ in range(120):
+            closes.append(closes[-1] - down)
+        for _ in range(14):
+            closes.append(closes[-1] + up)
+        base = datetime(2026, 1, 5, tzinfo=timezone.utc)
+        sim_bars: list[dict] = []
+        prev_close = closes[0]
+        for i, close in enumerate(closes):
+            open_ = prev_close if i > 0 else close
+            sim_bars.append({
+                "bar_time": (base + timedelta(minutes=15 * i)).isoformat(),
+                "open": str(open_),
+                "high": str(max(open_, close) + wick),
+                "low": str(min(open_, close) - wick),
+                "close": str(close),
+                "tick_volume": 100 + i,
+            })
+            prev_close = close
+
+        def post_bars(chosen: list[dict], batch_index: int, batch_total: int, tag: str) -> None:
+            nonlocal failures
+            r = client.post(
+                AGENT + "/ea/v1/bars",
+                json={
+                    "ea_version": "1.0.0", "terminal": terminal(), "account": account(),
+                    "broker_symbol": "EURUSD", "timeframe": "M15",
+                    "batch_index": batch_index, "batch_total": batch_total,
+                    "bars": chosen, "observed_at": iso_now(),
+                },
+                headers=HEADERS,
+            )
+            ok = r.status_code == 200
+            print(f"[bars] {tag}: {'OK' if ok else 'FAIL'} ({len(chosen)} bars) {r.text[:100]}")
+            if not ok:
+                failures += 1
+
+        post_bars(sim_bars[:100], 0, 2, "backfill part 1")
+        post_bars(sim_bars[100:131], 1, 2, "backfill part 2 (edge: ma_cross @130)")
+        post_bars(sim_bars[131:134], 0, 1, "incremental (edge: trend_following @133)")
+        post_bars(sim_bars[131:134], 0, 1, "redelivery (dedup: no new signal)")
+        post_bars(
+            [sim_bars[134],
+             {"bar_time": sim_bars[134]["bar_time"], "open": "1.05000",
+              "high": "1.04000", "low": "1.06000", "close": "1.05000", "tick_volume": 1}],
+            0, 1, "poisoned bar dropped")
+
+        # 13c. exactly one advisory signal per strategy (7.4 shape, 7.5 dedup)
+        time.sleep(3)
+        sigs = client.get(f"{API}/api/v1/accounts/{account_id}/signals").json()["data"]
+        by_code: dict[str, list[dict]] = {}
+        for s in sigs:
+            by_code.setdefault(s["signal_json"]["strategy_id"], []).append(s)
+        ma_sigs, tf_sigs = by_code.get("ma_cross", []), by_code.get("trend_following", [])
+        count_ok = len(sigs) == 2 and len(ma_sigs) == 1 and len(tf_sigs) == 1
+        print(f"[signals] count={len(sigs)} ma={len(ma_sigs)} tf={len(tf_sigs)} "
+              f"{'OK' if count_ok else 'FAIL'}")
+        if not count_ok:
+            failures += 1
+        for label, group, edge_bar, reasons in (
+            ("ma_cross", ma_sigs, sim_bars[130], ["MA_FAST_CROSSED_ABOVE"]),
+            ("trend_following", tf_sigs, sim_bars[133], ["EMA_TREND_UP", "ADX_ABOVE_THRESHOLD"]),
+        ):
+            if not group:
+                continue
+            j = group[0]["signal_json"]
+            stops_ok = (Decimal(j["proposed_stop_loss"]) < Decimal(j["reference_price"])
+                        < Decimal(j["proposed_take_profit"]))
+            ok = (
+                j["direction"] == "BUY"
+                and j["reason_codes"] == reasons
+                and utc_iso(group[0]["source_bar_time"]) == edge_bar["bar_time"]
+                and 0 <= j["strength"] <= 1
+                and stops_ok
+            )
+            print(f"[signals] {label} BUY: {'OK' if ok else 'FAIL'} "
+                  f"strength={j['strength']} ref={j['reference_price']} "
+                  f"reasons={j['reason_codes']} @{edge_bar['bar_time']}")
+            if not ok:
+                failures += 1
+
+        # 13d. bars query: oldest-first, deterministic count
+        rows = client.get(f"{API}/api/v1/accounts/{account_id}/bars",
+                          params={"symbol": "EURUSD", "timeframe": "M15", "limit": 2000}).json()["data"]
+        times = [datetime.fromisoformat(str(b["bar_time"])) for b in rows]
+        ordered = all(times[i] < times[i + 1] for i in range(len(times) - 1))
+        bars_ok = len(rows) == 135 and ordered
+        print(f"[bars] query count={len(rows)} oldest_first={ordered} "
+              f"{'OK' if bars_ok else 'FAIL'}")
+        if not bars_ok:
+            failures += 1
+
     print(f"\nagent-side failures: {failures}")
     return failures
 

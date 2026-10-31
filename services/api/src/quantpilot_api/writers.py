@@ -755,6 +755,83 @@ def handle_command_ack(data: dict[str, Any]) -> None:
         )
 
 
+def handle_bars(data: dict[str, Any]) -> None:
+    """Closed-bar projection (doc 5.1 market snapshot, 7.2 strategy input).
+
+    Upsert on (account, symbol, timeframe, bar_time): EA history backfill,
+    new-bar updates and JetStream redeliveries are all idempotent. The
+    newest closed bar of the batch then triggers strategy evaluation; the
+    evaluation runs AFTER the bars commit and its failures are isolated
+    per instance (a poisoned strategy must not stall the projection).
+    """
+    terminal_id, account_id = _resolve(data)
+    broker_symbol = str(data.get("broker_symbol", ""))
+    timeframe = str(data.get("timeframe", ""))
+    if not broker_symbol or not timeframe:
+        raise ValueError("ea.bars event missing broker_symbol/timeframe")
+
+    valid: list[tuple] = []
+    skipped = 0
+    for bar in data.get("bars") or []:
+        try:
+            bar_time = _ts(bar.get("bar_time"))
+        except Exception:
+            skipped += 1
+            continue
+        open_, high = _dec(bar.get("open")), _dec(bar.get("high"))
+        low, close = _dec(bar.get("low")), _dec(bar.get("close"))
+        if None in (open_, high, low, close):
+            skipped += 1
+            continue
+        # same sanity bound as the DB CHECK: a malformed bar would poison the
+        # batch redelivery loop forever, so it is dropped (and reported) here
+        if not (high >= low and low <= open_ <= high and low <= close <= high):
+            skipped += 1
+            continue
+        valid.append((bar_time, open_, high, low, close, _int(bar.get("tick_volume")) or 0))
+    if skipped:
+        add_system_event(
+            source="api-consumer",
+            event_type="ea.bars_dropped",
+            severity="WARN",
+            payload={
+                "account_id": account_id,
+                "broker_symbol": broker_symbol,
+                "timeframe": timeframe,
+                "dropped": skipped,
+                "detail": "bars failing OHLC sanity bounds were skipped",
+            },
+        )
+    if not valid:
+        return
+
+    with db.conn() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO symbol_bars (account_id, broker_symbol, timeframe, bar_time,
+                                        open, high, low, close, tick_volume)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (account_id, broker_symbol, timeframe, bar_time) DO UPDATE
+                   SET open = EXCLUDED.open,
+                       high = EXCLUDED.high,
+                       low = EXCLUDED.low,
+                       close = EXCLUDED.close,
+                       tick_volume = EXCLUDED.tick_volume
+                """,
+                [
+                    (_uuid(account_id), broker_symbol, timeframe, bar[0], bar[1],
+                     bar[2], bar[3], bar[4], bar[5])
+                    for bar in valid
+                ],
+            )
+    # lazy import: strategy_engine imports this module for add_system_event
+    from . import strategy_engine
+
+    newest = max(valid, key=lambda bar: bar[0])
+    strategy_engine.evaluate_newest_bar(account_id, broker_symbol, timeframe, newest[0])
+
+
 HANDLERS = {
     "ea.registered": handle_registered,
     "ea.heartbeat": handle_heartbeat,
@@ -765,4 +842,5 @@ HANDLERS = {
     "ea.calendar": handle_calendar,
     "ea.shutdown": handle_shutdown,
     "ea.command_ack": handle_command_ack,
+    "ea.bars": handle_bars,
 }
