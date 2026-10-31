@@ -3,9 +3,11 @@
 EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL 的完整数据链路。
 
 **OBSERVE_ONLY**：EA 不含任何交易执行代码（无 OrderSend / OrderCheck / CTrade），
-仅上报终端/账户身份、心跳快照、品种规格、持仓/挂单/成交与日历事件。新账户默认
-`OBSERVE_ONLY` 状态。云端命令通道已通（下发/确认/幂等/对账），但 EA 收到后仅回执
-（`OBSERVE_ONLY_ACK`），不执行任何交易；风险增加型命令在下发前过云端风控闸门。
+仅上报终端/账户身份、心跳快照、品种规格、持仓/挂单/成交、日历事件与已收盘 K 线
+（M15/H1 基线，PRD 22.2）。新账户默认 `OBSERVE_ONLY` 状态。云端命令通道已通
+（下发/确认/幂等/对账），但 EA 收到后仅回执（`OBSERVE_ONLY_ACK`），不执行任何
+交易；风险增加型命令在下发前过云端风控闸门。云端策略引擎消费收盘 bar 产生**建议
+性信号**（PRD 7.1：策略不直接下单），信号→命令接线在后续切片实现。
 
 ## 已完成切片
 
@@ -16,6 +18,10 @@ EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL �
   command_id 幂等、UNKNOWN 对账（迟到 ack / EA recently-acked 回显，永不盲重发）
 - 风控引擎（执行侧）：创建时闸门按 PRD 9.2 顺序检查；拒绝即落终态 REJECTED（永不投递）
   + `risk_decisions` 审计；全局/账户级 STOP_NEW_RISK / LOCKED 持久状态（PRD 3.3/9.5）
+- 策略引擎（PRD 7）：EA v1.5.0 按周期上报已收盘 bar（`symbol_bars` 投影，回填/增量/
+  重同步幂等）→ 无状态窗口重放评估 → `strategy_signals`（边沿触发，UNIQUE 去重，
+  doc 7.5）；首批 3 策略 ma_cross / rsi_momentum / trend_following；坏 bar 跳过并
+  发 `ea.bars_dropped` 防重投死循环；实例绑定固定版本 + config_revision 只增（doc 7.6）
 
 ## 目录结构
 
@@ -26,7 +32,7 @@ services/api/         FastAPI：JetStream 消费入库 + 查询路由 + 命令�
                      （risk.py 闸门 / account_config.py 账户配置模型）
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
-infra/postgres/       Alembic 迁移（0001–0009，含 risk_states / risk_decisions）
+infra/postgres/       Alembic 迁移（0001–0010，含 risk / 策略引擎表）
 scripts/              开发工具（隧道/冒烟/验收/部署）
 ```
 
@@ -53,8 +59,8 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 冒烟与验收：
 
 ```powershell
-.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（注册/心跳/规格/持仓/命令/风控闸门 16 场景）
-.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 端点 + 16 张表落库 + 风控不变量
+.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（注册/心跳/规格/持仓/命令/风控闸门/策略实例/收盘bar/信号）
+.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 端点 + 21 张表落库 + 风控/信号不变量
 ```
 
 ## Web 仪表盘（frontend/）
@@ -93,6 +99,28 @@ pnpm build      # 类型检查 + 产线构建
 风控闸门检查顺序遵循 PRD 9.2（停止状态 → 快照新鲜度/权限 → 日亏/回撤/保证金/连亏
 → 仓位数/周末/日单数 → 规格/手数 → 强制止损/单笔风险估算）；无法可靠估算风险时拒绝
 （PRD 9.3）。点差/即时报价类检查留给 EA 执行级（PRD 9.1 双层结构）。
+
+## 策略引擎 API（本阶段）
+
+- `GET /api/v1/strategies`：策略目录（code / 默认参数 / warmup 门槛）
+- `GET|POST /api/v1/accounts/{id}/strategy-instances`：实例列表 / 绑定
+  （账户+策略+品种+周期唯一，绑定固定 `strategy_version`）
+- `GET /api/v1/accounts/{id}/strategy-instances/{iid}`：实例详情
+- `POST /api/v1/accounts/{id}/strategy-instances/{iid}/status`：ENABLED / DISABLED
+- `PUT /api/v1/accounts/{id}/strategy-instances/{iid}/config`：参数覆盖
+  （`config_revision` 单调递增，历史版本不覆盖，doc 7.6）
+- `GET /api/v1/accounts/{id}/signals`：信号查询（strategy_code / timeframe 过滤，
+  返回 doc 7.4 标准结构）
+- `GET /api/v1/accounts/{id}/bars`：收盘 bar 查询（oldest-first）
+
+评估语义（PRD 7）：仅批次最新收盘 bar 触发；引擎无状态——从 `symbol_bars` 重放
+指标窗口（warmup 不足跳过）；边沿触发 + `UNIQUE(instance, source_bar_time)` 去重
+（doc 7.5），JetStream 重投不产生重复信号；单实例评估失败仅记 system event，不阻塞
+bar 投影；毒 bar（OHLC 越界）跳过并发 `ea.bars_dropped` 防无限重投。**信号仅建议，
+永不直接下单**（PRD 7.1）；信号→聚合→风控→命令接线在后续切片。
+
+EA 侧 v1.5.0 新增输入：`BarTimeframes`（默认 `M15,H1`，PRD 22.2）、
+`BarHistoryCount`（默认 500，首次上线回填历史 bar 数）。
 
 数据库变更（如换库）：
 
