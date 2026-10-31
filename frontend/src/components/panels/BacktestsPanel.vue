@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { createChart, LineSeries, type IChartApi, type UTCTimestamp } from 'lightweight-charts'
 import { useDashboardStore } from '../../stores/dashboard'
 import { api, num, type BacktestJobDetail } from '../../api'
 
@@ -48,17 +49,229 @@ const pct = (v: number | null | undefined) =>
   v === null || v === undefined ? '—' : `${(v * 100).toFixed(1)}%`
 
 const netUp = computed(() => ((num(selected.value?.metrics?.net_profit) ?? 0) >= 0))
+
+const costText = (field: string) => {
+  const cm = (selected.value?.cost_model ?? {}) as Record<string, unknown>
+  const v = cm[field]
+  return v === null || v === undefined ? '—' : String(v)
+}
+
+// ---- 创建表单（PRD 15：幂等键客户端生成；显式成本假设，默认非零） ----
+const formInstanceId = ref('')
+const formRange = ref<[Date, Date]>([
+  new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+  new Date(),
+])
+const formBalance = ref(10000)
+const formVolume = ref(1)
+
+/** 参考主流 ECN 欧元账户的保守默认假设，均可在表单中修改 */
+const formCost = ref({
+  spread_per_side: '0.00006',
+  slippage_per_side: '0.00002',
+  commission_per_lot_per_side: '3.5',
+  swap_per_lot_per_bar: '0.01',
+  contract_size: '100000',
+  quote_to_account_rate: '1',
+})
+
+watch(
+  () => [store.selectedAccountId, store.instances],
+  () => {
+    if (!formInstanceId.value || !store.instances.some((i) => i.instance_id === formInstanceId.value)) {
+      formInstanceId.value = store.instances[0]?.instance_id ?? ''
+    }
+  },
+  { immediate: true },
+)
+
+const allCostsZero = computed(() => {
+  const c = formCost.value
+  return ['spread_per_side', 'slippage_per_side', 'commission_per_lot_per_side', 'swap_per_lot_per_bar']
+    .every((k) => num(c[k as keyof typeof c]) === 0)
+})
+
+const createMsg = ref('')
+const creating = computed(() => store.backtestCreating)
+
+async function submitCreate() {
+  createMsg.value = ''
+  if (!formInstanceId.value || !formRange.value?.[0] || !formRange.value?.[1]) {
+    createMsg.value = '请选择策略实例和回测区间。'
+    return
+  }
+  const detail = await store.createBacktest({
+    strategy_instance_id: formInstanceId.value,
+    range_start: formRange.value[0].toISOString(),
+    range_end: formRange.value[1].toISOString(),
+    initial_balance: String(formBalance.value),
+    volume: String(formVolume.value),
+    cost_model: { ...formCost.value },
+  })
+  if (detail) {
+    selected.value = detail
+    createMsg.value = `任务已创建：${detail.job_id}（${detail.status}）`
+  } else {
+    createMsg.value = `创建失败：${store.error}`
+  }
+}
+
+// ---- 权益曲线（backtest report.equity_curve） ----
+const chartEl = ref<HTMLElement | null>(null)
+let chart: IChartApi | null = null
+let equitySeries: ReturnType<IChartApi['addSeries']> | null = null
+
+function toTime(iso: string): UTCTimestamp {
+  return Math.floor(new Date(iso).getTime() / 1000) as UTCTimestamp
+}
+
+function renderEquity() {
+  if (!chart || !equitySeries) return
+  const curve = selected.value?.report?.equity_curve ?? []
+  const points = curve
+    .map((p) => ({ time: toTime(p.bar_time), value: num(p.equity) ?? 0 }))
+    .filter((p, i, arr) => i === 0 || p.time > arr[i - 1].time)
+  equitySeries.setData(points)
+  if (points.length > 0) chart.timeScale().fitContent()
+}
+
+onMounted(() => {
+  if (!chartEl.value) return
+  chart = createChart(chartEl.value, {
+    height: 220,
+    layout: {
+      background: { color: 'transparent' },
+      textColor: '#7d8fa3',
+      fontSize: 10,
+    },
+    grid: {
+      vertLines: { color: 'rgba(148, 163, 184, 0.08)' },
+      horzLines: { color: 'rgba(148, 163, 184, 0.08)' },
+    },
+    rightPriceScale: { borderColor: 'rgba(148, 163, 184, 0.2)' },
+    timeScale: { borderColor: 'rgba(148, 163, 184, 0.2)', timeVisible: true },
+    autoSize: false,
+  })
+  equitySeries = chart.addSeries(LineSeries, {
+    color: '#22c55e',
+    lineWidth: 2,
+    title: '权益',
+  })
+  renderEquity()
+})
+
+watch(
+  () => selected.value?.report?.equity_curve,
+  () => renderEquity(),
+)
+
+onBeforeUnmount(() => {
+  chart?.remove()
+  chart = null
+  equitySeries = null
+})
 </script>
 
 <template>
   <div class="qp-panel bt">
     <div class="qp-panel__title">
-      历史回测 · 任务与报告
+      历史回测 · 创建 · 任务与报告
       <span class="qp-live-badge">backtest_jobs 真实数据</span>
     </div>
 
+    <!-- 创建表单 -->
+    <div class="bt__form">
+      <div class="bt__form-row">
+        <el-select
+          v-model="formInstanceId"
+          placeholder="策略实例"
+          size="small"
+          filterable
+          style="width: 300px"
+        >
+          <el-option
+            v-for="i in store.instances"
+            :key="i.instance_id"
+            :value="i.instance_id"
+            :label="`${i.strategy_code} · ${i.broker_symbol} · ${i.timeframe} · ${i.status}`"
+          />
+        </el-select>
+        <el-date-picker
+          v-model="formRange"
+          type="datetimerange"
+          size="small"
+          range-separator="→"
+          start-placeholder="开始"
+          end-placeholder="结束"
+          style="width: 360px"
+        />
+        <span class="bt__field">
+          初始资金
+          <el-input-number v-model="formBalance" :min="1" :step="1000" size="small" style="width: 130px" />
+        </span>
+        <span class="bt__field">
+          手数
+          <el-input-number v-model="formVolume" :min="0.01" :step="0.01" size="small" style="width: 110px" />
+        </span>
+      </div>
+
+      <div class="bt__cost">
+        <div class="bt__cost-title">
+          成本假设（显式研究假设；价格类为每边报价单位，往返 ×2）
+        </div>
+        <div class="bt__cost-grid">
+          <label class="bt__cost-item">
+            <span>点差/边</span>
+            <el-input v-model="formCost.spread_per_side" size="small" />
+          </label>
+          <label class="bt__cost-item">
+            <span>滑点/边</span>
+            <el-input v-model="formCost.slippage_per_side" size="small" />
+          </label>
+          <label class="bt__cost-item">
+            <span>佣金（货币/手/边）</span>
+            <el-input v-model="formCost.commission_per_lot_per_side" size="small" />
+          </label>
+          <label class="bt__cost-item">
+            <span>隔夜利息（货币/手/bar）</span>
+            <el-input v-model="formCost.swap_per_lot_per_bar" size="small" />
+          </label>
+          <label class="bt__cost-item">
+            <span>合约大小</span>
+            <el-input v-model="formCost.contract_size" size="small" />
+          </label>
+          <label class="bt__cost-item">
+            <span>报价→账户汇率</span>
+            <el-input v-model="formCost.quote_to_account_rate" size="small" />
+          </label>
+        </div>
+        <div v-if="allCostsZero" class="bt__cost-warn">
+          四项交易成本均为 0：回测结果将明显偏乐观。建议至少配置点差与佣金。
+        </div>
+      </div>
+
+      <div class="bt__form-actions">
+        <el-button
+          type="primary"
+          size="small"
+          :loading="creating"
+          :disabled="store.instances.length === 0"
+          @click="submitCreate"
+        >
+          创建回测任务
+        </el-button>
+        <span v-if="store.instances.length === 0" class="bt__form-tip">
+          当前账户没有策略实例，请先在策略引擎面板创建/绑定实例。
+        </span>
+        <span v-else class="bt__form-tip">同一幂等键重复提交返回原任务；不产生任何交易命令。</span>
+      </div>
+      <div v-if="createMsg" class="bt__create-msg" :class="{ 'is-fail': createMsg.startsWith('创建失败') }">
+        {{ createMsg }}
+      </div>
+    </div>
+
     <div v-if="jobs.length === 0" class="bt__empty">
-      暂无回测任务 —— 通过 POST /api/v1/backtests 创建（需 Idempotency-Key）。
+      暂无回测任务 —— 通过上方表单创建（POST /api/v1/backtests，需 Idempotency-Key）。
     </div>
 
     <table v-else class="bt__table">
@@ -99,8 +312,12 @@ const netUp = computed(() => ((num(selected.value?.metrics?.net_profit) ?? 0) >=
       <div class="bt__detail-head">
         报告 · {{ selected.strategy_code }} v{{ selected.strategy_version }} ·
         data_hash <code>{{ selected.data_hash?.slice(0, 12) }}…</code> ·
-        rev {{ selected.config_revision }}
+        rev {{ selected.config_revision }} ·
+        成本假设 点差/边 {{ costText('spread_per_side') }} · 滑点/边 {{ costText('slippage_per_side') }} ·
+        佣金 {{ costText('commission_per_lot_per_side') }} · swap/bar {{ costText('swap_per_lot_per_bar') }}
       </div>
+
+      <div ref="chartEl" class="bt__chart" />
 
       <div class="bt__metrics">
         <div class="bt__metric">
@@ -175,6 +392,54 @@ const netUp = computed(() => ((num(selected.value?.metrics?.net_profit) ?? 0) >=
   color: var(--qp-text-dim);
 }
 
+.bt__form {
+  border: 1px solid var(--qp-border-soft);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(148, 163, 184, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.bt__form-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bt__field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--qp-text-dim);
+}
+
+.bt__cost { display: flex; flex-direction: column; gap: 8px; }
+.bt__cost-title { font-size: 11px; color: var(--qp-text-dim); }
+.bt__cost-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px 14px;
+}
+.bt__cost-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--qp-text-dim);
+}
+.bt__cost-warn {
+  font-size: 11px;
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: rgba(251, 191, 36, 0.06);
+}
+
+.bt__form-actions { display: flex; align-items: center; gap: 10px; }
+.bt__form-tip { font-size: 10.5px; color: var(--qp-text-dim); }
+.bt__create-msg { font-size: 11px; color: var(--qp-up); }
+.bt__create-msg.is-fail { color: var(--qp-down); }
+
+.bt__chart { width: 100%; }
+
 .bt__table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
 .bt__table th {
   text-align: left;
@@ -212,8 +477,11 @@ const netUp = computed(() => ((num(selected.value?.metrics?.net_profit) ?? 0) >=
   border-radius: 8px;
   padding: 12px;
   background: rgba(148, 163, 184, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
-.bt__detail-head { font-size: 11px; color: var(--qp-text-dim); margin-bottom: 10px; }
+.bt__detail-head { font-size: 11px; color: var(--qp-text-dim); }
 .bt__detail-head code { font-size: 10.5px; }
 
 .bt__metrics {

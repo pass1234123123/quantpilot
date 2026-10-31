@@ -420,6 +420,25 @@ export interface BacktestJobDetail extends BacktestJobSummary {
   updated_at: string
 }
 
+/** 回测成本假设（backtest_engine.BacktestCostModel）：显式研究假设 */
+export interface BacktestCostModelInput {
+  spread_per_side: string
+  slippage_per_side: string
+  commission_per_lot_per_side: string
+  swap_per_lot_per_bar: string
+  contract_size: string
+  quote_to_account_rate: string
+}
+
+export interface CreateBacktestPayload {
+  strategy_instance_id: string
+  range_start: string
+  range_end: string
+  initial_balance: string
+  volume: string
+  cost_model: BacktestCostModelInput
+}
+
 /** AI 分析 doc 8.4：output_json 严格结构（统计版 regime 分类器） */
 export interface AiStrategyScore {
   strategy_id: string
@@ -480,13 +499,26 @@ async function get<T>(path: string): Promise<T> {
   return body.data
 }
 
-async function send<T>(path: string, method: 'PUT' | 'POST', payload: unknown): Promise<T> {
+async function send<T>(
+  path: string,
+  method: 'PUT' | 'POST',
+  payload: unknown,
+  extraHeaders?: Record<string, string>,
+): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(extraHeaders ?? {}),
+    },
     body: JSON.stringify(payload),
   })
   if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as ApiEnvelope<T> | null
+    if (body?.error) {
+      throw new Error(`${body.error.code}: ${body.error.message}`)
+    }
     throw new Error(`HTTP ${res.status} on ${path}`)
   }
   const body = (await res.json()) as ApiEnvelope<T>
@@ -535,6 +567,13 @@ export const api = {
   backtests: (accountId: string, limit = 50) =>
     get<BacktestJobSummary[]>(`/api/v1/backtests?account_id=${accountId}&limit=${limit}`),
   backtest: (jobId: string) => get<BacktestJobDetail>(`/api/v1/backtests/${jobId}`),
+  createBacktest: (payload: CreateBacktestPayload) =>
+    send<BacktestJobDetail>(
+      '/api/v1/backtests',
+      'POST',
+      payload,
+      { 'Idempotency-Key': crypto.randomUUID() },
+    ),
   aiAnalyses: (accountId: string, limit = 100) =>
     get<AiAnalysisRow[]>(`/api/v1/accounts/${accountId}/ai/analyses?limit=${limit}`),
   aiAnalyze: (accountId: string, brokerSymbol: string, timeframe: string) =>

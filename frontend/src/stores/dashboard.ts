@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type AiAnalysisRow, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type AiAnalysisRow, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type CreateBacktestPayload, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -29,6 +29,7 @@ export const useDashboardStore = defineStore('dashboard', {
     backtests: [] as BacktestJobSummary[],
     aiAnalyses: [] as AiAnalysisRow[],
     aiRunning: false,
+    backtestCreating: false,
     lastRefreshAt: '' as string,
   }),
   getters: {
@@ -159,6 +160,22 @@ export const useDashboardStore = defineStore('dashboard', {
         return null
       } finally {
         this.aiRunning = false
+      }
+    },
+    /** 创建回测任务（PRD 15：幂等键由客户端生成；无交易命令） */
+    async createBacktest(payload: CreateBacktestPayload) {
+      this.backtestCreating = true
+      try {
+        const detail = await api.createBacktest(payload)
+        this.backtests = await api
+          .backtests(this.selectedAccountId, 50)
+          .catch(() => [] as BacktestJobSummary[])
+        return detail
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e)
+        return null
+      } finally {
+        this.backtestCreating = false
       }
     },
     async setInstanceStatus(instanceId: string, status: 'ENABLED' | 'DISABLED') {
