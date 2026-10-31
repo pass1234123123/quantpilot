@@ -208,6 +208,15 @@ export interface CalendarEventRow {
   observed_at: string
 }
 
+export interface SystemEventRow {
+  event_id: string
+  source: string
+  event_type: string
+  severity: string
+  payload: Record<string, unknown> | null
+  occurred_at: string
+}
+
 export interface FiltersConfig {
   news_filter: boolean
   high_impact_only: boolean
@@ -284,6 +293,7 @@ export const api = {
     get<PerformanceData>(`/api/v1/accounts/${accountId}/performance?days=${days}`),
   calendar: (accountId: string, hours = 48) =>
     get<CalendarEventRow[]>(`/api/v1/accounts/${accountId}/calendar?hours=${hours}`),
+  events: (limit = 100) => get<SystemEventRow[]>(`/api/v1/events?limit=${limit}`),
   getConfig: (accountId: string) => get<AccountConfigData>(`/api/v1/accounts/${accountId}/config`),
   saveConfig: (accountId: string, config: { filters: FiltersConfig; expert: ExpertConfig }) =>
     send<AccountConfigData>(`/api/v1/accounts/${accountId}/config`, 'PUT', config),

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type CalendarEventRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type CalendarEventRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -17,6 +17,7 @@ export const useDashboardStore = defineStore('dashboard', {
     deals: [] as DealRow[],
     orders: [] as OrderRow[],
     calendar: [] as CalendarEventRow[],
+    events: [] as SystemEventRow[],
     performance: null as PerformanceData | null,
     config: null as AccountConfigData | null,
     configSaving: false,
@@ -52,14 +53,16 @@ export const useDashboardStore = defineStore('dashboard', {
         await api.health()
         this.apiHealthy = true
 
-        const [nodes, terminals, accounts] = await Promise.all([
+        const [nodes, terminals, accounts, events] = await Promise.all([
           api.nodes(),
           api.terminals(),
           api.accounts(),
+          api.events(100).catch(() => [] as SystemEventRow[]),
         ])
         this.nodes = nodes
         this.terminals = terminals
         this.accounts = accounts
+        this.events = events
 
         if (!this.selectedAccountId && accounts.length > 0) {
           this.selectedAccountId = accounts[0].account_id

@@ -431,6 +431,30 @@ def account_calendar(account_id: str, request: Request, hours: int = 48) -> JSON
 
 
 # --------------------------------------------------------------------------
+# system events (doc 12.2/12.3) - real event stream written by the consumer
+# (ea.registered / ea.shutdown / IDENTITY_MISMATCH etc.), read-only.
+# --------------------------------------------------------------------------
+
+@app.get("/api/v1/events")
+def list_system_events(request: Request, limit: int = 100, severity: str | None = None) -> JSONResponse:
+    """System event feed, newest-first. Optional severity filter (INFO/WARN/ERROR)."""
+    limit = max(1, min(limit, 500))
+    base = """
+        SELECT e.id::text AS event_id, e.source, e.event_type, e.severity,
+               e.payload, e.occurred_at
+          FROM system_events e
+    """
+    if severity is None:
+        rows = db.query(base + " ORDER BY e.occurred_at DESC LIMIT %s", (limit,))
+    else:
+        rows = db.query(
+            base + " WHERE e.severity = %s ORDER BY e.occurred_at DESC LIMIT %s",
+            (severity, limit),
+        )
+    return ok(db.jsonable(rows), request)
+
+
+# --------------------------------------------------------------------------
 # account config (doc 12.2 risk_profiles) - OBSERVE_ONLY slice: the config is
 # stored and served for observation; nothing in this system enforces it.
 # --------------------------------------------------------------------------

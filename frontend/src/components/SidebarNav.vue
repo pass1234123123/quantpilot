@@ -3,30 +3,42 @@ import { computed } from 'vue'
 import { useDashboardStore } from '../stores/dashboard'
 import { num } from '../api'
 
+defineProps<{ active: string }>()
+const emit = defineEmits<{ (e: 'select', key: string): void }>()
+
 const store = useDashboardStore()
 
-const navItems = [
-  '仪表盘',
-  '绩效',
-  '风险管理',
-  '过滤设置',
-  'EA 设置',
-  '交易日志',
-  '新闻过滤',
-  '行情监控',
-  '告警',
-  '设置',
-  '帮助与支持',
-]
+interface NavItem {
+  key: string
+  label: string
+}
 
-const active = '仪表盘'
+const navItems: NavItem[] = [
+  { key: 'dashboard', label: '仪表盘' },
+  { key: 'performance', label: '绩效' },
+  { key: 'risk', label: '风险管理' },
+  { key: 'filtering', label: '过滤设置' },
+  { key: 'expert', label: 'EA 设置' },
+  { key: 'journal', label: '交易日志' },
+  { key: 'news', label: '新闻过滤' },
+  { key: 'market', label: '行情监控' },
+  { key: 'alerts', label: '告警' },
+  { key: 'settings', label: '设置' },
+  { key: 'help', label: '帮助与支持' },
+]
 
 const systemHealth = computed(() => (store.apiHealthy ? 100 : 0))
 const dataFeed = computed(() => (store.apiHealthy ? '正常' : '中断'))
 const brokerConnection = computed(() =>
   store.snapshot?.connected ? '已建立' : '未知',
 )
-const eaStatus = computed(() => (store.snapshot?.expert_allowed ? '运行中' : '停止'))
+// EA 是否存活：最近 5 分钟内有 snapshot 上报即视为运行中（EA 挂掉会停止上报）
+const eaAlive = computed(() => {
+  const at = store.snapshot?.captured_at
+  if (!at) return false
+  return Date.now() - new Date(at).getTime() < 5 * 60 * 1000
+})
+const eaStatus = computed(() => (eaAlive.value ? '运行中' : '无心跳'))
 const lastUpdate = computed(() => store.snapshot?.captured_at ?? store.lastRefreshAt)
 const openPositions = computed(() => store.snapshot?.open_positions ?? 0)
 const freeMargin = computed(() => num(store.snapshot?.free_margin))
@@ -45,12 +57,16 @@ const freeMargin = computed(() => num(store.snapshot?.free_margin))
     <nav class="sidebar__nav">
       <div
         v-for="item in navItems"
-        :key="item"
+        :key="item.key"
         class="sidebar__item"
-        :class="{ 'is-active': item === active }"
+        :class="{ 'is-active': item.key === active }"
+        role="button"
+        tabindex="0"
+        @click="emit('select', item.key)"
+        @keydown.enter="emit('select', item.key)"
       >
         <span class="sidebar__item-dot" />
-        {{ item }}
+        {{ item.label }}
       </div>
     </nav>
 
@@ -120,8 +136,16 @@ const freeMargin = computed(() => num(store.snapshot?.free_margin))
   border-radius: 6px;
   color: var(--qp-text-dim);
   font-size: 12.5px;
-  cursor: default;
+  cursor: pointer;
   position: relative;
+  user-select: none;
+  transition: color 0.15s, background 0.15s;
+}
+.sidebar__item:hover,
+.sidebar__item:focus-visible {
+  color: var(--qp-text);
+  background: rgba(148, 163, 184, 0.1);
+  outline: none;
 }
 
 .sidebar__item-dot {
