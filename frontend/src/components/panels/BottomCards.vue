@@ -118,7 +118,7 @@ const currency = computed(() => snap.value?.currency ?? '')
               </span>
               {{ nextEvent.currency || nextEvent.country_code }} {{ nextEvent.name }}
             </div>
-            <div class="bc__countdown-name bc__dim">{{ eventTimeText(nextEvent.event_time) }}（经纪商服务器时间）</div>
+            <div class="bc__countdown-name bc__dim">{{ eventTimeText(nextEvent.event_time) }}（本地时间）</div>
           </template>
           <template v-else>
             <div class="bc__countdown-label">下一财经事件</div>

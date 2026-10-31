@@ -24,12 +24,12 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.30"
+#property version   "1.31"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.3.0"
+#define QP_EA_VERSION        "1.3.1"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
@@ -593,9 +593,14 @@ bool QpCalendarValueSane(const long value)
 
 bool QpSendCalendar()
   {
-   // window on the trade-server clock: calendar times follow it (the same
-   // documented approximation as the deals channel - MQL5 has no API to
-   // query the server timezone)
+   // Calendar times follow the trade-server clock, but the pipeline (PG
+   // storage, API windows, dashboard countdown) speaks UTC. Convert via
+   // the live offset TimeTradeServer - TimeGMT (DST-safe at report time;
+   // MQL5 exposes no server-timezone API, doc 21.3 no invention).
+   long utc_offset = (long)TimeTradeServer() - (long)TimeGMT();
+
+   // the CalendarValueHistory query window itself stays on the
+   // trade-server clock - that is the axis the calendar API speaks
    datetime now  = TimeTradeServer();
    datetime from = now - QP_CALENDAR_PAST_SEC;
    datetime to   = now + (datetime)CalendarWindowHours * 3600;
@@ -640,7 +645,7 @@ bool QpSendCalendar()
          e.AddStr("importance", QpCalendarImportanceLabel(ev.importance));
          e.AddStr("multiplier", QpCalendarMultiplierLabel(ev.multiplier));
          e.AddInt("digits", ev.digits);
-         e.AddStr("event_time", QpIsoTime(values[i].time));
+         e.AddStr("event_time", QpIsoTime((datetime)((long)values[i].time - utc_offset)));
          if(QpCalendarValueSane(values[i].actual_value))
             e.AddNumStr("actual", IntegerToString(values[i].actual_value));
          if(QpCalendarValueSane(values[i].forecast_value))
@@ -662,8 +667,8 @@ bool QpSendCalendar()
       o.AddRaw("account", QpAccountJson());
       o.AddInt("batch_index", batch_index);
       o.AddInt("batch_total", batch_total);
-      o.AddStr("window_from", QpIsoTime(from));
-      o.AddStr("window_to", QpIsoTime(to));
+      o.AddStr("window_from", QpIsoTime((datetime)((long)from - utc_offset)));
+      o.AddStr("window_to", QpIsoTime((datetime)((long)to - utc_offset)));
       o.AddRaw("events", "[" + events_json + "]");
       o.AddStr("observed_at", QpIsoNow());
       if(!QpHttpPost("/ea/v1/calendar", o.Dump()))
