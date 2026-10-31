@@ -30,6 +30,9 @@ Decimal 风险预算和同一风控闸门生成持久命令，但 EA 仍只回�
 - 策略自动化闭环（PRD 3.2/9.3）：同 source bar 同向信号聚合为一条命令，最强信号
   提供交易价位；反向信号记冲突且不建单；Decimal 风险预算按 volume_step 向下取整；
   确定性 command_id 保证 JetStream 重放幂等；AI 仅作为风险审计上下文，不参与许可决策
+- 历史回测（PRD 15）：复用实时策略实现与指标窗口，从 `symbol_bars` 读取历史数据；
+  当前 bar 收盘生成信号、下一根 bar 开盘全量成交；固定策略版本/config_revision、
+  数据 hash 与成本模型，持久化幂等任务和完整指标报告，不创建任何交易命令
 
 ## 目录结构
 
@@ -40,7 +43,7 @@ services/api/         FastAPI：JetStream 消费入库 + 查询路由 + 命令�
                      （signal_pipeline.py 聚合 / command_service.py 共用命令核心）
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
-infra/postgres/       Alembic 迁移（0001–0010，含 risk / 策略引擎表）
+infra/postgres/       Alembic 迁移（0001–0012，含 risk / 策略 / AI / 回测表）
 scripts/              开发工具（隧道/冒烟/验收/部署）
 ```
 
@@ -67,9 +70,9 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 冒烟与验收：
 
 ```powershell
-.venv\Scripts\python -m unittest discover -s services/api/tests -v  # 自动化闭环单元测试
-.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件 + 开关/聚合/冲突/风控/AI/重放场景
-.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API + 23 张表 + 风控/信号/自动化不变量
+.venv\Scripts\python -m unittest discover -s services/api/tests -v  # 全部单元测试（含回测成交/成本/幂等）
+.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件 + 自动化/AI/回测及重放场景
+.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API + 25 张表 + 风控/信号/自动化/回测不变量
 ```
 
 ## Web 仪表盘（frontend/）
@@ -160,6 +163,23 @@ signal_decision 等仅写入 `risk_decisions.risk_snapshot.ai` 供审计，绝�
   signal_id 写入风险快照；同 bar 反向信号记 `signal.conflict`，不建单。
 - command_id 由账户/品种/周期/source bar/direction 确定性生成，重放返回原命令；
   REJECT 以 `REJECTED` 持久化且永不投递。EA 始终保持 OBSERVE_ONLY。
+
+## 历史回测 API（本阶段）
+
+- `POST /api/v1/backtests`：创建并同步执行回测；必须提供 UUID `Idempotency-Key` 请求头，
+  body 包含 `strategy_instance_id`、带时区的 `range_start/range_end`、`initial_balance`、
+  `volume` 和 `cost_model`。相同键与请求体重放直接返回原报告；相同键不同请求体返回 409。
+- `GET /api/v1/backtests/{id}`：查询任务状态、固定策略/参数快照、数据 hash、指标、
+  交易明细、成本拆分与权益曲线。
+
+回测复用实时策略类和相同 warmup 窗口，仅使用区间内的已收盘 bar。信号在当前 bar 收盘
+产生，下一根 bar 开盘全量成交；单持仓且持仓期间忽略新入场，SL/TP 同根触发时保守地
+止损优先，末尾按最后收盘价强制平仓。成本模型分项记录 spread、slippage、commission、
+swap，全部资金计算使用 Decimal。报告包含净利润、最大回撤、Profit Factor、胜率、
+Expectancy、Sharpe、Sortino、Recovery Factor、Exposure、持仓时间与交易数。
+
+回测任务持久化于 `backtest_jobs/backtest_results`，记录策略版本、实例 config_revision、
+请求 hash 和精确历史数据 hash。该路径不调用命令服务，不进入 Agent/EA 执行链。
 
 数据库变更（如换库）：
 

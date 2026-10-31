@@ -802,6 +802,104 @@ def main() -> int:
         if not bars_ok:
             failures += 1
 
+        # 13e. Reproducible backtest (PRD 15): same fixed ma_cross instance,
+        # next-bar-open fills, explicit costs, immutable idempotent report.
+        ma_instance = next(
+            (i for i in instances if i["strategy_code"] == "ma_cross"), None,
+        )
+        if ma_instance is None:
+            print("[backtest] FAIL: ma_cross instance missing")
+            failures += 1
+        else:
+            backtest_key = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"quantpilot-e2e-backtest:{account_id}:{ma_instance['instance_id']}",
+            )
+            backtest_body = {
+                "strategy_instance_id": ma_instance["instance_id"],
+                "range_start": sim_bars[0]["bar_time"],
+                "range_end": sim_bars[-1]["bar_time"],
+                "initial_balance": "10000",
+                "volume": "0.01",
+                "cost_model": {
+                    "spread_per_side": "0.00005",
+                    "slippage_per_side": "0.00002",
+                    "commission_per_lot_per_side": "3.5",
+                    "swap_per_lot_per_bar": "0",
+                    "contract_size": "100000",
+                    "quote_to_account_rate": "1",
+                },
+            }
+            before_commands = client.get(
+                f"{API}/api/v1/commands",
+                params={"account_id": account_id, "limit": 500},
+            ).json().get("data", [])
+            r = client.post(
+                f"{API}/api/v1/backtests", json=backtest_body,
+                headers={"Idempotency-Key": str(backtest_key)},
+            )
+            job = r.json().get("data") or {}
+            metrics = job.get("metrics") or {}
+            report = job.get("report") or {}
+            trades = report.get("trades") or []
+            backtest_ok = (
+                r.status_code == 200 and job.get("status") == "COMPLETED"
+                and (report.get("data") or {}).get("bar_count") == 135
+                and metrics.get("trade_count", 0) >= 1
+                and Decimal((metrics.get("cost_breakdown") or {}).get("commission", "0")) > 0
+                and (report.get("assumptions") or {}).get("entry")
+                    == "NEXT_BAR_OPEN_FULL_FILL"
+                and len(report.get("equity_curve") or []) == 135
+            )
+            print(f"[backtest] run: {'OK' if backtest_ok else 'FAIL'} "
+                  f"status={r.status_code} job={job.get('status')} "
+                  f"trades={metrics.get('trade_count')}")
+            if not backtest_ok:
+                failures += 1
+            if trades:
+                first = trades[0]
+                next_open_ok = (
+                    utc_iso(first.get("source_bar_time")) == sim_bars[130]["bar_time"]
+                    and utc_iso(first.get("entry_time")) == sim_bars[131]["bar_time"]
+                    and Decimal(first["entry_price"])
+                        == Decimal(sim_bars[131]["open"]) + Decimal("0.00007")
+                )
+                print(f"[backtest] no-lookahead fill: {'OK' if next_open_ok else 'FAIL'} "
+                      f"entry={first.get('entry_price')} @{first.get('entry_time')}")
+                if not next_open_ok:
+                    failures += 1
+            replay = client.post(
+                f"{API}/api/v1/backtests", json=backtest_body,
+                headers={"Idempotency-Key": str(backtest_key)},
+            )
+            replay_job = replay.json().get("data") or {}
+            replay_ok = (
+                replay.status_code == 200 and replay_job.get("job_id") == job.get("job_id")
+                and (replay_job.get("report") or {}).get("data") == report.get("data")
+            )
+            print(f"[backtest] idempotent replay: {'OK' if replay_ok else 'FAIL'} "
+                  f"job={replay_job.get('job_id')}")
+            if not replay_ok:
+                failures += 1
+            conflict = client.post(
+                f"{API}/api/v1/backtests", json={**backtest_body, "volume": "0.02"},
+                headers={"Idempotency-Key": str(backtest_key)},
+            )
+            conflict_ok = conflict.status_code == 409
+            print(f"[backtest] key/body conflict: {'OK' if conflict_ok else 'FAIL'} "
+                  f"status={conflict.status_code}")
+            if not conflict_ok:
+                failures += 1
+            after_commands = client.get(
+                f"{API}/api/v1/commands",
+                params={"account_id": account_id, "limit": 500},
+            ).json().get("data", [])
+            isolated = len(after_commands) == len(before_commands)
+            print(f"[backtest] no trade commands: {'OK' if isolated else 'FAIL'} "
+                  f"commands={len(before_commands)}->{len(after_commands)}")
+            if not isolated:
+                failures += 1
+
         # 14. AI analysis engine (PRD 8, ADVISORY first release): manual
         # trigger on the newest closed bar, strict doc-8.4 shape, the V-path
         # tail classifies HIGH_VOL (ATR/close 0.00205 > 0.0015), input_hash

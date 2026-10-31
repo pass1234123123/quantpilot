@@ -52,6 +52,8 @@ TABLES = [
     "strategy_instances",
     "strategy_signals",
     "ai_analyses",
+    "backtest_jobs",
+    "backtest_results",
     "system_events",
 ]
 
@@ -296,6 +298,50 @@ def main() -> int:
         ordered = all(times[i] < times[i + 1] for i in range(len(times) - 1))
         check("api.bars", len(bars_data) == 135 and ordered,
               f"status={bars.status_code} count={len(bars_data)} oldest_first={ordered}")
+
+        # ---- strategy backtest (PRD 15): durable report + cost assumptions --
+        ma_inst = next((i for i in instances if i.get("strategy_code") == "ma_cross"), None)
+        if ma_inst is not None and bars_data:
+            key = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"quantpilot-e2e-backtest:{sim_id}:{ma_inst['instance_id']}",
+            )
+            job_id = uuid.uuid5(uuid.NAMESPACE_URL, f"quantpilot-backtest-v1:{key}")
+            response = client.get(f"{API}/api/v1/backtests/{job_id}")
+            job = response.json().get("data") or {}
+            metrics = job.get("metrics") or {}
+            report = job.get("report") or {}
+            required_metrics = {
+                "net_profit", "max_drawdown", "profit_factor", "win_rate",
+                "expectancy", "sharpe", "sortino", "recovery_factor",
+                "exposure", "average_holding_minutes", "trade_count", "cost_breakdown",
+            }
+            check("api.backtest_report",
+                  response.status_code == 200 and job.get("status") == "COMPLETED"
+                  and job.get("strategy_code") == "ma_cross"
+                  and job.get("config_revision") == ma_inst.get("config_revision")
+                  and required_metrics <= set(metrics)
+                  and (report.get("data") or {}).get("bar_count") == 135
+                  and len((report.get("data") or {}).get("sha256", "")) == 64
+                  and len(report.get("equity_curve") or []) == 135,
+                  f"status={response.status_code} job={job.get('status')} "
+                  f"trades={metrics.get('trade_count')}")
+            trades = report.get("trades") or []
+            if trades:
+                first = trades[0]
+                check("api.backtest_next_open_and_costs",
+                      _utc(first.get("source_bar_time")) == "2026-01-06T08:30:00+00:00"
+                      and _utc(first.get("entry_time")) == "2026-01-06T08:45:00+00:00"
+                      and Decimal(first["entry_price"])
+                          == Decimal(bars_data[131]["open"]) + Decimal("0.00007")
+                      and Decimal(first["costs"]["commission"]) > 0
+                      and Decimal(metrics["cost_breakdown"]["spread"]) > 0
+                      and Decimal(metrics["cost_breakdown"]["slippage"]) > 0,
+                      f"entry={first.get('entry_price')} costs={first.get('costs')}")
+            else:
+                check("api.backtest_next_open_and_costs", False, "no closed trades")
+        else:
+            check("api.backtest_report", False, "ma_cross instance or bars missing")
 
         # ---- AI analysis engine (PRD 8, ADVISORY): analyses are advisory ----
         # display artifacts: strict doc-8.4 shape inside output_json, the OFF
@@ -566,7 +612,31 @@ def main() -> int:
         check("pg.ai_analyses_have_accounts", orphan_analyses == 0,
               f"orphans={orphan_analyses}")
 
-        # ---- 7. Strategy automation invariants (PRD 3.2/7.5/9.3) -----------
+        # ---- 7. Backtest invariants (PRD 15): replay-safe and isolated -----
+        dup_jobs = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT idempotency_key FROM backtest_jobs
+                 GROUP BY idempotency_key HAVING count(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+        check("pg.backtests_dedup", dup_jobs == 0, f"duplicates={dup_jobs}")
+        incomplete = conn.execute(
+            """
+            SELECT count(*) FROM backtest_jobs j
+             LEFT JOIN backtest_results r ON r.job_id = j.id
+             WHERE j.status = 'COMPLETED'
+               AND (r.id IS NULL OR j.data_hash IS NULL OR length(j.data_hash) <> 64)
+            """
+        ).fetchone()[0]
+        check("pg.backtests_complete_reports", incomplete == 0, f"incomplete={incomplete}")
+        leaked = conn.execute(
+            "SELECT count(*) FROM commands WHERE created_by LIKE 'backtest%'"
+        ).fetchone()[0]
+        check("pg.backtests_create_no_commands", leaked == 0, f"commands={leaked}")
+
+        # ---- 8. Strategy automation invariants (PRD 3.2/7.5/9.3) -----------
         if auto_id:
             automation_rows = conn.execute(
                 """

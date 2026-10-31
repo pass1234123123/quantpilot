@@ -18,7 +18,7 @@ from typing import Literal
 from uuid import UUID
 
 import psycopg.errors
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -28,7 +28,7 @@ from quantpilot_contracts.models import (
     TradeCommandCreate,
 )
 
-from . import command_service, db, risk, writers
+from . import backtests, command_service, db, risk, writers
 from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
@@ -1287,6 +1287,40 @@ def account_bars(
     )
     rows.reverse()
     return ok(db.jsonable(rows), request)
+
+
+# --------------------------------------------------------------------------
+# Strategy backtests (PRD 15): durable research jobs, never trade commands.
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/v1/backtests")
+def create_backtest(
+    body: backtests.BacktestCreate,
+    request: Request,
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
+) -> JSONResponse:
+    try:
+        result = backtests.create_backtest(body, idempotency_key)
+    except backtests.BacktestNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except backtests.BacktestConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return ok(db.jsonable(result), request)
+
+
+@app.get("/api/v1/backtests/{job_id}")
+def get_backtest(job_id: str, request: Request) -> JSONResponse:
+    try:
+        job_uuid = UUID(job_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(404, "backtest not found") from exc
+    result = backtests.get_backtest(job_uuid)
+    if result is None:
+        raise HTTPException(404, "backtest not found")
+    return ok(db.jsonable(result), request)
 
 
 # --------------------------------------------------------------------------
