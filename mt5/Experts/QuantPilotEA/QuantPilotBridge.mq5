@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //| QuantPilotBridge.mq5                                             |
-//| QuantPilot AI - MT5 EA bridge, OBSERVE_ONLY telemetry.           |
+//| QuantPilot AI - MT5 EA bridge: read-only telemetry + command      |
+//| channel with OBSERVE_ONLY / DRY_RUN / LIVE(demo) run modes.        |
 //|                                                                   |
 //| What this EA does (and ALL it does in this slice):               |
 //|   - reports terminal/account identity to the local agent          |
@@ -14,45 +15,59 @@
 //|     PRD 7 market-data input for the cloud strategy engine)       |
 //|   - polls the cloud-side account config every 60s and LOGS it    |
 //|     (informational only - it is never applied, OBSERVE_ONLY)     |
-//|   - polls the cloud command channel and ACKS each command         |
-//|     (slice 1 receipt-only acks; slice 2 optional DRY_RUN           |
-//|     pre-trade checks - NEVER real execution - PRD 21.3)            |
+//|   - polls the cloud command channel and ACKS each command:        |
+//|     receipt (DUPLICATE/EXPIRED/OBSERVE_ONLY_ACK), DRY_RUN pre-      |
+//|     trade checks, or live CTrade execution on DEMO accounts        |
+//|     only (slice 3, behind the LiveTrading input; PRD 21.3)         |
 //|   - sends a shutdown note on removal                             |
 //|                                                                   |
-//| Command channel, slice 1 (PRD 13.5 + AT-005/AT-006):            |
+//| Command channel (PRD 13.5 + AT-005/AT-006):                       |
 //|   - the EA polls /ea/v1/commands/poll every CommandPollSeconds   |
 //|   - every received command is marked processed BEFORE the ack is |
 //|     sent (terminal GlobalVariable "QPCMD_<id>", survives EA      |
 //|     reloads); a lost ack is still reconcilable via the           |
 //|     recently_acked echo on the next poll (AT-006)                 |
 //|   - duplicate commands get ack_code=DUPLICATE, no side effects    |
-//|   - commands past expires_at get ack_code=EXPIRED                 |
-//|   - slice 2 DRY_RUN (PRD 13.5 / C1): with DryRunMode=true, risk-   |
-//|     increasing commands (OPEN_MARKET / PLACE_PENDING) run the      |
-//|     full pre-trade check chain (trade mode, spread, volume, SL/TP  |
-//|     distance, pending price, session + OrderCheck oracle) and    |
-//|     ack DRY_RUN_PASSED / DRY_RUN_REJECTED - NO order is ever sent |
-//|   - everything else gets ack_code=OBSERVE_ONLY_ACK - the payload  |
-//|     is logged and NOT executed                                    |
+//|   - commands past expires_at get ack_code=EXPIRED - expired        |
+//|     commands are NEVER executed, in any mode (acceptance C3)      |
 //|                                                                   |
-//| What it MUST NOT contain (PRD 21.3):                             |
-//|   - no OrderSend / CTrade / any real order execution - EVER;      |
-//|     DRY_RUN uses OrderCheck() purely as a validation oracle      |
-//|     (it places nothing, slice 2)                                  |
-//|   - no position modification, no risk limits, no trading logic    |
-//|   - it never acts on responses other than logging / acking them   |
+//| Run modes (three-level ladder, acceptance report section 5):      |
+//|   - OBSERVE_ONLY (default): DryRunMode=false, LiveTrading=false;  |
+//|     every command is acked, nothing is executed                   |
+//|   - DRY_RUN (C1): DryRunMode=true; risk-increasing commands       |
+//|     (OPEN_MARKET / PLACE_PENDING) run the full pre-trade chain    |
+//|     (trade mode, spread, volume, SL/TP distance, pending price,   |
+//|     session + OrderCheck oracle) and ack DRY_RUN_PASSED /         |
+//|     DRY_RUN_REJECTED. DryRunMode=true NEVER sends an order - it   |
+//|     short-circuits live execution too.                            |
+//|   - LIVE (C2): DryRunMode=false AND LiveTrading=true AND the      |
+//|     account is DEMO (per-command hard guard). Risk-increasing     |
+//|     commands run the SAME C1 chain first, then one synchronous   |
+//|     CTrade attempt; acks EXECUTED / EXECUTE_FAILED /             |
+//|     EXECUTE_REJECTED / LIVE_REFUSED_NOT_DEMO. Single attempt, no  |
+//|     auto-retry (the cloud re-issues under its own policy, C3).    |
+//|     MODIFY_POSITION never removes protection: absent sl/tp mean   |
+//|     "keep current" (PRD 13.4).                                    |
+//|                                                                   |
+//| What it MUST NOT do (PRD 21.3):                                   |
+//|   - never execute on a REAL/CONTEST account: per-command hard    |
+//|     guard acks LIVE_REFUSED_NOT_DEMO, independent of inputs        |
+//|   - never send an order while DryRunMode=true                    |
+//|   - no autonomous decision: no cloud command = no action; it      |
+//|     never acts on responses other than logging / acking them       |
 //|                                                                   |
 //| Identity verification (PRD 6.3): every payload carries the same   |
 //| terminal + account identity; the cloud flags IDENTITY_MISMATCH.   |
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.60"
+#property version   "1.70"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
+#include <Trade\Trade.mqh>
 
-#define QP_EA_VERSION        "1.6.0"
+#define QP_EA_VERSION        "1.7.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
@@ -69,6 +84,10 @@
 #define QP_ACK_EXPIRED        "EXPIRED"
 #define QP_ACK_DRY_RUN_PASS   "DRY_RUN_PASSED"
 #define QP_ACK_DRY_RUN_REJECT "DRY_RUN_REJECTED"
+#define QP_ACK_EXECUTED       "EXECUTED"
+#define QP_ACK_EXECUTE_FAIL   "EXECUTE_FAILED"
+#define QP_ACK_EXECUTE_REJ    "EXECUTE_REJECTED"
+#define QP_ACK_NOT_DEMO       "LIVE_REFUSED_NOT_DEMO"
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
@@ -79,9 +98,14 @@ input int    CalendarWindowHours = 48;                  // Economic calendar loo
 input int    CommandPollSeconds = 5;                    // Command poll interval, 1..120s
 input bool   DryRunMode       = false;                  // DRY_RUN: pre-trade checks only, never execute (PRD 13.5 / C1)
 input int    MaxSpreadPoints  = 0;                      // DRY_RUN: max allowed spread in points (0 = no spread check)
+input bool   LiveTrading      = false;                  // LIVE: real CTrade execution, DEMO accounts only (acceptance C2)
+input double MaxLiveVolume    = 0.0;                    // LIVE: local cap on order volume, rejects fatter orders (0 = off)
 input string BarTimeframes   = "M15,H1";                // Closed-bar timeframes: M5/M15/M30/H1/H4 (PRD 22.2)
 input int    BarHistoryCount = 500;                     // Initial closed-bar backfill per timeframe, 50..2000
 input string LogLevel         = "INFO";                 // DEBUG | INFO | ERROR
+
+//--- live trading (CTrade, slice 3 / acceptance C2)
+CTrade   g_trade;
 
 //--- runtime state
 bool     g_registered      = false;
@@ -1082,7 +1106,7 @@ string QpRecentCommandsJson()
   }
 
 //+------------------------------------------------------------------+
-//| Command receipt (slice 1: OBSERVE_ONLY - receipt, no execution) |
+//| Command ack: receipt / DRY_RUN verdict / live-execution outcome  |
 //+------------------------------------------------------------------+
 bool QpSendCommandAck(const string command_id, const string ack_code,
                       const string ack_message)
@@ -1100,12 +1124,13 @@ bool QpSendCommandAck(const string command_id, const string ack_code,
   }
 
 //+------------------------------------------------------------------+
-//| Slice 2 DRY_RUN (PRD 13.5 / C1): pre-trade checks, NEVER a trade.|
-//| The chain mirrors every gate of the future execution slice:       |
-//| trade mode -> quotes/spread -> volume -> SL/TP distance ->         |
-//| pending price -> session -> OrderCheck margin/validity oracle.    |
-//| A clean chain acks DRY_RUN_PASSED; any failure acks               |
-//| DRY_RUN_REJECTED with a machine-readable code. No order is sent. |
+//| Risk classification: only OPEN_MARKET / PLACE_PENDING add risk    |
+//| (PRD 13.5). The C1 chain below gates both DRY_RUN (never a trade) |
+//| and LIVE execution (same gates, then one CTrade attempt).        |
+//| Chain: trade mode -> quotes/spread -> volume -> SL/TP distance -> |
+//| pending price -> session -> OrderCheck margin/validity oracle.   |
+//| A clean chain acks DRY_RUN_PASSED / executes; any failure acks   |
+//| DRY_RUN_REJECTED / EXECUTE_REJECTED with a machine-readable code.|
 //+------------------------------------------------------------------+
 bool QpIsRiskIncreasing(const string command_type)
   {
@@ -1426,6 +1451,385 @@ bool QpPreTradeChecks(const string cmd_json, const string command_type,
    return(true);
   }
 
+//+------------------------------------------------------------------+
+//| LIVE execution (slice 3, acceptance C2).                          |
+//| Synchronous CTrade, single attempt - no auto-retry: a lost or      |
+//| ambiguous attempt is re-issued by the cloud under its own policy,  |
+//| and the terminal-level QPCMD_<id> marker turns any redelivery into  |
+//| a DUPLICATE ack (acceptance C3: never a 2nd order for one command).|
+//| Every ack_message carries broker tickets (order=/deal=) so the     |
+//| orders/deals/positions projections can reconcile it (C3).           |
+//+------------------------------------------------------------------+
+string QpRetcodeClass(const uint retcode)
+  {
+   switch(retcode)
+     {
+      case TRADE_RETCODE_REQUOTE:
+      case TRADE_RETCODE_PRICE_CHANGED:
+      case TRADE_RETCODE_PRICE_OFF:
+      case TRADE_RETCODE_TIMEOUT:
+      case TRADE_RETCODE_CONNECTION:
+      case TRADE_RETCODE_TOO_MANY_REQUESTS:
+         return("RETRYABLE");
+      case TRADE_RETCODE_DONE:
+      case TRADE_RETCODE_DONE_PARTIAL:
+      case TRADE_RETCODE_PLACED:
+         return("OK");
+      default:
+         return("FATAL");
+     }
+  }
+
+bool QpLiveOk(const uint retcode)
+  {
+   return(retcode == TRADE_RETCODE_DONE ||
+          retcode == TRADE_RETCODE_DONE_PARTIAL ||
+          retcode == TRADE_RETCODE_PLACED);
+  }
+
+// market orders need a filling mode the broker actually supports -
+// mirrors the C1 chain's OrderCheck request exactly.
+ENUM_ORDER_TYPE_FILLING QpFillingForSymbol(const string symbol, const bool is_pending)
+  {
+   if(is_pending)
+      return(ORDER_FILLING_RETURN);
+   long mask = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   if((mask & SYMBOL_FILLING_FOK) != 0)
+      return(ORDER_FILLING_FOK);
+   if((mask & SYMBOL_FILLING_IOC) != 0)
+      return(ORDER_FILLING_IOC);
+   return(ORDER_FILLING_RETURN);
+  }
+
+// OPEN_MARKET / PLACE_PENDING: the caller already ran the C1 chain.
+void QpExecuteOpenOrPending(const string cmd_json, const string command_id,
+                            const string command_type)
+  {
+   string payload_json;
+   if(!QpJsonExtractObject(cmd_json, "payload", payload_json) || payload_json == "")
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL, "PAYLOAD_MISSING: no payload object");
+      return;
+     }
+   string symbol = QpJsonGetString(payload_json, "symbol");
+   string side = QpJsonGetString(payload_json, "side");
+   double volume = QpJsonGetDouble(payload_json, "volume");
+   double sl = QpJsonGetDouble(payload_json, "stop_loss");
+   double tp = QpJsonGetDouble(payload_json, "take_profit");
+   double price = QpJsonGetDouble(payload_json, "price");
+   string order_kind = QpJsonGetString(payload_json, "order_kind");
+   long deviation = QpJsonGetLong(payload_json, "max_deviation_points");
+   long magic = QpJsonGetLong(payload_json, "magic_number");
+
+   // local fat-finger cap (0 = disabled)
+   if(MaxLiveVolume > 0.0 && volume > MaxLiveVolume + 1e-12)
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                       "VOLUME_ABOVE_LOCAL_CAP: volume " + DoubleToString(volume, 8) +
+                       " > MaxLiveVolume " + DoubleToString(MaxLiveVolume, 8));
+      return;
+     }
+
+   bool is_pending = (command_type == "PLACE_PENDING");
+   ENUM_ORDER_TYPE order_type = ORDER_TYPE_BUY;
+   if(is_pending)
+     {
+      if(!QpOrderKindToType(order_kind, order_type))
+        {
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ, "BAD_ORDER_KIND: " + order_kind);
+         return;
+        }
+     }
+   else
+      order_type = (side == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   g_trade.SetExpertMagicNumber((ulong)magic);
+   g_trade.SetDeviationInPoints((ulong)(deviation > 0 ? deviation : 15));
+   g_trade.SetTypeFilling(QpFillingForSymbol(symbol, is_pending));
+   g_trade.SetAsyncMode(false);
+
+   bool sent = false;
+   if(is_pending)
+      sent = g_trade.OrderOpen(symbol, order_type, volume, 0.0, price, sl, tp,
+                               ORDER_TIME_GTC, 0, "qp-live");
+   else
+     {
+      double ref = (side == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                                   : SymbolInfoDouble(symbol, SYMBOL_BID);
+      sent = g_trade.PositionOpen(symbol, order_type, volume, ref, sl, tp, "qp-live");
+     }
+
+   uint retcode = g_trade.ResultRetcode();
+   string tickets = "order=" + IntegerToString((long)g_trade.ResultOrder()) +
+                    " deal=" + IntegerToString((long)g_trade.ResultDeal());
+   if(sent && QpLiveOk(retcode))
+     {
+      QpLog("INFO", "LIVE " + command_type + " " + command_id + " executed: " + tickets +
+            " price=" + DoubleToString(g_trade.ResultPrice(), 8) +
+            " retcode=" + IntegerToString((int)retcode));
+      QpSendCommandAck(command_id, QP_ACK_EXECUTED,
+                       command_type + " executed: " + tickets +
+                       " price=" + DoubleToString(g_trade.ResultPrice(), 8) +
+                       " volume=" + DoubleToString(g_trade.ResultVolume(), 8) +
+                       " retcode=" + IntegerToString((int)retcode));
+     }
+   else
+     {
+      QpLog("WARN", "LIVE " + command_type + " " + command_id + " failed: " + tickets +
+            " retcode=" + IntegerToString((int)retcode) + " " +
+            g_trade.ResultRetcodeDescription() + " (" + QpRetcodeClass(retcode) + ")");
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "retcode=" + IntegerToString((int)retcode) + " " +
+                       g_trade.ResultRetcodeDescription() +
+                       " (" + QpRetcodeClass(retcode) + "): " + tickets);
+     }
+  }
+
+// MODIFY_POSITION: absent (or zero) sl/tp mean KEEP CURRENT - the command
+// can tighten or move protection, it can never remove it (PRD 13.4).
+void QpExecuteModifyPosition(const string payload_json, const string command_id)
+  {
+   if(payload_json == "")
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL, "PAYLOAD_MISSING: no payload object");
+      return;
+     }
+   ulong ticket = (ulong)StringToInteger(QpJsonGetString(payload_json, "position_ticket"));
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "POSITION_NOT_FOUND: " + QpJsonGetString(payload_json, "position_ticket"));
+      return;
+     }
+   double new_sl = QpJsonGetDouble(payload_json, "sl");  // 0 = absent -> keep
+   double new_tp = QpJsonGetDouble(payload_json, "tp"); // 0 = absent -> keep
+   double cur_sl = PositionGetDouble(POSITION_SL);
+   double cur_tp = PositionGetDouble(POSITION_TP);
+   bool is_buy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+   string symbol = PositionGetString(POSITION_SYMBOL);
+
+   if(new_sl == 0.0)
+      new_sl = cur_sl;
+   if(new_tp == 0.0)
+      new_tp = cur_tp;
+   if(new_sl == cur_sl && new_tp == cur_tp)
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                       "NO_CHANGE: effective sl/tp equal the current ones");
+      return;
+     }
+
+   // side sanity + stops distance against the live market (C1-style)
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double ref = is_buy ? SymbolInfoDouble(symbol, SYMBOL_BID)
+                       : SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double dist = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+   if(new_sl != 0.0)
+     {
+      if(is_buy ? (new_sl >= ref) : (new_sl <= ref))
+        {
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                          "SL_WRONG_SIDE: stop_loss must sit " +
+                          (is_buy ? "below" : "above") + " the market");
+         return;
+        }
+      if(dist > 0.0 && MathAbs(ref - new_sl) < dist)
+        {
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                          "SL_TOO_CLOSE: |ref - SL| < stops_level " + DoubleToString(dist, 8));
+         return;
+        }
+     }
+   if(new_tp != 0.0)
+     {
+      if(is_buy ? (new_tp <= ref) : (new_tp >= ref))
+        {
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                          "TP_WRONG_SIDE: take_profit must sit " +
+                          (is_buy ? "above" : "below") + " the market");
+         return;
+        }
+      if(dist > 0.0 && MathAbs(new_tp - ref) < dist)
+        {
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                          "TP_TOO_CLOSE: |TP - ref| < stops_level " + DoubleToString(dist, 8));
+         return;
+        }
+     }
+
+   bool sent = g_trade.PositionModify(ticket, new_sl, new_tp);
+   uint retcode = g_trade.ResultRetcode();
+   if(sent && QpLiveOk(retcode))
+     {
+      QpLog("INFO", "LIVE MODIFY_POSITION " + command_id + " executed: position=" +
+            IntegerToString((long)ticket) + " sl=" + DoubleToString(new_sl, 8) +
+            " tp=" + DoubleToString(new_tp, 8));
+      QpSendCommandAck(command_id, QP_ACK_EXECUTED,
+                       "MODIFY_POSITION executed: position=" + IntegerToString((long)ticket) +
+                       " sl=" + DoubleToString(new_sl, 8) +
+                       " tp=" + DoubleToString(new_tp, 8) +
+                       " retcode=" + IntegerToString((int)retcode));
+     }
+   else
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "retcode=" + IntegerToString((int)retcode) + " " +
+                       g_trade.ResultRetcodeDescription() +
+                       " (" + QpRetcodeClass(retcode) + "): position=" +
+                       IntegerToString((long)ticket));
+     }
+  }
+
+// CLOSE_POSITION: absent volume = full close; present volume = partial.
+void QpExecuteClosePosition(const string payload_json, const string command_id)
+  {
+   if(payload_json == "")
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL, "PAYLOAD_MISSING: no payload object");
+      return;
+     }
+   ulong ticket = (ulong)StringToInteger(QpJsonGetString(payload_json, "position_ticket"));
+   double volume = QpJsonGetDouble(payload_json, "volume"); // 0 = full close
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "POSITION_NOT_FOUND: " + QpJsonGetString(payload_json, "position_ticket"));
+      return;
+     }
+   string symbol = PositionGetString(POSITION_SYMBOL);
+   double pos_volume = PositionGetDouble(POSITION_VOLUME);
+
+   g_trade.SetDeviationInPoints(15);
+   g_trade.SetAsyncMode(false);
+
+   bool sent = false;
+   bool partial = false;
+   if(volume <= 0.0 || volume >= pos_volume - 1e-12)
+      sent = g_trade.PositionClose(ticket);
+   else
+     {
+      double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      if(step > 1e-12 && MathAbs(volume / step - MathRound(volume / step)) > 1e-4)
+        {
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ,
+                          "VOLUME_STEP: close volume " + DoubleToString(volume, 8) +
+                          " is not a multiple of step " + DoubleToString(step, 8));
+         return;
+        }
+      partial = true;
+      sent = g_trade.PositionClosePartial(ticket, volume);
+     }
+
+   uint retcode = g_trade.ResultRetcode();
+   if(sent && QpLiveOk(retcode))
+     {
+      double closed = partial ? volume : pos_volume;
+      double remaining = partial ? (pos_volume - volume) : 0.0;
+      QpLog("INFO", "LIVE CLOSE_POSITION " + command_id + " executed (" +
+            (partial ? "partial" : "full") + "): position=" + IntegerToString((long)ticket));
+      QpSendCommandAck(command_id, QP_ACK_EXECUTED,
+                       "CLOSE_POSITION executed (" + (partial ? "partial" : "full") +
+                       "): position=" + IntegerToString((long)ticket) +
+                       " closed=" + DoubleToString(closed, 8) +
+                       " remaining=" + DoubleToString(remaining, 8) +
+                       " deal=" + IntegerToString((long)g_trade.ResultDeal()) +
+                       " retcode=" + IntegerToString((int)retcode));
+     }
+   else
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "retcode=" + IntegerToString((int)retcode) + " " +
+                       g_trade.ResultRetcodeDescription() +
+                       " (" + QpRetcodeClass(retcode) + "): position=" +
+                       IntegerToString((long)ticket));
+     }
+  }
+
+// CANCEL_ORDER: delete a live pending order by ticket.
+void QpExecuteCancelOrder(const string payload_json, const string command_id)
+  {
+   if(payload_json == "")
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL, "PAYLOAD_MISSING: no payload object");
+      return;
+     }
+   ulong ticket = (ulong)StringToInteger(QpJsonGetString(payload_json, "order_ticket"));
+   if(ticket == 0 || !OrderSelect(ticket))
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "ORDER_NOT_FOUND: " + QpJsonGetString(payload_json, "order_ticket"));
+      return;
+     }
+   bool sent = g_trade.OrderDelete(ticket);
+   uint retcode = g_trade.ResultRetcode();
+   if(sent && QpLiveOk(retcode))
+     {
+      QpLog("INFO", "LIVE CANCEL_ORDER " + command_id + " executed: order=" +
+            IntegerToString((long)ticket));
+      QpSendCommandAck(command_id, QP_ACK_EXECUTED,
+                       "CANCEL_ORDER executed: order=" + IntegerToString((long)ticket) +
+                       " retcode=" + IntegerToString((int)retcode));
+     }
+   else
+     {
+      QpSendCommandAck(command_id, QP_ACK_EXECUTE_FAIL,
+                       "retcode=" + IntegerToString((int)retcode) + " " +
+                       g_trade.ResultRetcodeDescription() +
+                       " (" + QpRetcodeClass(retcode) + "): order=" +
+                       IntegerToString((long)ticket));
+     }
+  }
+
+// LIVE dispatch (acceptance C2). Hard guards first, then per-type paths.
+void QpExecuteCommand(const string cmd_json, const string command_id,
+                      const string command_type)
+  {
+   // hard guard: live execution ONLY on DEMO accounts, whatever the inputs
+   // say - a REAL/CONTEST account never sees an OrderSend from this EA
+   long acc_mode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(acc_mode != ACCOUNT_TRADE_MODE_DEMO)
+     {
+      QpLog("ERROR", "LIVE " + command_type + " " + command_id +
+            " refused: account mode is " + QpAccountModeLabel(acc_mode) + ", not DEMO");
+      QpSendCommandAck(command_id, QP_ACK_NOT_DEMO,
+                       "LiveTrading requires a DEMO account; account mode is " +
+                       QpAccountModeLabel(acc_mode));
+      return;
+     }
+
+   // risk-increasing types: the SAME C1 chain gates live execution
+   if(QpIsRiskIncreasing(command_type))
+     {
+      string code = "", detail = "";
+      if(!QpPreTradeChecks(cmd_json, command_type, code, detail))
+        {
+         QpLog("WARN", "LIVE " + command_type + " " + command_id +
+               " rejected by pre-trade checks: " + code + " - " + detail);
+         QpSendCommandAck(command_id, QP_ACK_EXECUTE_REJ, code + ": " + detail);
+         return;
+        }
+      QpExecuteOpenOrPending(cmd_json, command_id, command_type);
+      return;
+     }
+
+   string payload_json;
+   bool has_payload = QpJsonExtractObject(cmd_json, "payload", payload_json);
+
+   if(command_type == "MODIFY_POSITION")
+      QpExecuteModifyPosition(has_payload ? payload_json : "", command_id);
+   else if(command_type == "CLOSE_POSITION")
+      QpExecuteClosePosition(has_payload ? payload_json : "", command_id);
+   else if(command_type == "CANCEL_ORDER")
+      QpExecuteCancelOrder(has_payload ? payload_json : "", command_id);
+   else
+     {
+      // STOP_NEW_RISK / RECONCILE are cloud-side policies with no terminal
+      // trade action - receipt-only, as in every mode
+      QpSendCommandAck(command_id, QP_ACK_OBSERVE_ONLY,
+                       "cloud-side policy command; no terminal action (" + command_type + ")");
+     }
+  }
+
 void QpHandleCommand(const string cmd_json)
   {
    string command_id   = QpJsonGetString(cmd_json, "command_id");
@@ -1477,6 +1881,16 @@ void QpHandleCommand(const string cmd_json)
                " rejected: " + code + " - " + detail);
          QpSendCommandAck(command_id, QP_ACK_DRY_RUN_REJECT, code + ": " + detail);
         }
+      return;
+     }
+
+   // slice 3 LIVE (acceptance C2): DryRunMode=false AND LiveTrading=true;
+   // the DEMO-account hard guard lives inside QpExecuteCommand. The
+   // DryRunMode branch above short-circuits first, so DryRunMode=true can
+   // NEVER reach this path.
+   if(!DryRunMode && LiveTrading)
+     {
+      QpExecuteCommand(cmd_json, command_id, command_type);
       return;
      }
 
@@ -1740,8 +2154,8 @@ void QpSendShutdown(const string reason)
 int OnInit()
   {
    QpLog("INFO", "QuantPilotBridge " + QP_EA_VERSION +
-         " starting (OBSERVE_ONLY telemetry; DryRunMode=" +
-         (DryRunMode ? "true" : "false") + ")");
+         " starting (telemetry; DryRunMode=" + (DryRunMode ? "true" : "false") +
+         "; LiveTrading=" + (LiveTrading ? "true" : "false") + ")");
 
    // --- safety gates before any network activity ---
    if(AgentToken == "")
@@ -1771,6 +2185,22 @@ int OnInit()
       QpLog("ERROR", "MaxSpreadPoints must be >= 0");
       return(INIT_PARAMETERS_INCORRECT);
      }
+   if(MaxLiveVolume < 0.0)
+     {
+      QpLog("ERROR", "MaxLiveVolume must be >= 0 (0 disables the local cap)");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(LiveTrading && DryRunMode)
+      QpLog("WARN", "DryRunMode=true takes precedence: NO real orders will be sent");
+   if(LiveTrading)
+     {
+      long init_mode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+      if(init_mode == ACCOUNT_TRADE_MODE_DEMO)
+         QpLog("INFO", "LiveTrading armed on a DEMO account: real CTrade execution enabled (C2)");
+      else
+         QpLog("ERROR", "LiveTrading=true on a " + QpAccountModeLabel(init_mode) +
+               " account: every live command will be refused (LIVE_REFUSED_NOT_DEMO)");
+     }
    if(BarHistoryCount < 50 || BarHistoryCount > 2000)
      {
       QpLog("ERROR", "BarHistoryCount must be within 50..2000");
@@ -1778,6 +2208,11 @@ int OnInit()
      }
    if(!QpInitBarTimeframes())
       return(INIT_PARAMETERS_INCORRECT);
+
+   // synchronous CTrade, quiet journal; the live path configures the rest
+   // (magic/deviation/filling) per command
+   g_trade.LogLevel(LOG_LEVEL_ERRORS);
+   g_trade.SetAsyncMode(false);
 
    EventSetTimer(HeartbeatSeconds);
 
@@ -1869,7 +2304,7 @@ void OnTimer()
          g_last_config_at = TimeGMT();
      }
 
-   // command channel poll (OBSERVE_ONLY / DRY_RUN acks, never execution - PRD 21.3)
+   // command channel poll (OBSERVE_ONLY / DRY_RUN / LIVE(demo) per inputs - PRD 21.3)
    if(g_last_command_at == 0 || TimeGMT() - g_last_command_at >= CommandPollSeconds)
      {
       if(QpPollCommands())

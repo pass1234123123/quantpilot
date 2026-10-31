@@ -398,8 +398,11 @@ class NodeHeartbeatRequest(BaseModel):
 # Trade command channel (PRD 13.3/13.4/13.5, ADR-004) - slice 1
 # ==========================================================================
 # Slice-1 semantics: the channel is durable + idempotent + reconcilable, but
-# the EA only ACKS receipt (OBSERVE_ONLY) - no execution exists anywhere yet
-# (PRD 21.3). risk_profile_version / symbol_spec_hash / signature are
+# the EA ACKS with a free ack_code string: OBSERVE_ONLY_ACK (receipt only,
+# the default), DRY_RUN_* (pre-trade checks, no order) or the live-execution
+# codes EXECUTED / EXECUTE_FAILED / EXECUTE_REJECTED / LIVE_REFUSED_NOT_DEMO
+# (slice 3, DEMO accounts only behind the EA's LiveTrading input; PRD 21.3).
+# risk_profile_version / symbol_spec_hash / signature are
 # slice-2 (risk-engine gate) fields and intentionally NOT accepted here.
 
 
@@ -553,10 +556,11 @@ class EaCommandPollRequest(BaseModel):
 class EaCommandAckData(BaseModel):
     """POST /ea/v1/commands/ack body (EA -> agent) and ea.command_ack data.
 
-    OBSERVE_ONLY slice: this ack certifies RECEIPT only, never execution
-    (PRD 21.3). ack_code stays a free string (<= 64 chars): OBSERVE_ONLY_ACK |
-    DUPLICATE | EXPIRED | DRY_RUN_PASSED | DRY_RUN_REJECTED (slice 2
-    dry-run pre-trade checks; still receipt-only, no execution).
+    ack_code stays a free string (<= 64 chars): OBSERVE_ONLY_ACK |
+    DUPLICATE | EXPIRED | DRY_RUN_PASSED | DRY_RUN_REJECTED (dry-run
+    pre-trade checks, no execution) | EXECUTED | EXECUTE_FAILED |
+    EXECUTE_REJECTED | LIVE_REFUSED_NOT_DEMO (slice 3 live execution on
+    DEMO accounts only, behind the EA's LiveTrading input; PRD 21.3).
     """
 
     model_config = StrictModel
