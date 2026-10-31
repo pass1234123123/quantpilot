@@ -1421,6 +1421,77 @@ def account_bars(
 
 
 # --------------------------------------------------------------------------
+# AI analysis engine (PRD 8, ADVISORY-only in the first release)
+# --------------------------------------------------------------------------
+
+class AiAnalyzeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    broker_symbol: str
+    timeframe: str
+
+
+@app.get("/api/v1/accounts/{account_id}/ai/analyses")
+def account_ai_analyses(
+    account_id: str,
+    request: Request,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    limit: int = 100,
+) -> JSONResponse:
+    """Advisory AI analyses for the account (doc 8.4 structure inside
+    output_json), newest first."""
+    account_uuid = _account_or_404(account_id)
+    limit = max(1, min(limit, 500))
+    where = ["a.account_id = %s"]
+    params: list = [account_uuid]
+    if symbol is not None:
+        where.append("a.broker_symbol = %s")
+        params.append(symbol)
+    if timeframe is not None:
+        if timeframe not in _TIMEFRAMES:
+            raise HTTPException(400, f"timeframe must be one of {_TIMEFRAMES}")
+        where.append("a.timeframe = %s")
+        params.append(timeframe)
+    rows = db.query(
+        f"""
+        SELECT a.id::text AS id, a.analysis_id::text AS analysis_id,
+               a.account_id::text AS account_id, a.broker_symbol, a.timeframe,
+               a.model_provider, a.model_id, a.prompt_version, a.input_hash,
+               a.output_json, a.source_bar_time, a.created_at, a.expires_at,
+               a.duration_ms
+          FROM ai_analyses a
+         WHERE {' AND '.join(where)}
+         ORDER BY a.created_at DESC
+         LIMIT %s
+        """,
+        (*params, limit),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.post("/api/v1/accounts/{account_id}/ai/analyze")
+def ai_analyze(account_id: str, body: AiAnalyzeRequest, request: Request) -> JSONResponse:
+    """Trigger one analysis on the newest closed bar (manual / UI / testing).
+
+    Idempotent: re-analyzing the same feature snapshot returns the stored
+    row. With the account AI mode OFF (doc 8.5) no analysis runs and the
+    response carries ai_mode=OFF.
+    """
+    _account_or_404(account_id)
+    if body.timeframe not in _TIMEFRAMES:
+        raise HTTPException(400, f"timeframe must be one of {_TIMEFRAMES}")
+    from . import ai_engine
+
+    mode, analysis, error = ai_engine.analyze_on_demand(
+        account_id, body.broker_symbol, body.timeframe
+    )
+    if error is not None:
+        raise HTTPException(404, error)
+    return ok({"ai_mode": mode, "analysis": analysis}, request)
+
+
+# --------------------------------------------------------------------------
 # error handling
 # --------------------------------------------------------------------------
 

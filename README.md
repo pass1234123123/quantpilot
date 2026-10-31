@@ -22,6 +22,10 @@ EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL �
   重同步幂等）→ 无状态窗口重放评估 → `strategy_signals`（边沿触发，UNIQUE 去重，
   doc 7.5）；首批 3 策略 ma_cross / rsi_momentum / trend_following；坏 bar 跳过并
   发 `ea.bars_dropped` 防重投死循环；实例绑定固定版本 + config_revision 只增（doc 7.6）
+- AI 分析引擎（PRD 8）：统计特征版 Market Regime（ATR/波动率比、Wilder ADX、
+  EMA20/50 → TREND_UP/TREND_DOWN/RANGE/HIGH_VOL/UNKNOWN）+ Strategy Evaluator
+  适用评分；`ai_analyses` 落库严格 doc 8.4 结构；input_hash 幂等（重投不重复）；
+  首版仅 OFF / ADVISORY 模式（8.5），分析仅展示、永不改变交易许可（8.1）
 
 ## 目录结构
 
@@ -121,6 +125,21 @@ bar 投影；毒 bar（OHLC 越界）跳过并发 `ea.bars_dropped` 防无限重
 
 EA 侧 v1.5.0 新增输入：`BarTimeframes`（默认 `M15,H1`，PRD 22.2）、
 `BarHistoryCount`（默认 500，首次上线回填历史 bar 数）。
+
+## AI 分析引擎（本阶段）
+
+- `GET /api/v1/accounts/{id}/ai/analyses`：分析查询（symbol / timeframe 过滤，
+  doc 8.4 结构在 `output_json`，最新在前）
+- `POST /api/v1/accounts/{id}/ai/analyze`：在最新收盘 bar 上手动触发一次分析
+  （幂等：同特征快照返回已有行；账户 ai.mode=OFF 时返回 `ai_mode=OFF` 不执行）
+
+首版 provider 为确定性统计分类器 `statistical-regime/regime-rules-v1`（无 LLM 调用，
+成本记 0，doc 8.6 治理字段齐全：provider/model/prompt_version/input_hash/耗时/成本）。
+触发时机与策略评估相同——收盘 bar 落库后（doc 8.6：LLM 不按 tick 调用；首版无 LLM
+但保持同一节流节奏）。账户配置 `ai.mode`（`risk_profiles.config_json` 第四段，默认
+`ADVISORY`，doc 8.5）：`OFF` = 完全不分析（AI 故障回退位），`ADVISORY` = 仅展示。
+分析失败仅记 system event（`ai.analysis_failed`），不阻塞 bar 投影。FILTER /
+REGIME_ROUTING 模式待验证后启用；信号→分析→风控→命令的接线在后续切片。
 
 数据库变更（如换库）：
 

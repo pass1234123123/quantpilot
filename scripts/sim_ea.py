@@ -798,6 +798,82 @@ def main() -> int:
         if not bars_ok:
             failures += 1
 
+        # 14. AI analysis engine (PRD 8, ADVISORY first release): manual
+        # trigger on the newest closed bar, strict doc-8.4 shape, the V-path
+        # tail classifies HIGH_VOL (ATR/close 0.00205 > 0.0015), input_hash
+        # idempotency and the OFF fallback (8.5). Analyses never touch trade
+        # permission (8.1/8.5) - no command wiring here.
+        r1 = client.post(f"{API}/api/v1/accounts/{account_id}/ai/analyze",
+                        json={"broker_symbol": "EURUSD", "timeframe": "M15"})
+        d1 = r1.json().get("data") or {}
+        analysis = d1.get("analysis") or {}
+        scores = {s["strategy_id"]: s for s in analysis.get("strategy_scores", [])}
+        ma_sc, tf_sc = scores.get("ma_cross", {}), scores.get("trend_following", {})
+        shape_ok = (
+            r1.status_code == 200
+            and d1.get("ai_mode") == "ADVISORY"
+            and analysis.get("model_provider") == "statistical-regime"
+            and analysis.get("model_id") == "regime-rules-v1"
+            and analysis.get("prompt_version") == "market-eval-v1"
+            and analysis.get("market_regime") == "HIGH_VOL"
+            and 0.5 <= float(analysis.get("regime_confidence", 0)) <= 1
+            and analysis.get("signal_decision") == "REVIEW"
+            and analysis.get("risk_flags") == ["VOLATILITY_ELEVATED"]
+            and str(analysis.get("input_snapshot_id", "")).startswith("sha256:")
+            and analysis.get("source_bar_time") == sim_bars[134]["bar_time"]
+            and analysis.get("cost") == "0"
+        )
+        print(f"[ai] manual analyze: {'OK' if shape_ok else 'FAIL'} "
+              f"regime={analysis.get('market_regime')} "
+              f"conf={analysis.get('regime_confidence')} @{analysis.get('source_bar_time')}")
+        if not shape_ok:
+            failures += 1
+
+        # scores cover the two M15 instances only (rsi_momentum is M30, no bars)
+        score_ok = (
+            ma_sc.get("score") == 0.30 and ma_sc.get("reason_codes") == ["VOLATILITY_ELEVATED"]
+            and tf_sc.get("score") == 0.35 and tf_sc.get("reason_codes") == ["VOLATILITY_ELEVATED"]
+            and "rsi_momentum" not in scores
+        )
+        print(f"[ai] strategy scores: {'OK' if score_ok else 'FAIL'} "
+              f"ma={ma_sc.get('score')} tf={tf_sc.get('score')}")
+        if not score_ok:
+            failures += 1
+
+        # 14b. input-hash idempotency: same snapshot -> no new row
+        before = client.get(f"{API}/api/v1/accounts/{account_id}/ai/analyses",
+                            params={"symbol": "EURUSD", "timeframe": "M15",
+                                    "limit": 500}).json()["data"]
+        client.post(f"{API}/api/v1/accounts/{account_id}/ai/analyze",
+                   json={"broker_symbol": "EURUSD", "timeframe": "M15"})
+        after = client.get(f"{API}/api/v1/accounts/{account_id}/ai/analyses",
+                           params={"symbol": "EURUSD", "timeframe": "M15",
+                                   "limit": 500}).json()["data"]
+        dup_ok = len(before) >= 1 and len(after) == len(before)
+        print(f"[ai] redelivery dedup: {'OK' if dup_ok else 'FAIL'} "
+              f"{len(before)} -> {len(after)}")
+        if not dup_ok:
+            failures += 1
+
+        # 14c. OFF mode (8.5): no analysis runs; config PUT restores ADVISORY
+        cfg = client.get(f"{API}/api/v1/accounts/{account_id}/config").json()["data"]
+        doc = cfg["config"]
+        doc["ai"] = {"mode": "OFF"}
+        client.put(f"{API}/api/v1/accounts/{account_id}/config", json=doc)
+        r2 = client.post(f"{API}/api/v1/accounts/{account_id}/ai/analyze",
+                        json={"broker_symbol": "EURUSD", "timeframe": "M15"})
+        d2 = r2.json().get("data") or {}
+        off_ok = r2.status_code == 200 and d2.get("ai_mode") == "OFF" and d2.get("analysis") is None
+        print(f"[ai] mode OFF: {'OK' if off_ok else 'FAIL'} "
+              f"mode={d2.get('ai_mode')} analysis={d2.get('analysis')}")
+        if not off_ok:
+            failures += 1
+        doc["ai"] = {"mode": "ADVISORY"}
+        restored = client.put(f"{API}/api/v1/accounts/{account_id}/config", json=doc)
+        print(f"[ai] mode ADVISORY restored: {'OK' if restored.status_code == 200 else 'FAIL'}")
+        if restored.status_code != 200:
+            failures += 1
+
     print(f"\nagent-side failures: {failures}")
     return failures
 

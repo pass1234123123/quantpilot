@@ -50,6 +50,7 @@ TABLES = [
     "strategy_versions",
     "strategy_instances",
     "strategy_signals",
+    "ai_analyses",
     "system_events",
 ]
 
@@ -295,6 +296,34 @@ def main() -> int:
         check("api.bars", len(bars_data) == 135 and ordered,
               f"status={bars.status_code} count={len(bars_data)} oldest_first={ordered}")
 
+        # ---- AI analysis engine (PRD 8, ADVISORY): analyses are advisory ----
+        # display artifacts: strict doc-8.4 shape inside output_json, the OFF
+        # fallback is configured but the run mode restored to ADVISORY
+        analyses = client.get(f"{API}/api/v1/accounts/{sim_id}/ai/analyses",
+                              params={"symbol": "EURUSD", "timeframe": "M15",
+                                      "limit": 10}).json().get("data", [])
+        newest_doc = (analyses[0].get("output_json") if analyses else {}) or {}
+        check("api.ai_analyses",
+              bool(analyses)
+              and newest_doc.get("market_regime") in
+                  ("TREND_UP", "TREND_DOWN", "RANGE", "HIGH_VOL", "UNKNOWN")
+              and 0 <= float(newest_doc.get("regime_confidence", -1)) <= 1
+              and newest_doc.get("model_provider") == "statistical-regime"
+              and newest_doc.get("signal_decision") in ("ALLOW", "REVIEW")
+              and isinstance(newest_doc.get("strategy_scores"), list)
+              and str(newest_doc.get("input_snapshot_id", "")).startswith("sha256:"),
+              f"count={len(analyses)} regime={newest_doc.get('market_regime')}")
+        if analyses:
+            print(f"       analysis: regime={newest_doc.get('market_regime')} "
+                  f"decision={newest_doc.get('signal_decision')} "
+                  f"conf={newest_doc.get('regime_confidence')}")
+
+        ai_cfg = client.get(f"{API}/api/v1/accounts/{sim_id}/config").json()["data"]["config"]
+        check("api.ai_mode_advisory",
+              (ai_cfg.get("ai") or {}).get("mode") == "ADVISORY",
+              f"mode={(ai_cfg.get('ai') or {}).get('mode')}")
+
+
         # ---- risk engine (slice 2, PRD 9): stop states + gate audit -------
         st = client.get(f"{API}/api/v1/risk/state")
         st_data = st.json().get("data") or {}
@@ -458,6 +487,27 @@ def main() -> int:
             "SELECT count(*) FROM system_events WHERE event_type = 'ea.bars_dropped'"
         ).fetchone()[0]
         check("pg.bars_dropped_event", dropped >= 1, f"events={dropped}")
+
+        # ---- 6. AI engine invariants (PRD 8): input-hash idempotency + FKs --
+        dup_analyses = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT account_id, broker_symbol, timeframe, input_hash FROM ai_analyses
+                 GROUP BY account_id, broker_symbol, timeframe, input_hash HAVING count(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+        check("pg.ai_analyses_dedup", dup_analyses == 0, f"duplicates={dup_analyses}")
+
+        orphan_analyses = conn.execute(
+            """
+            SELECT count(*) FROM ai_analyses a
+             LEFT JOIN trading_accounts t ON t.id = a.account_id
+             WHERE t.id IS NULL
+            """
+        ).fetchone()[0]
+        check("pg.ai_analyses_have_accounts", orphan_analyses == 0,
+              f"orphans={orphan_analyses}")
 
     return finish()
 

@@ -94,9 +94,24 @@ class RiskLimitsConfig(BaseModel):
     _pct = field_validator("min_margin_level")(_percent)
 
 
+class AiConfig(BaseModel):
+    """AI run modes (doc 8.5).
+
+    First release supports OFF / ADVISORY only: ADVISORY analyses are display
+    artifacts that never change trade permission; OFF is the required
+    fallback (AI trouble -> run without AI). FILTER / REGIME_ROUTING come
+    after validation, AUTONOMOUS_RESEARCH is out of scope for now.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["OFF", "ADVISORY"] = "ADVISORY"
+
+
 class AccountConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
     expert: ExpertConfig = Field(default_factory=ExpertConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
+    ai: AiConfig = Field(default_factory=AiConfig)

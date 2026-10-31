@@ -831,6 +831,26 @@ def handle_bars(data: dict[str, Any]) -> None:
     newest = max(valid, key=lambda bar: bar[0])
     strategy_engine.evaluate_newest_bar(account_id, broker_symbol, timeframe, newest[0])
 
+    # AI analysis (PRD 8): same bar-close trigger (doc 8.6, never per-tick).
+    # Analyses are advisory display artifacts (doc 8.5 ADVISORY), so a failure
+    # here is logged + isolated - it must never stall the bars projection.
+    try:
+        from . import ai_engine
+
+        ai_engine.analyze_newest_bar(account_id, broker_symbol, timeframe, newest[0])
+    except Exception as exc:
+        add_system_event(
+            source="api-consumer",
+            event_type="ai.analysis_failed",
+            severity="WARN",
+            payload={
+                "account_id": account_id,
+                "broker_symbol": broker_symbol,
+                "timeframe": timeframe,
+                "error": str(exc),
+            },
+        )
+
 
 HANDLERS = {
     "ea.registered": handle_registered,
