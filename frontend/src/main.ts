@@ -7,10 +7,16 @@ import 'element-plus/theme-chalk/dark/css-vars.css'
 import '@element-plus/icons-vue'
 import './styles.css'
 import App from './App.vue'
+import { initSecureStore } from './secure-store'
 
 document.documentElement.classList.add('dark')
 
 const app = createApp(App)
 app.use(createPinia())
 app.use(ElementPlus, { locale: zhCn })
-app.mount('#app')
+// mount only after the credential cache is warm (desktop: OS credential
+// store; browser: localStorage); on failure we still mount - the user can
+// re-enter the key in Settings
+initSecureStore()
+  .catch(() => {})
+  .finally(() => app.mount('#app'))

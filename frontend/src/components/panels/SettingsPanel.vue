@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
 import { api, type AuthUser } from '../../api'
+import { clearApiKey, getApiKey, setApiKey } from '../../secure-store'
 
 const store = useDashboardStore()
 
@@ -14,21 +15,31 @@ const account = computed(() => store.selectedAccount)
 const snap = computed(() => store.snapshot)
 
 // 桌面连接（Tauri 生产模式无 Vite 代理，需直连 API 并自带密钥）
+// API Key 存于系统凭据管理器（secure-store），不再写 localStorage
 const connBase = ref(localStorage.getItem('qp.apiBase') ?? '')
-const connKey = ref(localStorage.getItem('qp.apiKey') ?? '')
+const connKey = ref(getApiKey())
 const connTesting = ref(false)
 const connResult = ref<'' | 'ok' | 'fail'>('')
 const connError = ref('')
 
-function saveConn() {
+async function saveConn() {
   localStorage.setItem('qp.apiBase', connBase.value.trim())
-  localStorage.setItem('qp.apiKey', connKey.value.trim())
-  connResult.value = ''
+  try {
+    await setApiKey(connKey.value)
+    connResult.value = ''
+  } catch (e) {
+    connResult.value = 'fail'
+    connError.value = e instanceof Error ? e.message : String(e)
+  }
 }
 
-function clearConn() {
+async function clearConn() {
   localStorage.removeItem('qp.apiBase')
-  localStorage.removeItem('qp.apiKey')
+  try {
+    await clearApiKey()
+  } catch {
+    // credential already gone - treat as cleared
+  }
   connBase.value = ''
   connKey.value = ''
   connResult.value = ''
@@ -176,7 +187,7 @@ function doLogout() {
       </div>
       <div class="settings__note">
         <p>· 开发模式（Vite 代理）无需配置：代理自动注入 X-API-Key，保持相对路径即可。</p>
-        <p>· 桌面安装版没有代理：请配置 API 地址与密钥（存于本机 localStorage），保存后立即生效并直连云端。</p>
+        <p>· 桌面安装版没有代理：请配置 API 地址与密钥。密钥保存进系统凭据管理器（Windows 凭据管理器），不落 localStorage 与磁盘明文。</p>
       </div>
     </div>
 

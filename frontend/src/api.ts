@@ -1,6 +1,8 @@
 /** Cloud API client (dev via Vite proxy -> http://127.0.0.1:8000).
  *  All responses use the unified envelope {data, error, request_id, timestamp}. */
 
+import { getApiKey } from './secure-store'
+
 export interface ApiEnvelope<T> {
   data: T
   error: { code: string; message: string } | null
@@ -507,7 +509,9 @@ function withBase(path: string): string {
 }
 
 function apiKeyHeaders(): Record<string, string> {
-  const key = localStorage.getItem('qp.apiKey') ?? ''
+  // r3-secure: key comes from the OS credential store cache in desktop
+  // builds (see secure-store.ts); localStorage only in plain browser dev
+  const key = getApiKey()
   return key ? { 'X-API-Key': key } : {}
 }
 
