@@ -554,7 +554,9 @@ class EaCommandAckData(BaseModel):
     """POST /ea/v1/commands/ack body (EA -> agent) and ea.command_ack data.
 
     OBSERVE_ONLY slice: this ack certifies RECEIPT only, never execution
-    (PRD 21.3). ack_code: OBSERVE_ONLY_ACK | DUPLICATE | EXPIRED.
+    (PRD 21.3). ack_code stays a free string (<= 64 chars): OBSERVE_ONLY_ACK |
+    DUPLICATE | EXPIRED | DRY_RUN_PASSED | DRY_RUN_REJECTED (slice 2
+    dry-run pre-trade checks; still receipt-only, no execution).
     """
 
     model_config = StrictModel

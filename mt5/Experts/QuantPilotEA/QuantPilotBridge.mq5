@@ -15,7 +15,8 @@
 //|   - polls the cloud-side account config every 60s and LOGS it    |
 //|     (informational only - it is never applied, OBSERVE_ONLY)     |
 //|   - polls the cloud command channel and ACKS each command         |
-//|     (slice 1: receipt only, NEVER execution - PRD 21.3)           |
+//|     (slice 1 receipt-only acks; slice 2 optional DRY_RUN           |
+//|     pre-trade checks - NEVER real execution - PRD 21.3)            |
 //|   - sends a shutdown note on removal                             |
 //|                                                                   |
 //| Command channel, slice 1 (PRD 13.5 + AT-005/AT-006):            |
@@ -26,11 +27,18 @@
 //|     recently_acked echo on the next poll (AT-006)                 |
 //|   - duplicate commands get ack_code=DUPLICATE, no side effects    |
 //|   - commands past expires_at get ack_code=EXPIRED                 |
+//|   - slice 2 DRY_RUN (PRD 13.5 / C1): with DryRunMode=true, risk-   |
+//|     increasing commands (OPEN_MARKET / PLACE_PENDING) run the      |
+//|     full pre-trade check chain (trade mode, spread, volume, SL/TP  |
+//|     distance, pending price, session + OrderCheck oracle) and    |
+//|     ack DRY_RUN_PASSED / DRY_RUN_REJECTED - NO order is ever sent |
 //|   - everything else gets ack_code=OBSERVE_ONLY_ACK - the payload  |
 //|     is logged and NOT executed                                    |
 //|                                                                   |
 //| What it MUST NOT contain (PRD 21.3):                             |
-//|   - no OrderSend / OrderCheck / CTrade / any order execution      |
+//|   - no OrderSend / CTrade / any real order execution - EVER;      |
+//|     DRY_RUN uses OrderCheck() purely as a validation oracle      |
+//|     (it places nothing, slice 2)                                  |
 //|   - no position modification, no risk limits, no trading logic    |
 //|   - it never acts on responses other than logging / acking them   |
 //|                                                                   |
@@ -39,12 +47,12 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.50"
+#property version   "1.60"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.5.0"
+#define QP_EA_VERSION        "1.6.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
@@ -59,6 +67,8 @@
 #define QP_ACK_OBSERVE_ONLY   "OBSERVE_ONLY_ACK"
 #define QP_ACK_DUPLICATE      "DUPLICATE"
 #define QP_ACK_EXPIRED        "EXPIRED"
+#define QP_ACK_DRY_RUN_PASS   "DRY_RUN_PASSED"
+#define QP_ACK_DRY_RUN_REJECT "DRY_RUN_REJECTED"
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
@@ -67,6 +77,8 @@ input int    HeartbeatSeconds = 10;                     // Heartbeat interval, 5
 input int    MaxSymbols       = 100;                    // Max Market Watch symbols to report
 input int    CalendarWindowHours = 48;                  // Economic calendar lookahead (hours)
 input int    CommandPollSeconds = 5;                    // Command poll interval, 1..120s
+input bool   DryRunMode       = false;                  // DRY_RUN: pre-trade checks only, never execute (PRD 13.5 / C1)
+input int    MaxSpreadPoints  = 0;                      // DRY_RUN: max allowed spread in points (0 = no spread check)
 input string BarTimeframes   = "M15,H1";                // Closed-bar timeframes: M5/M15/M30/H1/H4 (PRD 22.2)
 input int    BarHistoryCount = 500;                     // Initial closed-bar backfill per timeframe, 50..2000
 input string LogLevel         = "INFO";                 // DEBUG | INFO | ERROR
@@ -776,8 +788,9 @@ bool QpSendConfigPoll()
 //+------------------------------------------------------------------+
 //| Minimal JSON field extraction (response parsing only).           |
 //| QpJson.mqh builds JSON; these helpers read the few scalar fields |
-//| the command poll response carries. Only string / integer values  |
-//| are needed - payloads are logged verbatim, never interpreted.    |
+//| the command poll response carries. Slice 1 acks used strings +  |
+//| integers only; slice 2 DRY_RUN also extracts the nested payload  |
+//| object and its volume/price doubles - read-only, for validation. |
 //+------------------------------------------------------------------+
 bool QpJsonValueStart(const string json, const string key, int &pos)
   {
@@ -866,6 +879,35 @@ long QpJsonGetLong(const string json, const string key)
    return(StringToInteger(token));
   }
 
+// extract a numeric field as double (DRY_RUN payloads carry volume /
+// price / stop_loss / take_profit; Money fields arrive as decimal
+// strings per doc 13.1, so quoted and bare numbers are both accepted)
+double QpJsonGetDouble(const string json, const string key)
+  {
+   int pos;
+   if(!QpJsonValueStart(json, key, pos))
+      return(0.0);
+   int len = StringLen(json);
+   bool quoted = (StringGetCharacter(json, pos) == '"');
+   if(quoted)
+      pos++;
+   string token = "";
+   while(pos < len)
+     {
+      ushort c = StringGetCharacter(json, pos);
+      if(quoted)
+        {
+         if(c == '"')
+            break;
+        }
+      else if(c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r')
+         break;
+      token += StringSubstr(json, pos, 1);
+      pos++;
+     }
+   return(StringToDouble(token));
+  }
+
 // extract the raw text of array "key" (bracket-balanced, string-aware)
 bool QpJsonExtractArray(const string json, const string key, string &out)
   {
@@ -896,6 +938,50 @@ bool QpJsonExtractArray(const string json, const string key, string &out)
          else if(c == '[')
             depth++;
          else if(c == ']')
+           {
+            depth--;
+            if(depth == 0)
+              {
+               out = StringSubstr(json, start, pos - start + 1);
+               return(true);
+              }
+           }
+        }
+      pos++;
+     }
+   return(false);
+  }
+
+// extract the raw text of nested object "key" (brace-balanced, string-aware)
+bool QpJsonExtractObject(const string json, const string key, string &out)
+  {
+   out = "";
+   int pos;
+   if(!QpJsonValueStart(json, key, pos))
+      return(false);
+   if(StringGetCharacter(json, pos) != '{')
+      return(false);
+   int len = StringLen(json);
+   int depth = 0;
+   bool in_string = false;
+   int start = pos;
+   while(pos < len)
+     {
+      ushort c = StringGetCharacter(json, pos);
+      if(in_string)
+        {
+         if(c == '\\')
+            pos++; // skip escaped char
+         else if(c == '"')
+            in_string = false;
+        }
+      else
+        {
+         if(c == '"')
+            in_string = true;
+         else if(c == '{')
+            depth++;
+         else if(c == '}')
            {
             depth--;
             if(depth == 0)
@@ -1013,6 +1099,333 @@ bool QpSendCommandAck(const string command_id, const string ack_code,
    return(QpHttpPost("/ea/v1/commands/ack", o.Dump()));
   }
 
+//+------------------------------------------------------------------+
+//| Slice 2 DRY_RUN (PRD 13.5 / C1): pre-trade checks, NEVER a trade.|
+//| The chain mirrors every gate of the future execution slice:       |
+//| trade mode -> quotes/spread -> volume -> SL/TP distance ->         |
+//| pending price -> session -> OrderCheck margin/validity oracle.    |
+//| A clean chain acks DRY_RUN_PASSED; any failure acks               |
+//| DRY_RUN_REJECTED with a machine-readable code. No order is sent. |
+//+------------------------------------------------------------------+
+bool QpIsRiskIncreasing(const string command_type)
+  {
+   return(command_type == "OPEN_MARKET" || command_type == "PLACE_PENDING");
+  }
+
+bool QpOrderKindToType(const string order_kind, ENUM_ORDER_TYPE &type)
+  {
+   if(order_kind == "BUY_LIMIT")
+     { type = ORDER_TYPE_BUY_LIMIT; return(true); }
+   if(order_kind == "SELL_LIMIT")
+     { type = ORDER_TYPE_SELL_LIMIT; return(true); }
+   if(order_kind == "BUY_STOP")
+     { type = ORDER_TYPE_BUY_STOP; return(true); }
+   if(order_kind == "SELL_STOP")
+     { type = ORDER_TYPE_SELL_STOP; return(true); }
+   return(false);
+  }
+
+// trade-session check: SymbolInfoSessionTrade for today and yesterday
+// (sessions may cross midnight); "00:00 - 00:00" means around the clock.
+// If the symbol publishes no session info at all, stay lenient here and
+// let the final OrderCheck() be the authority.
+bool QpSessionOpen(const string symbol)
+  {
+   datetime server_now = TimeTradeServer();
+   if(server_now == 0)
+      return(true);
+   MqlDateTime parts;
+   TimeToStruct(server_now, parts);
+   int now_sec = parts.hour * 3600 + parts.min * 60 + parts.sec;
+   bool has_sessions = false;
+   for(int d = 0; d < 2; d++) // 0 = today, 1 = yesterday (crossing midnight)
+     {
+      int check_dow = (parts.day_of_week - d + 7) % 7;
+      int now_shifted = now_sec + d * 86400;
+      for(uint session_index = 0; session_index < 16; session_index++)
+        {
+         datetime from = 0, to = 0;
+         if(!SymbolInfoSessionTrade(symbol, (ENUM_DAY_OF_WEEK)check_dow,
+                                    session_index, from, to))
+            break;
+         int from_sec = (int)((long)from % 86400);
+         int to_sec = (int)((long)to % 86400);
+         if(from_sec == to_sec)
+           {
+            if(from_sec == 0)
+               return(true); // 00:00 - 00:00 on a listed weekday = 24h
+            has_sessions = true;
+            continue; // zero-length session
+           }
+         has_sessions = true;
+         int end_sec = to_sec;
+         if(end_sec < from_sec)
+            end_sec += 86400; // session crosses midnight
+         if(now_shifted >= from_sec && now_shifted < end_sec)
+            return(true);
+        }
+     }
+   return(!has_sessions); // no session info published -> lenient
+  }
+
+// full C1 pre-trade chain; on success detail carries the pass summary,
+// on failure code carries the machine-readable rejection reason.
+bool QpPreTradeChecks(const string cmd_json, const string command_type,
+                      string &code, string &detail)
+  {
+   code = "";
+   detail = "";
+
+   //--- payload (OpenMarketPayload / PlacePendingPayload fields)
+   string payload_json;
+   if(!QpJsonExtractObject(cmd_json, "payload", payload_json) || payload_json == "")
+     {
+      code = "PAYLOAD_MISSING";
+      detail = "command carries no payload object";
+      return(false);
+     }
+   string symbol = QpJsonGetString(payload_json, "symbol");
+   string side = QpJsonGetString(payload_json, "side");
+   double volume = QpJsonGetDouble(payload_json, "volume");
+   double sl = QpJsonGetDouble(payload_json, "stop_loss");
+   double tp = QpJsonGetDouble(payload_json, "take_profit");
+   double price = QpJsonGetDouble(payload_json, "price"); // pending only
+   string order_kind = QpJsonGetString(payload_json, "order_kind");
+   long deviation = QpJsonGetLong(payload_json, "max_deviation_points");
+   long magic = QpJsonGetLong(payload_json, "magic_number");
+
+   if(symbol == "" || side == "" || volume <= 0.0)
+     {
+      code = "PAYLOAD_INCOMPLETE";
+      detail = "payload needs symbol, side and a positive volume";
+      return(false);
+     }
+   bool is_buy = (side == "BUY");
+   if(!is_buy && side != "SELL")
+     {
+      code = "BAD_SIDE";
+      detail = "side must be BUY or SELL, got: " + side;
+      return(false);
+     }
+   bool is_pending = (command_type == "PLACE_PENDING");
+
+   //--- symbol must exist (and joins Market Watch for spec access)
+   if(!SymbolSelect(symbol, true))
+     {
+      code = "SYMBOL_UNKNOWN";
+      detail = "SymbolSelect failed for: " + symbol;
+      return(false);
+     }
+
+   //--- broker trade mode
+   long trade_mode = SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE);
+   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED ||
+      trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY)
+     {
+      code = "TRADE_MODE_BLOCKED";
+      detail = "symbol trade mode is " + QpTradeModeLabel(trade_mode);
+      return(false);
+     }
+   if(trade_mode == SYMBOL_TRADE_MODE_LONGONLY && !is_buy)
+     {
+      code = "TRADE_MODE_LONGONLY";
+      detail = "symbol rejects SELL orders";
+      return(false);
+     }
+   if(trade_mode == SYMBOL_TRADE_MODE_SHORTONLY && is_buy)
+     {
+      code = "TRADE_MODE_SHORTONLY";
+      detail = "symbol rejects BUY orders";
+      return(false);
+     }
+
+   //--- live quotes
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(bid <= 0.0 || ask <= 0.0)
+     {
+      code = "NO_QUOTES";
+      detail = "no bid/ask for: " + symbol;
+      return(false);
+     }
+
+   //--- spread cap (MaxSpreadPoints = 0 disables the check)
+   if(MaxSpreadPoints > 0)
+     {
+      long spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+      if(spread > MaxSpreadPoints)
+        {
+         code = "SPREAD_TOO_HIGH";
+         detail = "spread " + IntegerToString(spread) + " pts > max " +
+                  IntegerToString(MaxSpreadPoints) + " pts";
+         return(false);
+        }
+     }
+
+   //--- volume bounds and step
+   double vol_min = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double vol_max = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double vol_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   if(volume < vol_min - 1e-12 || (vol_max > 0.0 && volume > vol_max + 1e-12))
+     {
+      code = "VOLUME_OUT_OF_RANGE";
+      detail = "volume " + DoubleToString(volume, 8) + " outside [" +
+               DoubleToString(vol_min, 8) + ", " + DoubleToString(vol_max, 8) + "]";
+      return(false);
+     }
+   if(vol_step > 1e-12)
+     {
+      double steps = volume / vol_step;
+      if(MathAbs(steps - MathRound(steps)) > 1e-4)
+        {
+         code = "VOLUME_STEP";
+         detail = "volume " + DoubleToString(volume, 8) +
+                  " is not a multiple of step " + DoubleToString(vol_step, 8);
+         return(false);
+        }
+     }
+
+   //--- order type and reference price
+   ENUM_ORDER_TYPE order_type = ORDER_TYPE_BUY;
+   double check_price = 0.0;
+   if(is_pending)
+     {
+      if(!QpOrderKindToType(order_kind, order_type))
+        {
+         code = "BAD_ORDER_KIND";
+         detail = "unsupported order_kind: " + order_kind;
+         return(false);
+        }
+      if(price <= 0.0)
+        {
+         code = "BAD_PRICE";
+         detail = "pending command without a trigger price";
+         return(false);
+        }
+      check_price = price;
+     }
+   else
+     {
+      order_type = is_buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      check_price = is_buy ? ask : bid;
+     }
+
+   //--- SL / TP: side sanity + minimal distance (stops level)
+   double dist = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+   double ref = is_pending ? check_price : (is_buy ? bid : ask);
+   if(sl != 0.0)
+     {
+      if(is_buy ? (sl >= ref) : (sl <= ref))
+        {
+         code = "SL_WRONG_SIDE";
+         detail = "stop_loss must sit " + (is_buy ? "below" : "above") +
+                  " the " + (is_pending ? "trigger price" : "market");
+         return(false);
+        }
+      if(dist > 0.0 && MathAbs(ref - sl) < dist)
+        {
+         code = "SL_TOO_CLOSE";
+         detail = "|ref - SL| < stops_level " + DoubleToString(dist, 8);
+         return(false);
+        }
+     }
+   if(tp != 0.0)
+     {
+      if(is_buy ? (tp <= ref) : (tp >= ref))
+        {
+         code = "TP_WRONG_SIDE";
+         detail = "take_profit must sit " + (is_buy ? "above" : "below") +
+                  " the " + (is_pending ? "trigger price" : "market");
+         return(false);
+        }
+      if(dist > 0.0 && MathAbs(tp - ref) < dist)
+        {
+         code = "TP_TOO_CLOSE";
+         detail = "|TP - ref| < stops_level " + DoubleToString(dist, 8);
+         return(false);
+        }
+     }
+
+   //--- pending trigger price must sit on its correct side of the market
+   if(is_pending)
+     {
+      string why = "";
+      switch(order_type)
+        {
+         case ORDER_TYPE_BUY_LIMIT:
+            if(price > ask - dist)
+               why = "BUY_LIMIT must be below Ask";
+            break;
+         case ORDER_TYPE_BUY_STOP:
+            if(price < ask + dist)
+               why = "BUY_STOP must be above Ask";
+            break;
+         case ORDER_TYPE_SELL_LIMIT:
+            if(price < bid + dist)
+               why = "SELL_LIMIT must be above Bid";
+            break;
+         case ORDER_TYPE_SELL_STOP:
+            if(price > bid - dist)
+               why = "SELL_STOP must be below Bid";
+            break;
+        }
+      if(why != "")
+        {
+         code = "PENDING_PRICE_INVALID";
+         detail = why;
+         return(false);
+        }
+     }
+
+   //--- trading session
+   if(!QpSessionOpen(symbol))
+     {
+      code = "SESSION_CLOSED";
+      detail = "no trading session open for: " + symbol;
+      return(false);
+     }
+
+   //--- final gate: the terminal's own validation oracle. OrderCheck
+   // computes margin/validity exactly as OrderSend would - but it never
+   // places anything (slice 2: checks only, never execution).
+   MqlTradeRequest request;
+   MqlTradeCheckResult check;
+   ZeroMemory(request);
+   ZeroMemory(check);
+   request.action = is_pending ? TRADE_ACTION_PENDING : TRADE_ACTION_DEAL;
+   request.symbol = symbol;
+   request.volume = volume;
+   request.type = order_type;
+   request.price = check_price;
+   request.sl = sl;
+   request.tp = tp;
+   request.deviation = deviation > 0 ? (int)deviation : 15;
+   request.magic = (int)magic;
+   request.comment = "qp-dry-run";
+   request.type_time = ORDER_TIME_GTC;
+   request.type_filling = ORDER_FILLING_RETURN;
+   if(!is_pending)
+     {
+      // market orders: pick a filling mode the broker actually supports
+      long fill_mask = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+      if((fill_mask & SYMBOL_FILLING_FOK) != 0)
+         request.type_filling = ORDER_FILLING_FOK;
+      else if((fill_mask & SYMBOL_FILLING_IOC) != 0)
+         request.type_filling = ORDER_FILLING_IOC;
+     }
+   if(!OrderCheck(request, check))
+     {
+      code = "ORDER_CHECK_FAIL";
+      detail = "retcode=" + IntegerToString((int)check.retcode) +
+               " comment=" + check.comment;
+      return(false);
+     }
+
+   detail = "OrderCheck ok, required margin " + DoubleToString(check.margin, 2);
+   return(true);
+  }
+
 void QpHandleCommand(const string cmd_json)
   {
    string command_id   = QpJsonGetString(cmd_json, "command_id");
@@ -1046,11 +1459,32 @@ void QpHandleCommand(const string cmd_json)
       return;
      }
 
+   // slice 2 DRY_RUN (PRD 13.5 / C1): risk-increasing commands run the
+   // full pre-trade check chain - still NO order is ever sent
+   if(DryRunMode && QpIsRiskIncreasing(command_type))
+     {
+      string code = "", detail = "";
+      if(QpPreTradeChecks(cmd_json, command_type, code, detail))
+        {
+         QpLog("INFO", "DRY_RUN " + command_type + " " + command_id +
+               ": pre-trade checks passed (" + detail + ")");
+         QpSendCommandAck(command_id, QP_ACK_DRY_RUN_PASS,
+                          "pre-trade checks passed (" + command_type + "): " + detail);
+        }
+      else
+        {
+         QpLog("WARN", "DRY_RUN " + command_type + " " + command_id +
+               " rejected: " + code + " - " + detail);
+         QpSendCommandAck(command_id, QP_ACK_DRY_RUN_REJECT, code + ": " + detail);
+        }
+      return;
+     }
+
    // OBSERVE_ONLY (PRD 21.3): the payload is logged, NEVER executed
    QpLog("INFO", "command " + command_id + " (" + command_type +
-         ") acked OBSERVE_ONLY_ACK (slice 1: receipt only)");
+         ") acked OBSERVE_ONLY_ACK (receipt only, no execution)");
    QpSendCommandAck(command_id, QP_ACK_OBSERVE_ONLY,
-                    "received; not executed (OBSERVE_ONLY slice 1)");
+                    "received; not executed (OBSERVE_ONLY)");
   }
 
 //+------------------------------------------------------------------+
@@ -1305,7 +1739,9 @@ void QpSendShutdown(const string reason)
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   QpLog("INFO", "QuantPilotBridge " + QP_EA_VERSION + " starting (OBSERVE_ONLY telemetry)");
+   QpLog("INFO", "QuantPilotBridge " + QP_EA_VERSION +
+         " starting (OBSERVE_ONLY telemetry; DryRunMode=" +
+         (DryRunMode ? "true" : "false") + ")");
 
    // --- safety gates before any network activity ---
    if(AgentToken == "")
@@ -1328,6 +1764,11 @@ int OnInit()
    if(CommandPollSeconds < 1 || CommandPollSeconds > 120)
      {
       QpLog("ERROR", "CommandPollSeconds must be within 1..120");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(MaxSpreadPoints < 0)
+     {
+      QpLog("ERROR", "MaxSpreadPoints must be >= 0");
       return(INIT_PARAMETERS_INCORRECT);
      }
    if(BarHistoryCount < 50 || BarHistoryCount > 2000)
@@ -1428,7 +1869,7 @@ void OnTimer()
          g_last_config_at = TimeGMT();
      }
 
-   // command channel poll (OBSERVE_ONLY acks, never execution - PRD 21.3)
+   // command channel poll (OBSERVE_ONLY / DRY_RUN acks, never execution - PRD 21.3)
    if(g_last_command_at == 0 || TimeGMT() - g_last_command_at >= CommandPollSeconds)
      {
       if(QpPollCommands())
