@@ -1,11 +1,15 @@
 """FastAPI application: node/terminal/account routes + health (PRD 13.2).
 
 All responses use the unified envelope {data, error, request_id, timestamp}.
-Auth (PRD 14, phase-3 R2): one fail-closed gate, three credential lanes -
-the service key (X-API-Key == QP_API_KEY, machine channel, unchanged),
-Bearer JWTs from username/password login, and per-user qpk_... API keys.
-Named users carry one of four roles (ADMIN/TRADER/ANALYST/VIEWER) and only
-reach accounts they are granted. Trade commands flow through the durable
+Auth (PRD 14, phase-3 R2 + R2 remediation): one fail-closed gate, three
+credential lanes. The service key (X-API-Key == QP_API_KEY) is a MACHINE
+lane confined to the agent/EA routes (P1-01); every business route requires
+a named user - Bearer JWT (re-validated against the user row on every
+request, so disables/role changes apply immediately) or a personal qpk_...
+API key. Named users carry one of four roles (ADMIN/TRADER/ANALYST/VIEWER)
+and only reach accounts they are granted - enforced on URL paths AND query
+params, request bodies and DB-linked resource IDs alike (P1-02). Trade
+commands flow through the durable
 channel only; the cloud risk gate (PRD 9) refuses risk-increasing commands
 BEFORE they are queued: they land in terminal state REJECTED and are never
 delivered. EA-side execution is mode-gated (DRY_RUN pre-checks, live orders
@@ -228,18 +232,34 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
 
     Fail-closed like the service key: without QP_JWT_SECRET the endpoint
     refuses to issue tokens (503) instead of signing with a default.
-    Unknown usernames burn one bcrypt check (timing-safe). Every attempt,
-    success or failure, lands in system_events.
+    Unknown usernames burn one bcrypt check (timing-safe, same cost 12).
+    Attempts are rate-limited per client IP + username (P2-03). Every
+    attempt, success or failure, lands in system_events. The token embeds
+    the user's token_version so any later bump (password reset, role
+    change, disable) supersedes it immediately.
     """
     if not os.environ.get("QP_JWT_SECRET", ""):
         return err(503, "JWT_NOT_CONFIGURED", "set QP_JWT_SECRET before issuing tokens")
+    remote_ip = request.client.host if request.client else "unknown"
+    if auth.login_too_many_attempts(body.username, remote_ip):
+        writers.add_system_event(
+            "api", "auth.login_rate_limited", "WARN", {"username": body.username}
+        )
+        return err(429, "TOO_MANY_ATTEMPTS", "too many failed login attempts; retry later")
     user = auth.verify_login(body.username, body.password)
     if user is None:
+        auth.record_login_failure(body.username, remote_ip)
         writers.add_system_event(
             "api", "auth.login_failed", "WARN", {"username": body.username}
         )
         return err(401, "INVALID_CREDENTIALS", "invalid username or password")
-    token = auth.issue_token(user["id"], user["username"], user["role"])
+    auth.clear_login_failures(body.username, remote_ip)
+    token = auth.issue_token(
+        user["id"],
+        user["username"],
+        user["role"],
+        token_version=user["token_version"],
+    )
     writers.add_system_event(
         "api",
         "auth.login_succeeded",
@@ -263,7 +283,8 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
 
 @app.get("/api/v1/auth/me")
 def auth_me(request: Request) -> JSONResponse:
-    """Who am I - works for every lane (service key, JWT, user API key)."""
+    """Who am I - user lanes only (JWT or personal API key); the service
+    key is confined to machine routes and never reaches here (P1-01)."""
     p = request.state.principal
     return ok(
         {"kind": p.kind, "user_id": p.user_id, "username": p.username, "role": p.role},
@@ -415,8 +436,10 @@ def create_user(body: UserCreateRequest, request: Request) -> JSONResponse:
 @app.patch("/api/v1/auth/users/{user_id}")
 def update_user(user_id: str, body: UserUpdateRequest, request: Request) -> JSONResponse:
     """Update a user (ADMIN): password / role / active flag; account_ids is
-    a full grant-set replace. JWTs are stateless: a role change applies at
-    the next login, but account grants are re-checked on every request."""
+    a full grant-set replace. Every password/role/active change bumps
+    token_version, which supersedes live JWTs on their next request -
+    disabling a user or changing a role takes effect IMMEDIATELY (R2
+    acceptance P2-01/P2-02)."""
     try:
         user_uuid = UUID(user_id)
     except (ValueError, AttributeError, TypeError):
@@ -433,6 +456,9 @@ def update_user(user_id: str, body: UserUpdateRequest, request: Request) -> JSON
         sets.append("is_active = %s")
         params.append(body.is_active)
     if sets:
+        # supersede every live JWT for this user (P2-01/P2-02): the bearer
+        # lane re-validates token_version on each request
+        sets.append("token_version = token_version + 1")
         row = db.query_one(
             f"UPDATE users SET {', '.join(sets)} WHERE id = %s"
             " RETURNING id::text AS user_id, username, role, is_active",
@@ -541,9 +567,9 @@ def list_terminals(request: Request) -> JSONResponse:
 
 @app.get("/api/v1/accounts")
 def list_accounts(request: Request) -> JSONResponse:
-    """Accounts the caller may see (phase-3 R2): the service lane and ADMIN
-    see everything; other named users only the accounts they were granted
-    (list-level isolation - an ungranted account must not even appear)."""
+    """Accounts the caller may see (phase-3 R2): ADMIN sees everything;
+    other named users only the accounts they were granted (list-level
+    isolation - an ungranted account must not even appear)."""
     base = """
         SELECT a.id::text AS account_id, a.terminal_id::text AS terminal_id,
                t.node_id::text AS node_id, a.login_ref, a.server, a.company,
@@ -906,6 +932,40 @@ def _account_or_404(account_id: str) -> UUID:
     return account_uuid
 
 
+# --------------------------------------------------------------------------
+# object-level account authorization (R2 acceptance P1-02): the middleware
+# grant check only covers /accounts/{uuid}/... URL paths. Every other
+# surface - query params, request bodies and resources linked to an account
+# through the DB (commands, backtests, risk rows, audit rows) - must call
+# one of these helpers explicitly. Fail with 403, never by hiding buttons.
+# --------------------------------------------------------------------------
+
+
+def _ensure_account_allowed(p: auth.Principal, account_id) -> None:
+    """403 unless the caller is granted this account (ADMIN sees all)."""
+    if not auth.account_granted(p, str(account_id)):
+        raise HTTPException(403, "this account is not granted to your user")
+
+
+def _require_admin(p: auth.Principal) -> None:
+    """403 unless the caller is a named ADMIN - for cross-account/global
+    views and operations (unresolved commands, GLOBAL risk breakers)."""
+    if not (p.kind == "user" and p.role == "ADMIN"):
+        raise HTTPException(403, "administrator role required")
+
+
+def _granted_filter(p: auth.Principal) -> str | None:
+    """user_id for grant-based row filtering, or None (caller sees all).
+
+    Unfiltered list views narrow silently to the caller's granted accounts
+    - an ungranted account must not even appear (same isolation contract
+    as GET /api/v1/accounts).
+    """
+    if p.kind == "user" and p.role != "ADMIN":
+        return str(p.user_id)
+    return None
+
+
 def _config_payload(row: dict | None, account_id: str | None) -> dict:
     if row is None:
         return {
@@ -1079,9 +1139,19 @@ def _command_payload(row: dict, created: bool | None) -> dict:
 
 @app.post("/api/v1/commands")
 def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
-    """HTTP envelope for the shared durable-command creation core."""
+    """HTTP envelope for the shared durable-command creation core.
+
+    Object-level authorization (P1-02): the account arrives in the BODY,
+    so the middleware path check never sees it - grant-check it here.
+    created_by is stamped with the authenticated identity so audit rows
+    cannot claim a forged author.
+    """
+    p = request.state.principal
+    _ensure_account_allowed(p, body.account_id)
     try:
-        payload = command_service.create_command(body)
+        payload = command_service.create_command(
+            body.model_copy(update={"created_by": p.username})
+        )
     except command_service.CommandError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc
     return ok(payload, request)
@@ -1094,7 +1164,14 @@ def list_commands(
     status: str | None = None,
     limit: int = 100,
 ) -> JSONResponse:
-    """Command list, newest-first; optional account/status filters."""
+    """Command list, newest-first; optional account/status filters.
+
+    Non-admin users only ever see their granted accounts (P1-02): an
+    explicit account_id is grant-checked (403 on violation) and the
+    unfiltered view is narrowed by the grant table - cross-tenant
+    commands must not leak through a missing filter.
+    """
+    p = request.state.principal
     limit = max(1, min(limit, 500))
     if status is not None and status not in COMMAND_STATUSES:
         raise HTTPException(400, f"status must be one of {COMMAND_STATUSES}")
@@ -1105,7 +1182,13 @@ def list_commands(
             params.append(UUID(account_id))
         except (ValueError, AttributeError, TypeError):
             raise HTTPException(400, "invalid account_id")
+        _ensure_account_allowed(p, account_id)
         where.append("c.account_id = %s")
+    elif (user_filter := _granted_filter(p)) is not None:
+        where.append(
+            "c.account_id IN (SELECT account_id FROM user_account_grants WHERE user_id = %s)"
+        )
+        params.append(user_filter)
     if status is not None:
         params.append(status)
         where.append("c.status = %s")
@@ -1120,14 +1203,26 @@ def list_commands(
 def list_unresolved_commands(request: Request) -> JSONResponse:
     """Commands with uncertain outcomes (UNKNOWN / EXECUTE_UNRESOLVED) that
     await an operator reconciliation verdict (phase-3 R1, acceptance v2
-    P1 #1). Never re-issued blindly - confirm against broker state first."""
+    P1 #1). Never re-issued blindly - confirm against broker state first.
+    Cross-account by nature -> ADMIN only (P1-02)."""
+    _require_admin(request.state.principal)
     return ok(reconcile.unresolved_commands(), request)
 
 
 @app.get("/api/v1/commands/{command_id}/reconcile")
 def command_reconcile_evidence(command_id: str, request: Request) -> JSONResponse:
     """Broker-state evidence (positions/orders/deals) for one command plus a
-    conservative suggested verdict for the operator."""
+    conservative suggested verdict for the operator. The command's account
+    is grant-checked first (P1-02)."""
+    p = request.state.principal
+    try:
+        command_uuid = UUID(command_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "command not found")
+    row = _command_by_id(command_uuid)
+    if row is None:
+        raise HTTPException(404, "command not found")
+    _ensure_account_allowed(p, row["account_id"])
     try:
         return ok(reconcile.evidence(command_id), request)
     except command_service.CommandError as exc:
@@ -1139,7 +1234,17 @@ def command_reconcile_apply(
     command_id: str, body: ReconcileVerdictRequest, request: Request
 ) -> JSONResponse:
     """Record the operator's verdict on an uncertain outcome: terminal ACKED
-    + reconciled=true, fully audited (COMMAND_RECONCILE)."""
+    + reconciled=true, fully audited (COMMAND_RECONCILE). The command's
+    account is grant-checked first (P1-02)."""
+    p = request.state.principal
+    try:
+        command_uuid = UUID(command_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "command not found")
+    row = _command_by_id(command_uuid)
+    if row is None:
+        raise HTTPException(404, "command not found")
+    _ensure_account_allowed(p, row["account_id"])
     try:
         return ok(reconcile.apply(command_id, body.verdict, note=body.note), request)
     except command_service.CommandError as exc:
@@ -1149,7 +1254,9 @@ def command_reconcile_apply(
 @app.get("/api/v1/commands/{command_id}")
 def get_command(command_id: str, request: Request) -> JSONResponse:
     """Current command state (PRD 13.5: the frontend must show the REAL state),
-    including the risk-gate decision when the command was gated."""
+    including the risk-gate decision when the command was gated. The
+    command's account is grant-checked first (P1-02)."""
+    p = request.state.principal
     try:
         command_uuid = UUID(command_id)
     except (ValueError, AttributeError, TypeError):
@@ -1157,6 +1264,7 @@ def get_command(command_id: str, request: Request) -> JSONResponse:
     row = _command_by_id(command_uuid)
     if row is None:
         raise HTTPException(404, "command not found")
+    _ensure_account_allowed(p, row["account_id"])
     payload = _command_payload(row, created=None)
     decision = risk.decision_for_command(command_uuid)
     if decision is not None:
@@ -1342,16 +1450,29 @@ def _state_payload(row: dict | None, scope: str, account_id: str | None) -> dict
 def risk_state(request: Request, account_id: str | None = None) -> JSONResponse:
     """Effective stop states: GLOBAL + per-account rows (absent = NORMAL).
 
-    With account_id, returns the single account's effective state.
+    With account_id, returns the single account's effective state
+    (grant-checked, P1-02). Every role still sees the GLOBAL breaker (it
+    applies to all accounts); non-admins get their granted accounts only.
     """
+    p = request.state.principal
     if account_id is not None:
         account_uuid = _account_or_404(account_id)
+        _ensure_account_allowed(p, account_id)
         row = _stop_row("ACCOUNT", account_uuid)
         return ok(_state_payload(row, "ACCOUNT", account_id), request)
     global_row = _stop_row("GLOBAL", None)
-    account_rows = db.query(
-        f"{_RISK_STATE_SELECT} WHERE scope = 'ACCOUNT' ORDER BY updated_at DESC"
-    )
+    user_filter = _granted_filter(p)
+    if user_filter is None:
+        account_rows = db.query(
+            f"{_RISK_STATE_SELECT} WHERE scope = 'ACCOUNT' ORDER BY updated_at DESC"
+        )
+    else:
+        account_rows = db.query(
+            f"{_RISK_STATE_SELECT} WHERE scope = 'ACCOUNT' AND account_id IN"
+            " (SELECT account_id FROM user_account_grants WHERE user_id = %s)"
+            " ORDER BY updated_at DESC",
+            (user_filter,),
+        )
     return ok(
         {
             "global": _state_payload(global_row, "GLOBAL", None),
@@ -1367,11 +1488,17 @@ def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
     locked=True). Durable + audited (PRD 3.3: the state change must never be
     lost). De-escalation is refused with 409 - leaving a breaker state goes
     through POST /api/v1/risk/resume (LOCKED needs confirm_locked there).
+    scope=ACCOUNT is grant-checked, scope=GLOBAL is ADMIN-only (P1-02):
+    a GLOBAL breaker stops every account, which is never a per-user action.
     Broadcast to the EA/agent is a later slice; the cloud gate reads this
     state on every new-risk command."""
+    p = request.state.principal
     account_uuid: UUID | None = None
     if body.scope == "ACCOUNT":
         account_uuid = _account_or_404(str(body.account_id))
+        _ensure_account_allowed(p, str(body.account_id))
+    else:
+        _require_admin(p)
     status = "LOCKED" if body.locked else (body.status or "STOP_NEW_RISK")
     current_row = _stop_row(body.scope, account_uuid)
     current = current_row["status"] if current_row is not None else "NORMAL"
@@ -1419,10 +1546,15 @@ def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
 
 @app.post("/api/v1/risk/resume")
 def risk_resume(body: RiskResumeRequest, request: Request) -> JSONResponse:
-    """Return to NORMAL. LOCKED requires confirm_locked=true (PRD 9.5)."""
+    """Return to NORMAL. LOCKED requires confirm_locked=true (PRD 9.5).
+    scope=ACCOUNT is grant-checked, scope=GLOBAL is ADMIN-only (P1-02)."""
+    p = request.state.principal
     account_uuid: UUID | None = None
     if body.scope == "ACCOUNT":
         account_uuid = _account_or_404(str(body.account_id))
+        _ensure_account_allowed(p, str(body.account_id))
+    else:
+        _require_admin(p)
     row = _stop_row(body.scope, account_uuid)
     if row is None:
         # already NORMAL - idempotent no-op
@@ -1477,7 +1609,10 @@ def risk_decisions(
     command_id: str | None = None,
     limit: int = 100,
 ) -> JSONResponse:
-    """Gate decision audit trail (doc 12.2 risk_decisions), newest first."""
+    """Gate decision audit trail (doc 12.2 risk_decisions), newest first.
+    Explicit account_id is grant-checked; the unfiltered view narrows to
+    the caller's granted accounts for non-admins (P1-02)."""
+    p = request.state.principal
     limit = max(1, min(limit, 500))
     where = ["1=1"]
     params: list = []
@@ -1486,7 +1621,13 @@ def risk_decisions(
             params.append(UUID(account_id))
         except (ValueError, AttributeError, TypeError):
             raise HTTPException(400, "invalid account_id")
+        _ensure_account_allowed(p, account_id)
         where.append("d.account_id = %s")
+    elif (user_filter := _granted_filter(p)) is not None:
+        where.append(
+            "d.account_id IN (SELECT account_id FROM user_account_grants WHERE user_id = %s)"
+        )
+        params.append(user_filter)
     if command_id is not None:
         try:
             params.append(UUID(command_id))
@@ -1796,6 +1937,16 @@ def create_backtest(
     request: Request,
     idempotency_key: UUID = Header(alias="Idempotency-Key"),
 ) -> JSONResponse:
+    """Grant-check the strategy instance's account BEFORE creating the job
+    (P1-02): the account arrives indirectly via body.strategy_instance_id.
+    A missing instance falls through to the 404 below."""
+    p = request.state.principal
+    instance = db.query_one(
+        "SELECT account_id::text AS account_id FROM strategy_instances WHERE id = %s",
+        (body.strategy_instance_id,),
+    )
+    if instance is not None:
+        _ensure_account_allowed(p, instance["account_id"])
     try:
         result = backtests.create_backtest(body, idempotency_key)
     except backtests.BacktestNotFound as exc:
@@ -1821,13 +1972,24 @@ def list_backtests(
     strategy_instance_id: UUID | None = None,
     limit: int = 100,
 ) -> JSONResponse:
-    """Backtest job summaries, newest first; optional account/instance filters."""
-    rows = backtests.list_backtests(account_id, strategy_instance_id, limit)
+    """Backtest job summaries, newest first; optional account/instance
+    filters. Explicit account_id is grant-checked; the unfiltered view
+    narrows to the caller's granted accounts for non-admins (P1-02)."""
+    p = request.state.principal
+    if account_id is not None:
+        _ensure_account_allowed(p, account_id)
+    rows = backtests.list_backtests(
+        account_id,
+        strategy_instance_id,
+        limit,
+        granted_user_id=_granted_filter(p),
+    )
     return ok(db.jsonable(rows), request)
 
 
 @app.get("/api/v1/backtests/{job_id}")
 def get_backtest(job_id: str, request: Request) -> JSONResponse:
+    p = request.state.principal
     try:
         job_uuid = UUID(job_id)
     except (ValueError, AttributeError, TypeError) as exc:
@@ -1835,6 +1997,7 @@ def get_backtest(job_id: str, request: Request) -> JSONResponse:
     result = backtests.get_backtest(job_uuid)
     if result is None:
         raise HTTPException(404, "backtest not found")
+    _ensure_account_allowed(p, result["account_id"])
     return ok(db.jsonable(result), request)
 
 
@@ -1933,14 +2096,23 @@ def get_audit_logs(
     limit: int = 100,
 ) -> JSONResponse:
     """Structured operation audit, newest first; optional account/action
-    filters. Written best-effort by every state-changing route."""
+    filters. Written best-effort by every state-changing route. Explicit
+    account_id is grant-checked; the unfiltered view narrows to the
+    caller's granted accounts for non-admins (P1-02)."""
+    p = request.state.principal
     account_uuid: UUID | None = None
     if account_id is not None:
         try:
             account_uuid = UUID(account_id)
         except (ValueError, AttributeError, TypeError):
             raise HTTPException(400, "invalid account_id") from None
-    rows = audit.list_audit_logs(account_uuid, action, max(1, min(limit, 500)))
+        _ensure_account_allowed(p, account_id)
+    rows = audit.list_audit_logs(
+        account_uuid,
+        action,
+        max(1, min(limit, 500)),
+        granted_user_id=_granted_filter(p),
+    )
     return ok(db.jsonable(rows), request)
 
 
@@ -1950,8 +2122,12 @@ def get_audit_logs(
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:  # noqa: D401
-    code = {404: "NOT_FOUND", 400: "BAD_REQUEST", 401: "UNAUTHORIZED", 405: "METHOD_NOT_ALLOWED"}.get(
-        exc.status_code, "ERROR"
-    )
+    code = {
+        404: "NOT_FOUND",
+        400: "BAD_REQUEST",
+        401: "UNAUTHORIZED",
+        403: "FORBIDDEN",
+        405: "METHOD_NOT_ALLOWED",
+    }.get(exc.status_code, "ERROR")
     message = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
     return err(exc.status_code, code, message, request)

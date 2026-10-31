@@ -1,23 +1,11 @@
-import fs from 'node:fs'
-import path from 'node:path'
 import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vite'
 
-// Dev proxy injects the service key server-side (from repo root .env or
-// process env) so the key never ships in the client bundle.
-function repoEnv(name: string): string {
-  try {
-    const env = fs.readFileSync(path.resolve(process.cwd(), '../.env'), 'utf8')
-    const line = env.split(/\r?\n/).find((l) => l.startsWith(`${name}=`))
-    return line ? line.slice(name.length + 1).trim() : ''
-  } catch {
-    return ''
-  }
-}
-
-const apiKey = process.env.QP_API_KEY || repoEnv('QP_API_KEY')
-
-// https://vite.dev/config/
+// R2 remediation P1-01: the dev proxy NO LONGER injects the shared
+// service key. The service key is a machine lane (agent/EA) only; dev
+// sessions must authenticate like production - username/password login
+// (Bearer JWT) or a personal qpk_ API key. Without credentials the API
+// answers 401 and the login gate opens.
 export default defineConfig({
   plugins: [vue()],
   server: {
@@ -28,7 +16,6 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
-        headers: apiKey ? { 'X-API-Key': apiKey } : {},
       },
       '/healthz': { target: 'http://127.0.0.1:8000', changeOrigin: true },
     },

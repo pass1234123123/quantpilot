@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
-import { api, type AuthUser } from '../../api'
+import { api } from '../../api'
 import { clearApiKey, getApiKey, setApiKey } from '../../secure-store'
 
 const store = useDashboardStore()
@@ -75,79 +75,10 @@ const runModeText = computed(() => {
   if (!mode) return '—（等待 EA 心跳上报）'
   return RUN_MODE_LABELS[mode] ?? `${mode}（未知模式，请核对 EA 版本）`
 })
-
-// 用户登录（phase-3 R2）：JWT 通道，与服务密钥通道并存
-const loginUser = ref<AuthUser | null>(api.currentUser())
-const loginName = ref('')
-const loginPass = ref('')
-const loginBusy = ref(false)
-const loginError = ref('')
-const loginOk = ref(false)
-
-async function doLogin() {
-  if (!loginName.value.trim() || !loginPass.value) return
-  loginBusy.value = true
-  loginError.value = ''
-  loginOk.value = false
-  try {
-    loginUser.value = await api.login(loginName.value.trim(), loginPass.value)
-    loginPass.value = ''
-    loginOk.value = true
-  } catch (e) {
-    loginError.value = e instanceof Error ? e.message : String(e)
-  } finally {
-    loginBusy.value = false
-  }
-}
-
-function doLogout() {
-  api.logout()
-  loginUser.value = null
-  loginOk.value = false
-  loginError.value = ''
-}
 </script>
 
 <template>
   <div class="settings">
-    <div class="qp-panel">
-      <div class="qp-panel__title">
-        用户登录
-        <span class="qp-live-badge">JWT</span>
-      </div>
-      <template v-if="loginUser">
-        <div class="settings__rows">
-          <div class="settings__row"><span>用户名</span><b>{{ loginUser.username }}</b></div>
-          <div class="settings__row"><span>角色</span><b>{{ loginUser.role }}</b></div>
-          <div class="settings__row"><span>认证方式</span><b class="qp-up">Bearer Token（默认 8 小时有效）</b></div>
-        </div>
-        <div class="settings__conn">
-          <el-button size="small" type="danger" plain @click="doLogout">登出</el-button>
-          <el-tag v-if="loginOk" type="success" size="small">登录成功</el-tag>
-        </div>
-      </template>
-      <template v-else>
-        <div class="settings__rows">
-          <div class="settings__row">
-            <span>用户名</span>
-            <el-input v-model="loginName" placeholder="用户名" size="small" style="width: 240px" @keyup.enter="doLogin" />
-          </div>
-          <div class="settings__row">
-            <span>密码</span>
-            <el-input v-model="loginPass" type="password" show-password placeholder="密码" size="small" style="width: 240px" @keyup.enter="doLogin" />
-          </div>
-        </div>
-        <div class="settings__conn">
-          <el-button size="small" type="primary" :loading="loginBusy" @click="doLogin">登录</el-button>
-          <el-tag v-if="loginError" type="danger" size="small">失败：{{ loginError }}</el-tag>
-        </div>
-      </template>
-      <div class="settings__note">
-        <p>· 登录后以个人身份调用 API（角色与账户授权由管理员分配）；Token 过期自动失效并回退服务密钥通道。</p>
-        <p>· 未登录时沿用服务密钥（开发代理注入 / 桌面直连配置）。</p>
-      </div>
-    </div>
-
     <div class="qp-panel">
       <div class="qp-panel__title">
         系统信息
@@ -187,8 +118,8 @@ function doLogout() {
           <el-input v-model="connBase" placeholder="http://127.0.0.1:8000" size="small" style="width: 320px" />
         </div>
         <div class="settings__row">
-          <span>API Key</span>
-          <el-input v-model="connKey" type="password" show-password placeholder="services/api 的 QP_API_KEY" size="small" style="width: 320px" />
+          <span>个人 API Key</span>
+          <el-input v-model="connKey" type="password" show-password placeholder="qpk_…（个人密钥，可选；登录 Token 优先）" size="small" style="width: 320px" />
         </div>
       </div>
       <div class="settings__conn">
@@ -199,8 +130,9 @@ function doLogout() {
         <el-tag v-else-if="connResult === 'fail'" type="danger" size="small">失败：{{ connError }}</el-tag>
       </div>
       <div class="settings__note">
-        <p>· 开发模式（Vite 代理）无需配置：代理自动注入 X-API-Key，保持相对路径即可。</p>
-        <p>· 桌面安装版没有代理：请配置 API 地址与密钥。密钥保存进系统凭据管理器（Windows 凭据管理器），不落 localStorage 与磁盘明文。</p>
+        <p>· 登录（用户名 + 密码）是访问业务功能的首选方式；此处可选用个人 API Key（qpk_ 前缀，在「AI/账户授权管理」由管理员或自助创建）。</p>
+        <p>· 共享服务密钥仅用于 Agent / EA 机器通道，在此处填入无法访问业务数据（后端按机器身份拒绝，R2 P1-01）。</p>
+        <p>· 密钥与登录 Token 均保存进系统凭据管理器（Windows 凭据管理器），不落 localStorage 与磁盘明文。</p>
       </div>
     </div>
 

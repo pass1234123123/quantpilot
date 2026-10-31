@@ -12,10 +12,14 @@ module adds per-identity credentials for humans:
 * account grants users reach /api/v1/accounts/{uuid}/... only when granted
                  (checked per request, so revoking a grant is immediate)
 
-JWTs are stateless: disabling a user does not kill live tokens, but the
-account gate re-checks grants on every request and role changes apply at
-the next login. Passwords are bcrypt cost 12 and login is timing-safe
-against user enumeration (unknown usernames burn one dummy check).
+JWTs are NOT trusted on their own: every request re-validates the user
+row (still active, current role, matching token_version), so disabling a
+user, changing a role or resetting a password kills live tokens at once
+(R2 acceptance P2-01/P2-02). The shared service key is a MACHINE lane
+only (R2 acceptance P1-01): it reaches agent/EA routes and nothing else.
+Passwords are bcrypt cost 12 and login is timing-safe against user
+enumeration (unknown usernames burn one dummy check) and rate-limited
+per IP + username.
 """
 
 from __future__ import annotations
@@ -53,6 +57,9 @@ _ACCOUNT_IN_PATH = re.compile(r"^/api/v1/accounts/([0-9a-f-]{36})(/|$)")
 
 DENY_MESSAGES = {
     "SERVICE_KEY_ONLY": "this route carries machine traffic; it requires the service key",
+    "USER_IDENTITY_REQUIRED": (
+        "the service key only carries machine traffic; log in as a user"
+    ),
     "ADMIN_ONLY": "administrator role required",
     "ROLE_FORBIDDEN": "your role is not allowed to perform this action",
 }
@@ -107,7 +114,13 @@ def _b64url_decode(segment: str) -> bytes:
     return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
 
 
-def issue_token(user_id: str, username: str, role: str, ttl: int | None = None) -> str:
+def issue_token(
+    user_id: str,
+    username: str,
+    role: str,
+    ttl: int | None = None,
+    token_version: int = 0,
+) -> str:
     secret = os.environ.get("QP_JWT_SECRET", "")
     if not secret:
         raise RuntimeError("QP_JWT_SECRET not configured; refusing to issue tokens")
@@ -117,6 +130,7 @@ def issue_token(user_id: str, username: str, role: str, ttl: int | None = None) 
         "sub": str(user_id),
         "username": username,
         "role": role,
+        "ver": int(token_version),
         "iat": now,
         "exp": now + (ttl if ttl is not None else TOKEN_TTL_SECONDS),
     }
@@ -169,16 +183,39 @@ def verify_token(token: str) -> dict | None:
 
 
 def authenticate_bearer(authorization: str) -> Principal | None:
+    """Resolve a Bearer JWT -> Principal, re-validating the user row.
+
+    The signature only proves the token was issued by us; it says nothing
+    about the user TODAY. So every request re-reads the user: disabled
+    users are rejected, role changes apply immediately and a bumped
+    token_version (password reset / role change / disable) supersedes
+    older tokens (R2 acceptance P2-01/P2-02). Tokens issued before the
+    token_version column existed carry no "ver" claim and count as 0.
+    """
     if not authorization.startswith("Bearer "):
         return None
     payload = verify_token(authorization[len("Bearer "):].strip())
     if payload is None:
         return None
+    user_id = payload.get("sub")
+    row = db.query_one(
+        """
+        SELECT username, role, is_active, token_version
+          FROM users
+         WHERE id = %s
+        """,
+        (user_id,),
+    )
+    if row is None or not row["is_active"]:
+        return None
+    token_version = payload.get("ver", 0)
+    if not isinstance(token_version, int) or token_version != int(row["token_version"] or 0):
+        return None
     return Principal(
         kind="user",
-        user_id=payload.get("sub"),
-        username=payload.get("username", ""),
-        role=payload.get("role"),
+        user_id=str(user_id),
+        username=row["username"],
+        role=row["role"],
     )
 
 
@@ -213,18 +250,61 @@ _dummy_hash: bytes | None = None
 
 
 def _dummy_verify(password: str) -> None:
-    """Burn one bcrypt check for unknown usernames (anti-enumeration)."""
+    """Burn one bcrypt check for unknown usernames (anti-enumeration).
+
+    Same cost 12 as the real hashes, so response timing cannot tell an
+    unknown username apart from a wrong password (R2 acceptance P2-04).
+    """
     global _dummy_hash
     if _dummy_hash is None:
-        _dummy_hash = hash_password("timing-equalizer", rounds=4)
+        _dummy_hash = hash_password("timing-equalizer", rounds=12)
     verify_password(password, _dummy_hash)
 
 
+# --------------------------------------------------------------------------
+# login rate limiting (P2-03): in-memory sliding window per (ip, username)
+# --------------------------------------------------------------------------
+
+_LOGIN_MAX_FAILURES = int(os.environ.get("QP_LOGIN_MAX_FAILURES", "10"))
+_LOGIN_WINDOW_SECONDS = int(os.environ.get("QP_LOGIN_WINDOW_SECONDS", "900"))
+_login_failures: dict[str, list[float]] = {}
+
+
+def _login_bucket(username: str, remote_ip: str) -> str:
+    return f"{remote_ip}|{username.strip().lower()}"
+
+
+def _prune_bucket(bucket: str, now: float) -> list[float]:
+    stamps = [
+        t
+        for t in _login_failures.get(bucket, [])
+        if now - t < _LOGIN_WINDOW_SECONDS
+    ]
+    _login_failures[bucket] = stamps
+    return stamps
+
+
+def login_too_many_attempts(username: str, remote_ip: str) -> bool:
+    bucket = _login_bucket(username, remote_ip)
+    return len(_prune_bucket(bucket, time.time())) >= _LOGIN_MAX_FAILURES
+
+
+def record_login_failure(username: str, remote_ip: str) -> None:
+    bucket = _login_bucket(username, remote_ip)
+    _prune_bucket(bucket, time.time())
+    _login_failures.setdefault(bucket, []).append(time.time())
+
+
+def clear_login_failures(username: str, remote_ip: str) -> None:
+    _login_failures.pop(_login_bucket(username, remote_ip), None)
+
+
 def verify_login(username: str, password: str) -> dict | None:
-    """username + password -> {id, username, role} or None."""
+    """username + password -> {id, username, role, token_version} or None."""
     row = db.query_one(
         """
-        SELECT id::text AS id, username, password_hash, role, is_active
+        SELECT id::text AS id, username, password_hash, role, is_active,
+               token_version
           FROM users
          WHERE username = %s
         """,
@@ -237,7 +317,12 @@ def verify_login(username: str, password: str) -> dict | None:
         return None
     if not row["is_active"]:
         return None
-    return {"id": row["id"], "username": row["username"], "role": row["role"]}
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "role": row["role"],
+        "token_version": int(row["token_version"] or 0),
+    }
 
 
 def generate_api_key() -> tuple[str, str]:
@@ -252,9 +337,11 @@ def generate_api_key() -> tuple[str, str]:
 
 
 def authorize(principal: Principal, method: str, path: str) -> str | None:
-    """Role matrix (phase-3 R2, acceptance v2 P1 #2):
+    """Role matrix (phase-3 R2, acceptance v2 P1 #2 + R2 remediation P1-01):
 
-    * service lane: everything (machine channel, unchanged)
+    * service lane: MACHINE ROUTES ONLY - the shared service key must
+      never impersonate a user on business routes, otherwise it would
+      bypass per-user RBAC and account grants entirely
     * machine routes: service-key only, for every user role
     * /api/v1/auth/users* (incl. GET): ADMIN only
     * GET/HEAD/OPTIONS otherwise: every user role (row isolation is
@@ -264,7 +351,7 @@ def authorize(principal: Principal, method: str, path: str) -> str | None:
     * all other writes (commands, config, risk): ADMIN/TRADER
     """
     if principal.is_service:
-        return None
+        return None if _MACHINE_PATHS.match(path) else "USER_IDENTITY_REQUIRED"
     if _MACHINE_PATHS.match(path):
         return "SERVICE_KEY_ONLY"
     if _ADMIN_PATHS.match(path):

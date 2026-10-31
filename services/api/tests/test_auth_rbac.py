@@ -1,13 +1,21 @@
-"""User auth + RBAC (phase-3 R2): JWT login, four roles, per-user API keys
-and per-account grants layered ON TOP of the unchanged service-key gate.
+"""User auth + RBAC (phase-3 R2 + R2 remediation): JWT login, four roles,
+per-user API keys and per-account grants layered ON TOP of the service-key
+gate.
 
-Compatibility invariant: the X-API-Key service path behaves exactly as
-before (see test_app_auth.py). Humans authenticate via Bearer JWT (login
-with username + bcrypt password) or a personal qpk_... key. Users are
-confined to granted accounts and to what their role allows; machine routes
-(nodes/register, commands/pending ...) stay service-key-only; the
-fail-closed order of checks (503 API_KEY_NOT_CONFIGURED -> 401 -> 403)
-never regresses - even for login.
+R2 remediation invariants (P1-01/P2-01/P2-02):
+- the X-API-Key service path is a MACHINE lane only (see test_app_auth.py):
+  it carries agent/EA traffic on the whitelisted machine paths, every
+  business route demands a named user (403 USER_IDENTITY_REQUIRED);
+- the Bearer lane re-reads the users row on every request - role changes,
+  disables and token_version bumps invalidate old tokens immediately;
+- humans authenticate via Bearer JWT (login with username + bcrypt
+  password) or a personal qpk_... key; users are confined to granted
+  accounts and to what their role allows; machine routes stay
+  service-key-only; the fail-closed order of checks (503
+  API_KEY_NOT_CONFIGURED -> 401 -> 403) never regresses - even for login.
+
+Route tests that need the per-request user re-read ride rbac_testkit's
+bearer() context, which stands in for auth.db with a well-formed users row.
 """
 
 import base64
@@ -194,16 +202,28 @@ class AuthorizeTests(unittest.TestCase):
         self.service = auth.Principal(kind="service")
         self.users = {r: _principal(r) for r in auth.ROLES}
 
-    def test_service_passes_everything(self) -> None:
+    def test_service_key_is_confined_to_machine_paths(self) -> None:
+        # P1-01: the service lane carries agent/EA traffic on the whitelisted
+        # machine paths only - every business path demands a named user.
+        for path in (
+            "/api/v1/nodes/register",
+            "/api/v1/nodes/heartbeat",
+            "/api/v1/config/lookup",
+            "/api/v1/commands/pending",
+        ):
+            self.assertIsNone(self.auth.authorize(self.service, "POST", path))
         cases = [
-            ("POST", "/api/v1/nodes/register"),
             ("POST", "/api/v1/commands"),
             ("GET", "/api/v1/auth/users"),
             ("PATCH", f"/api/v1/auth/users/{UID}"),
             ("DELETE", f"/api/v1/accounts/{UID}/orders"),
+            ("GET", "/api/v1/accounts"),
         ]
         for method, path in cases:
-            self.assertIsNone(self.auth.authorize(self.service, method, path))
+            self.assertEqual(
+                self.auth.authorize(self.service, method, path),
+                "USER_IDENTITY_REQUIRED",
+            )
 
     def test_machine_routes_are_service_key_only(self) -> None:
         for principal in self.users.values():
@@ -316,7 +336,7 @@ class LoginFlowTests(unittest.TestCase):
         self.client = _client()
 
     @staticmethod
-    def _user_row(role="TRADER", is_active=True):
+    def _user_row(role="TRADER", is_active=True, token_version=0):
         from quantpilot_api import auth
 
         return {
@@ -324,6 +344,7 @@ class LoginFlowTests(unittest.TestCase):
             "username": "alice",
             "role": role,
             "is_active": is_active,
+            "token_version": token_version,
             "password_hash": auth.hash_password("pass-word-123", rounds=4).decode(),
         }
 
@@ -401,18 +422,11 @@ class MiddlewareTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = _client()
 
-    @staticmethod
-    def _token(role: str) -> str:
-        from quantpilot_api import auth
-
-        return auth.issue_token("u-1", "alice", role)
-
     def test_bearer_jwt_passes_gate(self) -> None:
-        with patch.dict(os.environ, SECRET_ENV):
-            resp = self.client.get(
-                "/api/v1/not-a-route",
-                headers={"Authorization": f"Bearer {self._token('VIEWER')}"},
-            )
+        from rbac_testkit import bearer
+
+        with bearer(role="VIEWER") as headers:
+            resp = self.client.get("/api/v1/not-a-route", headers=headers)
         self.assertEqual(resp.status_code, 404)
 
     def test_invalid_bearer_401(self) -> None:
@@ -434,23 +448,19 @@ class MiddlewareTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
 
     def test_viewer_cannot_issue_commands(self) -> None:
-        with patch.dict(os.environ, SECRET_ENV):
-            resp = self.client.post(
-                "/api/v1/commands",
-                json={},
-                headers={"Authorization": f"Bearer {self._token('VIEWER')}"},
-            )
+        from rbac_testkit import bearer
+
+        with bearer(role="VIEWER") as headers:
+            resp = self.client.post("/api/v1/commands", json={}, headers=headers)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"]["code"], "ROLE_FORBIDDEN")
 
     def test_trader_passes_command_gate(self) -> None:
         # reaching pydantic validation (422) proves the middleware let it through
-        with patch.dict(os.environ, SECRET_ENV):
-            resp = self.client.post(
-                "/api/v1/commands",
-                json={},
-                headers={"Authorization": f"Bearer {self._token('TRADER')}"},
-            )
+        from rbac_testkit import bearer
+
+        with bearer(role="TRADER") as headers:
+            resp = self.client.post("/api/v1/commands", json={}, headers=headers)
         self.assertEqual(resp.status_code, 422)
 
     def test_user_key_passes_gate(self) -> None:
@@ -492,90 +502,88 @@ class MiddlewareTests(unittest.TestCase):
         self.assertEqual(resp.json()["error"]["code"], "SERVICE_KEY_ONLY")
 
     def test_ungranted_account_403(self) -> None:
-        import quantpilot_api.auth as auth
+        from rbac_testkit import bearer
 
-        mock = MagicMock()
-        mock.query_one.return_value = None
-        with patch.dict(os.environ, SECRET_ENV), patch.object(auth, "db", mock):
-            resp = self.client.get(
-                f"/api/v1/accounts/{UID}/positions",
-                headers={"Authorization": f"Bearer {self._token('TRADER')}"},
-            )
+        # granted_accounts=[] -> the grant lookup returns no row for this
+        # account while the users row stays valid (P1-01 fixed: the bearer
+        # lane re-reads users, so the old mock returning None for EVERY
+        # query would now 401 before the grant check).
+        with bearer(role="TRADER", granted_accounts=[]) as headers:
+            resp = self.client.get(f"/api/v1/accounts/{UID}/positions", headers=headers)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"]["code"], "ACCOUNT_NOT_GRANTED")
 
     def test_granted_account_reaches_route(self) -> None:
         import quantpilot_api.app as app_module
-        import quantpilot_api.auth as auth
+        from rbac_testkit import bearer
 
-        auth_mock = MagicMock()
-        auth_mock.query_one.return_value = {"one": 1}
         app_mock = MagicMock()
         app_mock.query.return_value = []
         app_mock.jsonable.side_effect = lambda value: value
         with (
-            patch.dict(os.environ, SECRET_ENV),
-            patch.object(auth, "db", auth_mock),
+            bearer(role="TRADER") as headers,  # no granted_accounts -> all granted
             patch.object(app_module, "db", app_mock),
         ):
             resp = self.client.get(
-                f"/api/v1/accounts/{UID}/positions",
-                headers={"Authorization": f"Bearer {self._token('TRADER')}"},
+                f"/api/v1/accounts/{UID}/positions", headers=headers
             )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"], [])
 
     def test_user_list_accounts_filters_to_grants(self) -> None:
         import quantpilot_api.app as app_module
+        from rbac_testkit import bearer
 
         app_mock = MagicMock()
         app_mock.query.return_value = []
         app_mock.jsonable.side_effect = lambda value: value
-        with patch.dict(os.environ, SECRET_ENV), patch.object(app_module, "db", app_mock):
-            resp = self.client.get(
-                "/api/v1/accounts",
-                headers={"Authorization": f"Bearer {self._token('VIEWER')}"},
-            )
+        with (
+            bearer(role="VIEWER") as headers,
+            patch.object(app_module, "db", app_mock),
+        ):
+            resp = self.client.get("/api/v1/accounts", headers=headers)
         self.assertEqual(resp.status_code, 200)
         sql, params = app_mock.query.call_args[0]
         self.assertIn("user_account_grants", sql)
         self.assertEqual(params, ("u-1",))
 
-    def test_service_list_accounts_sees_all(self) -> None:
+    def test_admin_sees_all_accounts_and_service_key_is_refused(self) -> None:
         import quantpilot_api.app as app_module
+        from rbac_testkit import bearer, service_key
 
         app_mock = MagicMock()
         app_mock.query.return_value = []
         app_mock.jsonable.side_effect = lambda value: value
-        with patch.dict(os.environ, {"QP_API_KEY": "svc-key"}), patch.object(
-            app_module, "db", app_mock
+        with (
+            bearer(role="ADMIN") as headers,
+            patch.object(app_module, "db", app_mock),
         ):
-            resp = self.client.get("/api/v1/accounts", headers={"X-API-Key": "svc-key"})
+            resp = self.client.get("/api/v1/accounts", headers=headers)
         self.assertEqual(resp.status_code, 200)
         self.assertNotIn("user_account_grants", app_mock.query.call_args[0][0])
+
+        # P1-01: the service key no longer reaches business routes at all
+        with service_key() as headers:
+            resp = self.client.get("/api/v1/accounts", headers=headers)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"]["code"], "USER_IDENTITY_REQUIRED")
 
 
 class AdminUserRoutesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = _client()
 
-    @staticmethod
-    def _token(role: str) -> str:
-        from quantpilot_api import auth
-
-        return auth.issue_token("u-9", "root", role)
-
     def test_viewer_cannot_list_users(self) -> None:
-        with patch.dict(os.environ, SECRET_ENV):
-            resp = self.client.get(
-                "/api/v1/auth/users",
-                headers={"Authorization": f"Bearer {self._token('VIEWER')}"},
-            )
+        from rbac_testkit import bearer
+
+        with bearer(role="VIEWER") as headers:
+            resp = self.client.get("/api/v1/auth/users", headers=headers)
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.json()["error"]["code"], "ADMIN_ONLY")
 
     def test_admin_lists_users_with_grants(self) -> None:
         import quantpilot_api.app as app_module
+        from rbac_testkit import bearer
 
         app_mock = MagicMock()
         app_mock.query.side_effect = [
@@ -591,16 +599,17 @@ class AdminUserRoutesTests(unittest.TestCase):
             [{"user_id": "u-1", "account_id": UID}],
         ]
         app_mock.jsonable.side_effect = lambda value: value
-        with patch.dict(os.environ, SECRET_ENV), patch.object(app_module, "db", app_mock):
-            resp = self.client.get(
-                "/api/v1/auth/users",
-                headers={"Authorization": f"Bearer {self._token('ADMIN')}"},
-            )
+        with (
+            bearer(role="ADMIN") as headers,
+            patch.object(app_module, "db", app_mock),
+        ):
+            resp = self.client.get("/api/v1/auth/users", headers=headers)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"][0]["account_ids"], [UID])
 
     def test_admin_creates_user_and_grants(self) -> None:
         import quantpilot_api.app as app_module
+        from rbac_testkit import bearer
 
         app_mock = MagicMock()
         app_mock.jsonable.side_effect = lambda value: value
@@ -615,7 +624,7 @@ class AdminUserRoutesTests(unittest.TestCase):
             },
         ]
         with (
-            patch.dict(os.environ, SECRET_ENV),
+            bearer(role="ADMIN") as headers,
             patch.object(app_module, "db", app_mock),
             patch("quantpilot_api.app.writers") as writers,
         ):
@@ -627,7 +636,7 @@ class AdminUserRoutesTests(unittest.TestCase):
                     "role": "TRADER",
                     "account_ids": [UID],
                 },
-                headers={"Authorization": f"Bearer {self._token('ADMIN')}"},
+                headers=headers,
             )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["username"], "bob")
@@ -649,19 +658,17 @@ class ApiKeyRoutesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = _client()
 
-    @staticmethod
-    def _token(role: str) -> str:
-        from quantpilot_api import auth
-
-        return auth.issue_token("u-1", "alice", role)
-
     def test_service_key_cannot_mint_user_keys(self) -> None:
-        with patch.dict(os.environ, {"QP_API_KEY": "svc-key"}):
+        # P1-01: the middleware now refuses the service key on business
+        # paths BEFORE the handler's USER_ONLY check can run.
+        from rbac_testkit import service_key
+
+        with service_key() as headers:
             resp = self.client.post(
-                "/api/v1/auth/api-keys", json={"label": "l"}, headers={"X-API-Key": "svc-key"}
+                "/api/v1/auth/api-keys", json={"label": "l"}, headers=headers
             )
         self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["error"]["code"], "USER_ONLY")
+        self.assertEqual(resp.json()["error"]["code"], "USER_IDENTITY_REQUIRED")
 
     def test_create_passes_row_through_jsonable(self) -> None:
         # regression: the INSERT row carries a datetime (created_at); the
@@ -669,6 +676,7 @@ class ApiKeyRoutesTests(unittest.TestCase):
         from datetime import datetime
 
         import quantpilot_api.app as app_module
+        from rbac_testkit import bearer
 
         app_mock = MagicMock()
         seen: list[dict] = []
@@ -682,14 +690,14 @@ class ApiKeyRoutesTests(unittest.TestCase):
             "created_at": datetime(2026, 10, 31, 12, 0, 0),
         }
         with (
-            patch.dict(os.environ, SECRET_ENV),
+            bearer(role="VIEWER") as headers,
             patch.object(app_module, "db", app_mock),
             patch("quantpilot_api.app.writers"),
         ):
             resp = self.client.post(
                 "/api/v1/auth/api-keys",
                 json={"label": "l"},
-                headers={"Authorization": f"Bearer {self._token('VIEWER')}"},
+                headers=headers,
             )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(seen), 1)

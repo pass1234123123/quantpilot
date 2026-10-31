@@ -1,8 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
+import { canWrite } from '../../api'
 
 const store = useDashboardStore()
+
+// Role gating is INTERACTION-only; the backend re-checks on every call.
+const writable = computed(() => canWrite())
 
 const strategies = computed(() => store.strategies)
 const instances = computed(() => store.instances)
@@ -60,7 +64,7 @@ function toggle(i: { instance_id: string; status: 'ENABLED' | 'DISABLED' }) {
             <span class="sp__tag" :class="i.status === 'ENABLED' ? 'is-on' : 'is-off'">{{ i.status }}</span>
           </td>
           <td>
-            <button class="sp__btn" @click="toggle(i)">
+            <button class="sp__btn" :disabled="!writable" @click="toggle(i)">
               {{ i.status === 'ENABLED' ? '停用' : '启用' }}
             </button>
           </td>

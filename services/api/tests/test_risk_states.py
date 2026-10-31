@@ -218,13 +218,17 @@ class StopResumeEndpointTests(unittest.TestCase):
         self.client = TestClient(app_module.app)
 
     def _post(self, path: str, body: dict) -> object:
+        # R2 remediation: /risk/stop and /risk/resume are business routes, so
+        # the service key no longer reaches them (P1-01). Ride the Bearer
+        # lane as an ADMIN; the app-module db patches below are independent
+        # of the auth-module db mock that bearer() installs.
+        from rbac_testkit import bearer
+
         with (
-            patch.dict(os.environ, {"QP_API_KEY": "secret"}),
+            bearer(role="ADMIN") as headers,
             patch.object(self.app_module, "_account_or_404", return_value=ACCOUNT),
         ):
-            return self.client.post(
-                f"{path}", json=body, headers={"X-API-Key": "secret"}
-            )
+            return self.client.post(f"{path}", json=body, headers=headers)
 
     def test_stop_sets_each_escalated_state(self) -> None:
         for status in ESCALATED:

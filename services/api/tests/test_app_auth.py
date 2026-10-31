@@ -1,9 +1,13 @@
-"""X-API-Key service auth: every /api/* route is gated, /healthz stays public.
+"""Service-key gate: every /api/* route is gated, /healthz stays public.
 
 Fail-closed (PRD 14): without QP_API_KEY configured the API refuses all API
 traffic (503) instead of silently running open. The middleware reads the
 environment on every request so the key can be rotated without a restart and
 tests can patch it per-case.
+
+R2 remediation (P1-01): the service key is a MACHINE lane. It carries agent/
+EA traffic on the whitelisted machine paths only; business routes demand a
+named user (403 USER_IDENTITY_REQUIRED).
 """
 
 import os
@@ -35,13 +39,25 @@ class ApiKeyAuthTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["error"]["code"], "UNAUTHORIZED")
 
-    def test_correct_key_reaches_the_router(self) -> None:
+    def test_service_key_passes_on_machine_routes(self) -> None:
+        # P1-01: the service key is the machine lane; POST /commands/pending
+        # is agent traffic. An empty body reaches the ROUTER (pydantic 422),
+        # proving the gate let machine traffic through.
+        with patch.dict(os.environ, {"QP_API_KEY": "secret"}):
+            resp = self.client.post(
+                "/api/v1/commands/pending", json={}, headers={"X-API-Key": "secret"}
+            )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_service_key_rejected_on_business_routes(self) -> None:
+        # P1-01: the same key on ANY business path is refused before the
+        # router - even for a path that does not exist (403, not 404).
         with patch.dict(os.environ, {"QP_API_KEY": "secret"}):
             resp = self.client.get(
                 "/api/v1/definitely-not-a-route", headers={"X-API-Key": "secret"}
             )
-        # passes the gate, then FastAPI 404s the unknown route (NOT 401)
-        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()["error"]["code"], "USER_IDENTITY_REQUIRED")
 
     def test_server_without_configured_key_fails_closed(self) -> None:
         env = {k: v for k, v in os.environ.items() if k != "QP_API_KEY"}

@@ -4,7 +4,10 @@ audit_logs records who/what/when for every state-changing cloud operation
 (config saves, instance status/config updates, command creation, backtest
 creation, AI triggers). record() is best-effort by design: an audit failure
 must never break the audited operation, it logs loudly instead. The query
-side powers GET /api/v1/audit-logs behind the standard X-API-Key gate.
+side powers GET /api/v1/audit-logs.
+
+R2 remediation (P1-01): business routes no longer accept the service key;
+route tests ride the Bearer lane as an ADMIN via rbac_testkit.bearer().
 """
 
 import json
@@ -16,8 +19,9 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
+from rbac_testkit import bearer
+
 TEST_API_KEY = "test-api-key"
-AUTH = {"X-API-Key": TEST_API_KEY}
 
 
 def force_api_key(case: unittest.TestCase) -> None:
@@ -84,7 +88,7 @@ class AuditLogRouteTests(unittest.TestCase):
 
         self.client = TestClient(app_module.app)
 
-    def test_route_requires_api_key(self) -> None:
+    def test_route_requires_authentication(self) -> None:
         resp = self.client.get("/api/v1/audit-logs")
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["error"]["code"], "UNAUTHORIZED")
@@ -94,10 +98,13 @@ class AuditLogRouteTests(unittest.TestCase):
 
         account = uuid4()
         rows = [{"id": "r"}]
-        with patch.object(audit, "list_audit_logs", return_value=rows) as listed:
+        with (
+            bearer(role="ADMIN") as auth_headers,
+            patch.object(audit, "list_audit_logs", return_value=rows) as listed,
+        ):
             resp = self.client.get(
                 f"/api/v1/audit-logs?account_id={account}&action=CONFIG_UPDATE&limit=7",
-                headers=AUTH,
+                headers=auth_headers,
             )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertIsNone(resp.json()["error"])
@@ -107,12 +114,15 @@ class AuditLogRouteTests(unittest.TestCase):
     def test_limit_clamped_and_invalid_account_rejected(self) -> None:
         from quantpilot_api import audit
 
-        with patch.object(audit, "list_audit_logs", return_value=[]) as listed:
-            self.client.get("/api/v1/audit-logs?limit=9999", headers=AUTH)
-            self.assertEqual(listed.call_args.args[2], 500)
-            self.client.get("/api/v1/audit-logs?limit=0", headers=AUTH)
-            self.assertEqual(listed.call_args.args[2], 1)
-        resp = self.client.get("/api/v1/audit-logs?account_id=not-a-uuid", headers=AUTH)
+        with bearer(role="ADMIN") as auth_headers:
+            with patch.object(audit, "list_audit_logs", return_value=[]) as listed:
+                self.client.get("/api/v1/audit-logs?limit=9999", headers=auth_headers)
+                self.assertEqual(listed.call_args.args[2], 500)
+                self.client.get("/api/v1/audit-logs?limit=0", headers=auth_headers)
+                self.assertEqual(listed.call_args.args[2], 1)
+            resp = self.client.get(
+                "/api/v1/audit-logs?account_id=not-a-uuid", headers=auth_headers
+            )
         self.assertEqual(resp.status_code, 400)
 
 
@@ -129,13 +139,14 @@ class AuditWiringTests(unittest.TestCase):
     def test_config_put_records_audit(self) -> None:
         account = uuid4()
         with (
+            bearer(role="ADMIN") as auth_headers,
             patch.object(self.app, "_account_or_404", return_value=account),
             patch.object(self.app.db, "conn"),
             patch.object(self.app, "_active_config_row", return_value=None),
             patch.object(self.app.audit, "record") as record,
         ):
             resp = self.client.put(
-                f"/api/v1/accounts/{account}/config", json={}, headers=AUTH
+                f"/api/v1/accounts/{account}/config", json={}, headers=auth_headers
             )
         self.assertEqual(resp.status_code, 200, resp.text)
         record.assert_called_once()
@@ -149,6 +160,7 @@ class AuditWiringTests(unittest.TestCase):
         instance = uuid4()
         row = {"instance_id": str(instance), "status": "ENABLED"}
         with (
+            bearer(role="ADMIN") as auth_headers,
             patch.object(self.app, "_account_or_404", return_value=account),
             patch.object(self.app, "_instance_or_404", return_value=row),
             patch.object(self.app.db, "conn"),
@@ -157,7 +169,7 @@ class AuditWiringTests(unittest.TestCase):
             resp = self.client.post(
                 f"/api/v1/accounts/{account}/strategy-instances/{instance}/status",
                 json={"status": "ENABLED"},
-                headers=AUTH,
+                headers=auth_headers,
             )
         self.assertEqual(resp.status_code, 200, resp.text)
         record.assert_called_once()
@@ -185,13 +197,16 @@ class AuditWiringTests(unittest.TestCase):
             "volume": "1",
         }
         with (
+            bearer(role="ADMIN") as auth_headers,
+            patch.object(self.app.db, "query_one",
+                         return_value={"account_id": str(account)}),
             patch.object(backtests, "create_backtest", return_value=stored),
             patch.object(self.app.audit, "record") as record,
         ):
             resp = self.client.post(
                 "/api/v1/backtests",
                 json=body,
-                headers={"Idempotency-Key": str(uuid4()), **AUTH},
+                headers={"Idempotency-Key": str(uuid4()), **auth_headers},
             )
         self.assertEqual(resp.status_code, 200, resp.text)
         record.assert_called_once()
@@ -207,6 +222,7 @@ class AuditWiringTests(unittest.TestCase):
         account = uuid4()
         analysis = {"analysis_id": "a1", "market_regime": "RANGE"}
         with (
+            bearer(role="ADMIN") as auth_headers,
             patch.object(self.app, "_account_or_404", return_value=account),
             patch.object(ai_engine, "analyze_on_demand", return_value=("ADVISORY", analysis, None)),
             patch.object(self.app.audit, "record") as record,
@@ -214,7 +230,7 @@ class AuditWiringTests(unittest.TestCase):
             resp = self.client.post(
                 f"/api/v1/accounts/{account}/ai/analyze",
                 json={"broker_symbol": "EURUSD", "timeframe": "M15"},
-                headers=AUTH,
+                headers=auth_headers,
             )
         self.assertEqual(resp.status_code, 200, resp.text)
         record.assert_called_once()

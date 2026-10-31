@@ -1,4 +1,3 @@
-import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -8,10 +7,9 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from rbac_testkit import bearer
 
 NOW = datetime(2026, 1, 5, tzinfo=timezone.utc)
-TEST_API_KEY = "test-api-key"
-AUTH = {"X-API-Key": TEST_API_KEY}
 
 
 def body_dict(instance_id: UUID) -> dict:
@@ -95,20 +93,13 @@ class BacktestContractTests(unittest.TestCase):
 
 class BacktestRouteTests(unittest.TestCase):
     def setUp(self) -> None:
-        # route tests run behind the X-API-Key middleware; force the key so
-        # the suite is hermetic even when the repo .env (loaded at import
-        # time by config.py) already defines a different QP_API_KEY
-        original = os.environ.get("QP_API_KEY")
-        os.environ["QP_API_KEY"] = TEST_API_KEY
+        # R2 remediation (P1-01): business routes demand a named user; every
+        # request below rides the Bearer lane as an ADMIN. bearer() patches
+        # QP_API_KEY/QP_JWT_SECRET per request, so no env forcing is needed.
+        import quantpilot_api.app as app_module
 
-        def restore() -> None:
-            if original is None:
-                os.environ.pop("QP_API_KEY", None)
-            else:
-                os.environ["QP_API_KEY"] = original
-
-        self.addCleanup(restore)
-        self.client = TestClient(__import__("quantpilot_api.app", fromlist=["app"]).app)
+        self.app_module = app_module
+        self.client = TestClient(app_module.app)
         self.instance_id = uuid4()
         self.key = uuid4()
 
@@ -122,11 +113,16 @@ class BacktestRouteTests(unittest.TestCase):
             "status": "COMPLETED",
             "metrics": {},
         }
-        with patch.object(backtests, "create_backtest", return_value=stored) as create:
+        with (
+            bearer(role="ADMIN") as auth_headers,
+            patch.object(self.app_module.db, "query_one",
+                         return_value={"account_id": stored["account_id"]}),
+            patch.object(backtests, "create_backtest", return_value=stored) as create,
+        ):
             response = self.client.post(
                 "/api/v1/backtests",
                 json=body_dict(self.instance_id),
-                headers={"Idempotency-Key": str(self.key), **AUTH},
+                headers={"Idempotency-Key": str(self.key), **auth_headers},
             )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -135,24 +131,35 @@ class BacktestRouteTests(unittest.TestCase):
         create.assert_called_once()
         self.assertEqual(create.call_args.args[1], self.key)
 
-        with patch.object(backtests, "get_backtest", return_value=stored):
-            fetched = self.client.get(f"/api/v1/backtests/{job_id}", headers=AUTH)
+        with (
+            bearer(role="ADMIN") as auth_headers,
+            patch.object(backtests, "get_backtest", return_value=stored),
+        ):
+            fetched = self.client.get(
+                f"/api/v1/backtests/{job_id}", headers=auth_headers
+            )
         self.assertEqual(fetched.status_code, 200, fetched.text)
         self.assertEqual(fetched.json()["data"]["job_id"], str(job_id))
 
     def test_post_requires_idempotency_key(self) -> None:
-        response = self.client.post(
-            "/api/v1/backtests", json=body_dict(self.instance_id), headers=AUTH
-        )
+        with bearer(role="ADMIN") as auth_headers:
+            response = self.client.post(
+                "/api/v1/backtests", json=body_dict(self.instance_id),
+                headers=auth_headers,
+            )
         self.assertEqual(response.status_code, 422)
 
     def test_list_backtests_filters_by_account_and_wraps_envelope(self) -> None:
         from quantpilot_api import backtests
 
         rows = [{"job_id": str(uuid4()), "status": "COMPLETED", "strategy_code": "ma_cross"}]
-        with patch.object(backtests, "list_backtests", return_value=rows) as listed:
+        with (
+            bearer(role="ADMIN") as auth_headers,
+            patch.object(backtests, "list_backtests", return_value=rows) as listed,
+        ):
             response = self.client.get(
-                f"/api/v1/backtests?account_id={self.instance_id}&limit=5", headers=AUTH
+                f"/api/v1/backtests?account_id={self.instance_id}&limit=5",
+                headers=auth_headers,
             )
 
         self.assertEqual(response.status_code, 200, response.text)

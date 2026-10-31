@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { useDashboardStore } from './stores/dashboard'
+import { api, setAuthRequiredListener, type AuthUser } from './api'
+import LoginView from './components/LoginView.vue'
 import SidebarNav from './components/SidebarNav.vue'
 import KpiBand from './components/KpiBand.vue'
 import RiskPanel from './components/panels/RiskPanel.vue'
@@ -71,6 +73,42 @@ const viewSub = computed(() => viewMeta[activeView.value].sub)
 const store = useDashboardStore()
 let timer: ReturnType<typeof setInterval> | null = null
 
+// R2 remediation T6 (login gate): no business view renders before a
+// personal identity exists. Startup re-validates the stored token against
+// the backend (never trusts a cached copy); a mid-session 401 (expiry,
+// revoke, disable, role change) bounces the user back here via the
+// api.ts listener - it never degrades to the shared service key (P1-01).
+const authUser = ref<AuthUser | null>(null)
+const sessionChecking = ref(true)
+
+function startApp() {
+  store.refreshAll()
+  if (timer) clearInterval(timer)
+  timer = setInterval(() => store.refreshAll(), 30000)
+}
+function stopApp() {
+  if (timer) {
+    clearInterval(timer)
+    timer = null
+  }
+}
+
+setAuthRequiredListener(() => {
+  authUser.value = null
+  stopApp()
+})
+
+function onLoggedIn(user: AuthUser) {
+  authUser.value = user
+  startApp()
+}
+
+function logout() {
+  api.logout()
+  authUser.value = null
+  stopApp()
+}
+
 // Tauri webview detection (desktop shell), no extra package dependency.
 const isDesktopShell = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 // Desktop production builds have no Vite proxy: when API calls fail and no
@@ -79,17 +117,30 @@ const desktopNeedsConfig = computed(
   () => isDesktopShell && !localStorage.getItem('qp.apiBase') && !!store.error,
 )
 
-onMounted(() => {
-  store.refreshAll()
-  timer = setInterval(() => store.refreshAll(), 30000)
+onMounted(async () => {
+  try {
+    authUser.value = await api.verifySession()
+  } catch {
+    authUser.value = null
+  } finally {
+    sessionChecking.value = false
+  }
+  if (authUser.value) startApp()
 })
 onBeforeUnmount(() => {
-  if (timer) clearInterval(timer)
+  stopApp()
+  setAuthRequiredListener(null)
 })
 </script>
 
 <template>
-  <div class="shell">
+  <div v-if="sessionChecking" class="boot">
+    <div class="boot__card">正在检查登录会话…</div>
+  </div>
+
+  <LoginView v-else-if="!authUser" @success="onLoggedIn" />
+
+  <div v-else class="shell">
     <SidebarNav :active="activeView" @select="activeView = $event as ViewKey" />
 
     <div class="main">
@@ -99,6 +150,9 @@ onBeforeUnmount(() => {
           <span>{{ viewSub }}</span>
         </div>
         <div class="header__actions">
+          <el-tag size="small" type="info" effect="plain">
+            {{ authUser.username }} · {{ authUser.role }}
+          </el-tag>
           <el-select
             v-if="store.accounts.length > 0"
             :model-value="store.selectedAccountId"
@@ -117,6 +171,7 @@ onBeforeUnmount(() => {
           <el-button size="small" :loading="store.loading" @click="store.refreshAll()">
             刷新
           </el-button>
+          <el-button size="small" type="danger" plain @click="logout">登出</el-button>
         </div>
       </header>
 
@@ -206,6 +261,22 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.boot {
+  height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #0b1420;
+}
+.boot__card {
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--qp-text-dim);
+  padding: 18px 28px;
+  border: 1px solid var(--qp-border);
+  border-radius: 10px;
+  background: rgba(13, 24, 38, 0.9);
+}
+
 .shell {
   display: flex;
   height: 100vh;

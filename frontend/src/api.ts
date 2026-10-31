@@ -1,7 +1,14 @@
 /** Cloud API client (dev via Vite proxy -> http://127.0.0.1:8000).
  *  All responses use the unified envelope {data, error, request_id, timestamp}. */
 
-import { getApiKey } from './secure-store'
+import {
+  clearAuthToken,
+  getApiKey,
+  getAuthToken,
+  getSessionUser,
+  setAuthToken,
+  setSessionUser,
+} from './secure-store'
 
 export interface ApiEnvelope<T> {
   data: T
@@ -509,27 +516,35 @@ function withBase(path: string): string {
   return base ? `${base.replace(/\/+$/, '')}${path}` : path
 }
 
-function apiKeyHeaders(): Record<string, string> {
-  // r3-secure: key comes from the OS credential store cache in desktop
-  // builds (see secure-store.ts); localStorage only in plain browser dev
-  const key = getApiKey()
-  return key ? { 'X-API-Key': key } : {}
-}
-
-// User session (phase-3 R2): a JWT from username/password login takes
-// precedence over the service key. The backend rejects any request that
-// carries an Authorization header outright, so never send both at once.
+// P1-01 remediation: NO service-key fallback for desktop users. The only
+// accepted identities are the logged-in user's JWT (preferred) or a
+// PERSONAL API key (qpk_ prefix). The shared service key is a machine
+// lane (agent/EA) and never identifies a person: a non-qpk_ key is
+// simply not sent, so the backend answers 401 and the gate re-opens.
 function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem('qp.token') ?? ''
+  const token = getAuthToken()
   if (token) return { Authorization: `Bearer ${token}` }
-  return apiKeyHeaders()
+  const key = getApiKey()
+  if (key.startsWith('qpk_')) return { 'X-API-Key': key }
+  return {}
 }
 
-// A 401 with a token present means the session expired (or was revoked):
-// drop it so later requests fall back to the service-key lane.
+type AuthRequiredListener = () => void
+let authRequiredListener: AuthRequiredListener | null = null
+
+/** The app registers this to bounce the UI back to the login gate when
+ *  a session dies (401: expired, revoked, disabled user, role change).
+ *  The session never degrades into the shared service key. */
+export function setAuthRequiredListener(fn: AuthRequiredListener | null): void {
+  authRequiredListener = fn
+}
+
+// A 401 means the session is gone: clear the stored token and notify
+// the gate. There is no fallback identity to degrade into (P1-01).
 function dropSession(): void {
-  localStorage.removeItem('qp.token')
-  localStorage.removeItem('qp.user')
+  void clearAuthToken().catch(() => {})
+  setSessionUser(null)
+  authRequiredListener?.()
 }
 
 async function get<T>(path: string): Promise<T> {
@@ -584,6 +599,18 @@ export interface AuthUser {
   role: string
 }
 
+/** Role helpers for INTERACTION gating only (hide/disable buttons). The
+ *  backend re-validates the role on every request - not a boundary. */
+export function canWrite(): boolean {
+  const role = getSessionUser()?.role
+  return role === 'ADMIN' || role === 'TRADER'
+}
+
+export function canResearch(): boolean {
+  const role = getSessionUser()?.role
+  return role === 'ADMIN' || role === 'TRADER' || role === 'ANALYST'
+}
+
 interface LoginResponse {
   token: string
   token_type: string
@@ -593,9 +620,10 @@ interface LoginResponse {
 
 export const api = {
   // Login posts WITHOUT authHeaders(): the backend rejects requests that
-  // carry an Authorization header, and a stale token must not block a fresh
-  // login. Persisted as qp.token / qp.user (r3-secure moves this to the
-  // OS credential store).
+  // carry an Authorization header, and a stale token must not block a
+  // fresh login (the login route is credential-exempt server-side).
+  // The token goes to the OS credential store on desktop (sessionStorage
+  // in browser dev) - never localStorage (P1-03).
   login: async (username: string, password: string): Promise<AuthUser> => {
     const res = await fetch(withBase('/api/v1/auth/login'), {
       method: 'POST',
@@ -608,19 +636,28 @@ export const api = {
       const message = body?.error?.message ?? '登录失败'
       throw new Error(`${code}: ${message}`)
     }
-    localStorage.setItem('qp.token', body.data.token)
-    localStorage.setItem('qp.user', JSON.stringify(body.data.user))
+    await setAuthToken(body.data.token)
+    setSessionUser(body.data.user)
     return body.data.user
   },
   logout: () => {
     dropSession()
   },
   currentUser: (): AuthUser | null => {
-    const raw = localStorage.getItem('qp.user')
-    if (!raw) return null
+    return getSessionUser()
+  },
+  /** Reload-safe session restore: re-validate the stored token against
+   *  the backend (user still active, role current) instead of trusting
+   *  any cached copy. Returns null when there is no usable session. */
+  verifySession: async (): Promise<AuthUser | null> => {
+    if (!getAuthToken()) return null
     try {
-      return JSON.parse(raw) as AuthUser
+      const me = await get<AuthUser>('/api/v1/auth/me')
+      setSessionUser(me)
+      return me
     } catch {
+      // 401 already cleared the session via get(); anything else also
+      // means "no usable session right now" - the login gate decides.
       return null
     }
   },

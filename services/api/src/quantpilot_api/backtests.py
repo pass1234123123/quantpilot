@@ -61,13 +61,23 @@ def list_backtests(
     account_id: UUID | None = None,
     strategy_instance_id: UUID | None = None,
     limit: int = 100,
+    granted_user_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Job summaries, newest first; optional account/instance filters."""
+    """Job summaries, newest first; optional account/instance filters.
+
+    granted_user_id narrows the unfiltered view to that user's granted
+    accounts (R2 acceptance P1-02); explicit account_ids are grant-checked
+    by the caller before reaching here."""
     where = ["1=1"]
     params: list[Any] = []
     if account_id is not None:
         where.append("j.account_id = %s")
         params.append(account_id)
+    if granted_user_id is not None:
+        where.append(
+            "j.account_id IN (SELECT account_id FROM user_account_grants WHERE user_id = %s)"
+        )
+        params.append(granted_user_id)
     if strategy_instance_id is not None:
         where.append("j.strategy_instance_id = %s")
         params.append(strategy_instance_id)

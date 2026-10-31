@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
-import type { AiAnalysisDoc } from '../../api'
+import { canResearch, type AiAnalysisDoc } from '../../api'
 
 const store = useDashboardStore()
+
+// Role gating is INTERACTION-only; the backend re-checks on every call.
+const researchable = computed(() => canResearch())
 
 const TIMEFRAMES = ['M5', 'M15', 'M30', 'H1', 'H4'] as const
 
@@ -122,7 +125,7 @@ const decisionClass = (d: string) => (d === 'ALLOW' ? 'is-allow' : 'is-review')
         size="small"
         type="primary"
         :loading="store.aiRunning"
-        :disabled="modeIsOff"
+        :disabled="modeIsOff || !researchable"
         @click="runAnalysis"
       >
         运行分析

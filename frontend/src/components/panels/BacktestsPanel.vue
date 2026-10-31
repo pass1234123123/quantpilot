@@ -2,9 +2,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { createChart, LineSeries, type IChartApi, type UTCTimestamp } from 'lightweight-charts'
 import { useDashboardStore } from '../../stores/dashboard'
-import { api, num, type BacktestJobDetail } from '../../api'
+import { api, canResearch, num, type BacktestJobDetail } from '../../api'
 
 const store = useDashboardStore()
+
+// Role gating is INTERACTION-only; the backend re-checks on every call.
+const researchable = computed(() => canResearch())
 
 const jobs = computed(() => store.backtests)
 const selected = ref<BacktestJobDetail | null>(null)
@@ -255,7 +258,7 @@ onBeforeUnmount(() => {
           type="primary"
           size="small"
           :loading="creating"
-          :disabled="store.instances.length === 0"
+          :disabled="store.instances.length === 0 || !researchable"
           @click="submitCreate"
         >
           创建回测任务

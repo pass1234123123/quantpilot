@@ -72,13 +72,23 @@ def list_audit_logs(
     account_id: UUID | None = None,
     action: str | None = None,
     limit: int = 100,
+    granted_user_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Audit rows, newest first; optional account/action filters."""
+    """Audit rows, newest first; optional account/action filters.
+
+    granted_user_id narrows the unfiltered view to that user's granted
+    accounts (R2 acceptance P1-02) - the caller is responsible for having
+    grant-checked any explicit account_id beforehand."""
     where = ["1=1"]
     params: list[Any] = []
     if account_id is not None:
         where.append("l.account_id = %s")
         params.append(account_id)
+    if granted_user_id is not None:
+        where.append(
+            "l.account_id IN (SELECT account_id FROM user_account_grants WHERE user_id = %s)"
+        )
+        params.append(granted_user_id)
     if action is not None:
         where.append("l.action = %s")
         params.append(action)

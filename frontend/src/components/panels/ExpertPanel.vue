@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
+import { canWrite } from '../../api'
 
 const store = useDashboardStore()
+
+// Role gating is INTERACTION-only; the backend re-checks on every call.
+const writable = computed(() => canWrite())
+
 const config = computed(() => store.config)
 
 // 云端 risk_profiles 配置（OBSERVE_ONLY：本切片仅存储与展示，EA 端只记录不执行）
@@ -73,7 +78,7 @@ const save = () => store.saveConfig()
         </div>
       </div>
 
-      <button class="es__save" :disabled="store.configSaving" @click="save">
+      <button class="es__save" :disabled="store.configSaving || !writable" @click="save">
         {{ store.configSaving ? '保存中…' : '保存到云端' }}
       </button>
       <div class="es__note">OBSERVE_ONLY：配置仅存储与下发记录，不驱动任何交易行为</div>
