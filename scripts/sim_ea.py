@@ -270,13 +270,143 @@ def main() -> int:
         },
     )
 
-    # 10. commands endpoint must exist and be empty (OBSERVE_ONLY)
-    r = client.get(AGENT + "/ea/v1/commands", headers=HEADERS)
-    body = r.json()
-    empty = body.get("commands") == []
-    print(f"[commands] empty list: {'OK' if empty else 'FAIL'}")
-    if not empty:
+    # 10. command channel (slice 1: OBSERVE_ONLY receipts, AT-005/AT-006)
+    import uuid
+
+    accounts = client.get(API + "/api/v1/accounts").json()["data"]
+    sim_acc = next((a for a in accounts if a.get("login_ref") == "10001234"), None)
+
+    def poll(recently: list[str]) -> dict:
+        r = client.post(
+            AGENT + "/ea/v1/commands/poll",
+            json={
+                "ea_version": "1.0.0",
+                "terminal": terminal(),
+                "account": account(),
+                "recently_acked": recently,
+                "observed_at": iso_now(),
+            },
+            headers=HEADERS,
+        )
+        return r.json() if r.status_code == 200 else {}
+
+    def ack(cid: str, code: str = "OBSERVE_ONLY_ACK",
+            msg: str = "received; not executed (OBSERVE_ONLY slice 1)") -> int:
+        r = client.post(
+            AGENT + "/ea/v1/commands/ack",
+            json={
+                "ea_version": "1.0.0",
+                "terminal": terminal(),
+                "account": account(),
+                "command_id": cid,
+                "ack_code": code,
+                "ack_message": msg,
+                "observed_at": iso_now(),
+            },
+            headers=HEADERS,
+        )
+        return r.status_code
+
+    def command_status(cid: str) -> str:
+        r = client.get(f"{API}/api/v1/commands/{cid}")
+        return (r.json().get("data") or {}).get("status", f"HTTP{r.status_code}")
+
+    if sim_acc is None:
+        print("[commands] FAIL: sim account not registered yet")
         failures += 1
+    else:
+        account_id = sim_acc["account_id"]
+
+        # 10a. create cmd1 + idempotent replay (AT-005)
+        cmd1 = str(uuid.uuid4())
+        body1 = {
+            "command_id": cmd1,
+            "account_id": account_id,
+            "command_type": "OPEN_MARKET",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(),
+            "created_by": "sim_ea",
+            "payload": {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "volume": "0.10",
+                "stop_loss": "1.07900",
+                "take_profit": "1.09000",
+                "max_deviation_points": 20,
+                "magic_number": 20260831,
+            },
+        }
+        r = client.post(API + "/api/v1/commands", json=body1)
+        first = r.status_code == 200 and r.json()["data"]["created"] is True
+        r2 = client.post(API + "/api/v1/commands", json=body1)
+        replay = r2.status_code == 200 and r2.json()["data"]["created"] is False
+        same_id = r2.json().get("data", {}).get("command_id") == cmd1
+        print(f"[commands] cmd1 create={first} replay_no_new={replay} same_id={same_id}")
+        if not (first and replay and same_id):
+            failures += 1
+
+        # 10b. poll -> one command; second poll -> empty (per-account serial,
+        # DELIVERED is never resent, PRD 2.5 / AT-006)
+        got = poll([]).get("commands", [])
+        delivered = len(got) == 1 and got[0]["command_id"] == cmd1
+        second = poll([]).get("commands", [])
+        not_resent = len(second) == 0
+        print(f"[commands] cmd1 delivered={delivered} not_resent={not_resent}")
+        if not (delivered and not_resent):
+            failures += 1
+
+        # 10c. ack (OBSERVE_ONLY) + duplicate ack (event consumer is idempotent)
+        ack1 = ack(cmd1)
+        ack1b = ack(cmd1)
+        print(f"[commands] cmd1 ack={ack1} duplicate_ack={ack1b}")
+        if ack1 != 200 or ack1b != 200:
+            failures += 1
+
+        # 10d. cmd2 short TTL, delivered but never acked -> UNKNOWN (AT-006:
+        # timeout != not delivered; the cloud never resends)
+        cmd2 = str(uuid.uuid4())
+        client.post(API + "/api/v1/commands", json={
+            "command_id": cmd2,
+            "account_id": account_id,
+            "command_type": "CLOSE_POSITION",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=8)).isoformat(),
+            "created_by": "sim_ea",
+            "payload": {"position_ticket": "900001"},
+        })
+        time.sleep(2)
+        got2 = poll([]).get("commands", [])
+        cmd2_delivered = len(got2) == 1 and got2[0]["command_id"] == cmd2
+        print(f"[commands] cmd2 delivered={cmd2_delivered} (will NOT be acked)")
+        if not cmd2_delivered:
+            failures += 1
+
+        # 10e. cmd3 queued but never polled -> EXPIRED (never delivered)
+        cmd3 = str(uuid.uuid4())
+        client.post(API + "/api/v1/commands", json={
+            "command_id": cmd3,
+            "account_id": account_id,
+            "command_type": "STOP_NEW_RISK",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat(),
+            "created_by": "sim_ea",
+            "payload": {},
+        })
+
+        # let the ack event flow + the sweeper run (10s tick, 15s UNKNOWN grace)
+        print("[commands] waiting for ack flow / sweeper (38s)...")
+        time.sleep(38)
+
+        s1 = command_status(cmd1)
+        s2 = command_status(cmd2)
+        s3 = command_status(cmd3)
+        print(f"[commands] statuses: cmd1={s1} cmd2={s2} cmd3={s3}")
+        if not (s1 == "ACKED" and s2 == "UNKNOWN" and s3 == "EXPIRED"):
+            failures += 1
+
+        # 10f. UNKNOWN reconciled via the recently_acked echo (AT-006)
+        rec = poll([cmd2])
+        s2b = command_status(cmd2)
+        print(f"[commands] cmd2 after echo={s2b} reconciled={rec.get('reconciled')}")
+        if s2b != "ACKED":
+            failures += 1
 
     # 11. config poll: agent must resolve the identity and relay a config
     r = client.post(

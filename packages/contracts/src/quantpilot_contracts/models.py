@@ -16,8 +16,9 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
 
 from .constants import SCHEMA_VERSION
 
@@ -349,3 +350,177 @@ class NodeHeartbeatRequest(BaseModel):
     model_config = StrictModel
 
     node_id: str
+
+
+# ==========================================================================
+# Trade command channel (PRD 13.3/13.4/13.5, ADR-004) - slice 1
+# ==========================================================================
+# Slice-1 semantics: the channel is durable + idempotent + reconcilable, but
+# the EA only ACKS receipt (OBSERVE_ONLY) - no execution exists anywhere yet
+# (PRD 21.3). risk_profile_version / symbol_spec_hash / signature are
+# slice-2 (risk-engine gate) fields and intentionally NOT accepted here.
+
+
+class OpenMarketPayload(BaseModel):
+    """OPEN_MARKET payload (PRD 13.3 example)."""
+
+    model_config = StrictModel
+
+    symbol: str = Field(min_length=1)
+    side: Literal["BUY", "SELL"]
+    volume: Money
+    stop_loss: Money | None = None
+    take_profit: Money | None = None
+    max_deviation_points: int = Field(default=15, ge=0, le=1000)
+    magic_number: int = Field(default=0, ge=0)
+
+
+class PlacePendingPayload(BaseModel):
+    """PLACE_PENDING payload (PRD 13.4: check validity/trigger price/specs)."""
+
+    model_config = StrictModel
+
+    symbol: str = Field(min_length=1)
+    side: Literal["BUY", "SELL"]
+    order_kind: Literal["BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP"]
+    volume: Money
+    price: Money
+    stop_loss: Money | None = None
+    take_profit: Money | None = None
+    magic_number: int = Field(default=0, ge=0)
+
+
+class ModifyPositionPayload(BaseModel):
+    """MODIFY_POSITION payload: ticket required, never remove protection
+    unintentionally (PRD 13.4)."""
+
+    model_config = StrictModel
+
+    position_ticket: str = Field(min_length=1)
+    sl: Money | None = None
+    tp: Money | None = None
+
+
+class ClosePositionPayload(BaseModel):
+    """CLOSE_POSITION payload: ticket required; volume None = full close."""
+
+    model_config = StrictModel
+
+    position_ticket: str = Field(min_length=1)
+    volume: Money | None = None
+
+
+class CancelOrderPayload(BaseModel):
+    """CANCEL_ORDER payload: ticket required (PRD 13.4)."""
+
+    model_config = StrictModel
+
+    order_ticket: str = Field(min_length=1)
+
+
+class EmptyCommandPayload(BaseModel):
+    """STOP_NEW_RISK / RECONCILE carry no parameters."""
+
+    model_config = StrictModel
+
+
+COMMAND_PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
+    "OPEN_MARKET": OpenMarketPayload,
+    "PLACE_PENDING": PlacePendingPayload,
+    "MODIFY_POSITION": ModifyPositionPayload,
+    "CLOSE_POSITION": ClosePositionPayload,
+    "CANCEL_ORDER": CancelOrderPayload,
+    "STOP_NEW_RISK": EmptyCommandPayload,
+    "RECONCILE": EmptyCommandPayload,
+}
+
+CommandType = Literal[
+    "OPEN_MARKET",
+    "PLACE_PENDING",
+    "MODIFY_POSITION",
+    "CLOSE_POSITION",
+    "CANCEL_ORDER",
+    "STOP_NEW_RISK",
+    "RECONCILE",
+]
+
+
+def validate_command_payload(command_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate a command payload against its per-type model (PRD 13.4).
+
+    Returns the JSON-mode dict (money as decimal strings, PRD 13.1/21.3).
+    """
+    model = COMMAND_PAYLOAD_MODELS.get(command_type)
+    if model is None:
+        raise ValueError(f"unsupported command_type: {command_type}")
+    return model.model_validate(payload).model_dump(mode="json")
+
+
+class TradeCommandCreate(BaseModel):
+    """POST /api/v1/commands body (PRD 13.3 subset for slice 1).
+
+    command_id is the caller-assigned idempotency key: a repeated POST with
+    the same command_id returns the original command state instead of
+    creating a second one (AT-005, PRD 2.5/14.1).
+    """
+
+    model_config = StrictModel
+
+    command_id: UUID = Field(description="caller-assigned UUID; unique idempotency key")
+    idempotency_key: UUID | None = None
+    account_id: UUID
+    command_type: CommandType
+    expires_at: datetime = Field(description="commands are undeliverable after this instant")
+    strategy_instance_id: UUID | None = None
+    signal_id: UUID | None = None
+    created_by: str = Field(default="api", max_length=64)
+    payload: dict[str, Any]
+
+    @field_validator("expires_at")
+    @classmethod
+    def _require_tz_aware(cls, value: datetime) -> datetime:
+        # naive datetimes cannot be compared against now(UTC); reject early
+        # with a 422 instead of surfacing as a 500 inside the request handler
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must be timezone-aware (ISO 8601 with offset)")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "TradeCommandCreate":
+        self.payload = validate_command_payload(self.command_type, self.payload)
+        return self
+
+
+class EaCommandPollRequest(BaseModel):
+    """POST /ea/v1/commands/poll body (EA -> agent).
+
+    recently_acked echoes command_ids the EA already processed; the cloud
+    uses the echo to reconcile DELIVERED/UNKNOWN commands to ACKED without
+    resending them (AT-006, PRD 5.5).
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    recently_acked: list[UUID] = Field(default_factory=list)
+    observed_at: datetime
+
+
+class EaCommandAckData(BaseModel):
+    """POST /ea/v1/commands/ack body (EA -> agent) and ea.command_ack data.
+
+    OBSERVE_ONLY slice: this ack certifies RECEIPT only, never execution
+    (PRD 21.3). ack_code: OBSERVE_ONLY_ACK | DUPLICATE | EXPIRED.
+    """
+
+    model_config = StrictModel
+
+    ea_version: str
+    terminal: EaTerminalIdentity
+    account: EaAccountIdentity
+    command_id: UUID
+    ack_code: str = Field(max_length=64)
+    ack_message: str = Field(default="", max_length=512)
+    observed_at: datetime

@@ -682,6 +682,79 @@ def handle_shutdown(data: dict[str, Any]) -> None:
     )
 
 
+def handle_command_ack(data: dict[str, Any]) -> None:
+    """ea.command_ack: EA receipt acknowledgment -> commands state machine.
+
+    OBSERVE_ONLY slice: the ack certifies receipt only, never execution
+    (PRD 21.3). Transitions DELIVERED/UNKNOWN -> ACKED; a redelivered ack for
+    an already-ACKED command is a no-op (JetStream at-least-once, PRD 4.5).
+    The resolved account must match the command's account - an ack arriving
+    under a different identity never mutates the command (PRD 6.3).
+    """
+    terminal_id, account_id = _resolve(data)
+    command_id = str(data.get("command_id") or "")
+    try:
+        command_uuid = UUID(command_id)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"invalid command_id in ack: {command_id!r}")
+    with db.conn() as connection:
+        row = connection.execute(
+            """
+            UPDATE commands
+               SET status         = 'ACKED',
+                   acked_at       = now(),
+                   ack_code       = %s,
+                   ack_message    = %s,
+                   reconciled     = reconciled OR (status = 'UNKNOWN'),
+                   unknown_at     = NULL,
+                   updated_at     = now(),
+                   version        = version + 1
+             WHERE command_id = %s AND account_id = %s
+               AND status IN ('DELIVERED', 'UNKNOWN')
+            RETURNING status
+            """,
+            (data.get("ack_code"), data.get("ack_message") or None, command_uuid, _uuid(account_id)),
+        ).fetchone()
+    if row is not None:
+        add_system_event(
+            source="api-consumer",
+            event_type="command.acked",
+            severity="INFO",
+            payload={
+                "command_id": command_id,
+                "account_id": account_id,
+                "ack_code": data.get("ack_code"),
+                "ack_message": data.get("ack_message"),
+                "ea_version": data.get("ea_version"),
+            },
+        )
+        return
+    # no transition happened: idempotent redelivery (already ACKED) or an
+    # ack that does not match a deliverable command of this account
+    existing = db.query_one(
+        "SELECT status::text AS status FROM commands WHERE command_id = %s",
+        (command_uuid,),
+    )
+    if existing is None:
+        add_system_event(
+            source="api-consumer",
+            event_type="command.ack_unmatched",
+            severity="WARN",
+            payload={"command_id": command_id, "account_id": account_id,
+                     "detail": "ack for unknown command_id"},
+        )
+    elif existing["status"] != "ACKED":
+        add_system_event(
+            source="api-consumer",
+            event_type="command.ack_unmatched",
+            severity="WARN",
+            payload={"command_id": command_id, "account_id": account_id,
+                     "status": existing["status"],
+                     "detail": "ack arrived for a command not in DELIVERED/UNKNOWN"
+                               " (e.g. EXPIRED before delivery, or account mismatch)"},
+        )
+
+
 HANDLERS = {
     "ea.registered": handle_registered,
     "ea.heartbeat": handle_heartbeat,
@@ -691,4 +764,5 @@ HANDLERS = {
     "ea.orders": handle_orders,
     "ea.calendar": handle_calendar,
     "ea.shutdown": handle_shutdown,
+    "ea.command_ack": handle_command_ack,
 }

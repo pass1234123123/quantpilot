@@ -12,24 +12,37 @@
 //|   - sends the MT5 built-in economic calendar (read-only)         |
 //|   - polls the cloud-side account config every 60s and LOGS it    |
 //|     (informational only - it is never applied, OBSERVE_ONLY)     |
+//|   - polls the cloud command channel and ACKS each command         |
+//|     (slice 1: receipt only, NEVER execution - PRD 21.3)           |
 //|   - sends a shutdown note on removal                             |
+//|                                                                   |
+//| Command channel, slice 1 (PRD 13.5 + AT-005/AT-006):            |
+//|   - the EA polls /ea/v1/commands/poll every CommandPollSeconds   |
+//|   - every received command is marked processed BEFORE the ack is |
+//|     sent (terminal GlobalVariable "QPCMD_<id>", survives EA      |
+//|     reloads); a lost ack is still reconcilable via the           |
+//|     recently_acked echo on the next poll (AT-006)                 |
+//|   - duplicate commands get ack_code=DUPLICATE, no side effects    |
+//|   - commands past expires_at get ack_code=EXPIRED                 |
+//|   - everything else gets ack_code=OBSERVE_ONLY_ACK - the payload  |
+//|     is logged and NOT executed                                    |
 //|                                                                   |
 //| What it MUST NOT contain (PRD 21.3):                             |
 //|   - no OrderSend / OrderCheck / CTrade / any order execution      |
 //|   - no position modification, no risk limits, no trading logic    |
-//|   - it never acts on responses other than logging them            |
+//|   - it never acts on responses other than logging / acking them   |
 //|                                                                   |
 //| Identity verification (PRD 6.3): every payload carries the same   |
 //| terminal + account identity; the cloud flags IDENTITY_MISMATCH.   |
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.31"
+#property version   "1.40"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 
-#define QP_EA_VERSION        "1.3.1"
+#define QP_EA_VERSION        "1.4.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
@@ -39,6 +52,10 @@
 #define QP_CALENDAR_REFRESH_SEC 600 // re-report the calendar window (10 min)
 #define QP_CALENDAR_PER_BATCH 200
 #define QP_CALENDAR_PAST_SEC  7200  // include releases from the past 2h
+#define QP_CMD_RECENT_MAX     50    // recently_acked echo ring size (AT-006)
+#define QP_ACK_OBSERVE_ONLY   "OBSERVE_ONLY_ACK"
+#define QP_ACK_DUPLICATE      "DUPLICATE"
+#define QP_ACK_EXPIRED        "EXPIRED"
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
@@ -46,6 +63,7 @@ input string AgentToken       = "";                     // Shared local token (X
 input int    HeartbeatSeconds = 10;                     // Heartbeat interval, 5..15s (PRD 5.7)
 input int    MaxSymbols       = 100;                    // Max Market Watch symbols to report
 input int    CalendarWindowHours = 48;                  // Economic calendar lookahead (hours)
+input int    CommandPollSeconds = 5;                    // Command poll interval, 1..120s
 input string LogLevel         = "INFO";                 // DEBUG | INFO | ERROR
 
 //--- runtime state
@@ -58,6 +76,8 @@ datetime g_last_deal_time  = 0;    // max deal time already reported (0 = full b
 datetime g_last_deals_at   = 0;    // when the deals channel last succeeded
 datetime g_last_config_at  = 0;    // when the config poll last succeeded
 datetime g_last_calendar_at = 0;  // when the calendar report last succeeded
+datetime g_last_command_at = 0;   // when the command poll last succeeded
+string   g_recent_command_ids[]; // recently acked command_ids (echo ring)
 
 //+------------------------------------------------------------------+
 //| Logging                                                          |
@@ -557,6 +577,314 @@ bool QpSendConfigPoll()
   }
 
 //+------------------------------------------------------------------+
+//| Minimal JSON field extraction (response parsing only).           |
+//| QpJson.mqh builds JSON; these helpers read the few scalar fields |
+//| the command poll response carries. Only string / integer values  |
+//| are needed - payloads are logged verbatim, never interpreted.    |
+//+------------------------------------------------------------------+
+bool QpJsonValueStart(const string json, const string key, int &pos)
+  {
+   pos = StringFind(json, "\"" + key + "\"");
+   if(pos < 0)
+      return(false);
+   pos += StringLen(key) + 2;
+   int len = StringLen(json);
+   // skip whitespace, expect ':', skip whitespace again
+   while(pos < len && (StringGetCharacter(json, pos) == ' ' ||
+                       StringGetCharacter(json, pos) == '\t' ||
+                       StringGetCharacter(json, pos) == '\n' ||
+                       StringGetCharacter(json, pos) == '\r'))
+      pos++;
+   if(pos >= len || StringGetCharacter(json, pos) != ':')
+      return(false);
+   pos++;
+   while(pos < len && (StringGetCharacter(json, pos) == ' ' ||
+                       StringGetCharacter(json, pos) == '\t' ||
+                       StringGetCharacter(json, pos) == '\n' ||
+                       StringGetCharacter(json, pos) == '\r'))
+      pos++;
+   return(pos < len);
+  }
+
+string QpJsonGetString(const string json, const string key)
+  {
+   int pos;
+   if(!QpJsonValueStart(json, key, pos))
+      return("");
+   if(StringGetCharacter(json, pos) != '"')
+      return(""); // non-string value
+   pos++;
+   string out = "";
+   int len = StringLen(json);
+   while(pos < len)
+     {
+      ushort c = StringGetCharacter(json, pos);
+      if(c == '\\')
+        {
+         pos++;
+         if(pos >= len)
+            break;
+         ushort e = StringGetCharacter(json, pos);
+         if(e == '"')
+            out += "\"";
+         else if(e == '\\')
+            out += "\\";
+         else if(e == 'n')
+            out += "\n";
+         else if(e == 'r')
+            out += "\r";
+         else if(e == 't')
+            out += "\t";
+         else if(e == 'u')
+           {
+            out += "\\u" + StringSubstr(json, pos + 1, 4); // passthrough
+            pos += 4;
+           }
+         pos++;
+         continue;
+        }
+      if(c == '"')
+         break;
+      out += StringSubstr(json, pos, 1);
+      pos++;
+     }
+   return(out);
+  }
+
+long QpJsonGetLong(const string json, const string key)
+  {
+   int pos;
+   if(!QpJsonValueStart(json, key, pos))
+      return(0);
+   int len = StringLen(json);
+   string token = "";
+   while(pos < len)
+     {
+      ushort c = StringGetCharacter(json, pos);
+      if(c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r')
+         break;
+      token += StringSubstr(json, pos, 1);
+      pos++;
+     }
+   return(StringToInteger(token));
+  }
+
+// extract the raw text of array "key" (bracket-balanced, string-aware)
+bool QpJsonExtractArray(const string json, const string key, string &out)
+  {
+   out = "";
+   int pos;
+   if(!QpJsonValueStart(json, key, pos))
+      return(false);
+   if(StringGetCharacter(json, pos) != '[')
+      return(false);
+   int len = StringLen(json);
+   int depth = 0;
+   bool in_string = false;
+   int start = pos;
+   while(pos < len)
+     {
+      ushort c = StringGetCharacter(json, pos);
+      if(in_string)
+        {
+         if(c == '\\')
+            pos++; // skip escaped char
+         else if(c == '"')
+            in_string = false;
+        }
+      else
+        {
+         if(c == '"')
+            in_string = true;
+         else if(c == '[')
+            depth++;
+         else if(c == ']')
+           {
+            depth--;
+            if(depth == 0)
+              {
+               out = StringSubstr(json, start, pos - start + 1);
+               return(true);
+              }
+           }
+        }
+      pos++;
+     }
+   return(false);
+  }
+
+// split a JSON array of objects into individual object strings
+int QpJsonSplitObjects(const string array_json, string &objs[])
+  {
+   ArrayResize(objs, 0);
+   int len = StringLen(array_json);
+   int depth = 0;
+   bool in_string = false;
+   int obj_start = -1;
+   for(int pos = 0; pos < len; pos++)
+     {
+      ushort c = StringGetCharacter(array_json, pos);
+      if(in_string)
+        {
+         if(c == '\\')
+            pos++;
+         else if(c == '"')
+            in_string = false;
+         continue;
+        }
+      if(c == '"')
+         in_string = true;
+      else if(c == '{')
+        {
+         if(depth == 0)
+            obj_start = pos;
+         depth++;
+        }
+      else if(c == '}')
+        {
+         depth--;
+         if(depth == 0 && obj_start >= 0)
+           {
+            int n = ArraySize(objs);
+            ArrayResize(objs, n + 1);
+            objs[n] = StringSubstr(array_json, obj_start, pos - obj_start + 1);
+            obj_start = -1;
+           }
+        }
+     }
+   return(ArraySize(objs));
+  }
+
+//+------------------------------------------------------------------+
+//| Command dedup (AT-005): terminal-level GlobalVariable marker.    |
+//| GlobalVariables persist across EA reloads within the terminal,  |
+//| so a re-attached EA still recognizes commands it already acked.|
+//+------------------------------------------------------------------+
+bool QpCommandProcessed(const string command_id)
+  {
+   return(GlobalVariableCheck("QPCMD_" + command_id));
+  }
+
+void QpMarkCommandProcessed(const string command_id)
+  {
+   GlobalVariableSet("QPCMD_" + command_id, (double)TimeGMT());
+  }
+
+// remember command_id for the recently_acked echo (AT-006 reconciliation)
+void QpRememberCommand(const string command_id)
+  {
+   int n = ArraySize(g_recent_command_ids);
+   if(n < QP_CMD_RECENT_MAX)
+     {
+      ArrayResize(g_recent_command_ids, n + 1);
+      g_recent_command_ids[n] = command_id;
+      return;
+     }
+   for(int i = 0; i < n - 1; i++)
+      g_recent_command_ids[i] = g_recent_command_ids[i + 1];
+   g_recent_command_ids[n - 1] = command_id;
+  }
+
+string QpRecentCommandsJson()
+  {
+   string out = "";
+   int n = ArraySize(g_recent_command_ids);
+   for(int i = 0; i < n; i++)
+     {
+      if(i > 0)
+         out += ",";
+      out += "\"" + g_recent_command_ids[i] + "\"";
+     }
+   return("[" + out + "]");
+  }
+
+//+------------------------------------------------------------------+
+//| Command receipt (slice 1: OBSERVE_ONLY - receipt, no execution) |
+//+------------------------------------------------------------------+
+bool QpSendCommandAck(const string command_id, const string ack_code,
+                      const string ack_message)
+  {
+   QpJsonObject o;
+   o.Clear();
+   o.AddStr("ea_version", QP_EA_VERSION);
+   o.AddRaw("terminal", g_terminal_json);
+   o.AddRaw("account", QpAccountJson());
+   o.AddStr("command_id", command_id);
+   o.AddStr("ack_code", ack_code);
+   o.AddStr("ack_message", ack_message);
+   o.AddStr("observed_at", QpIsoNow());
+   return(QpHttpPost("/ea/v1/commands/ack", o.Dump()));
+  }
+
+void QpHandleCommand(const string cmd_json)
+  {
+   string command_id   = QpJsonGetString(cmd_json, "command_id");
+   string command_type = QpJsonGetString(cmd_json, "command_type");
+   long   expires_unix = QpJsonGetLong(cmd_json, "expires_at_unix");
+
+   if(command_id == "")
+     {
+      QpLog("ERROR", "command without command_id; ignored");
+      return;
+     }
+
+   // duplicate delivery (at-least-once transport): ack DUPLICATE, no effects
+   if(QpCommandProcessed(command_id))
+     {
+      QpLog("DEBUG", "command " + command_id + " duplicate; acking DUPLICATE");
+      QpSendCommandAck(command_id, QP_ACK_DUPLICATE, "already processed (terminal dedup)");
+      return;
+     }
+
+   // mark FIRST, ack second: if this ack is lost in transit, the next poll's
+   // recently_acked echo still lets the cloud reconcile the UNKNOWN row
+   QpMarkCommandProcessed(command_id);
+   QpRememberCommand(command_id);
+
+   if(expires_unix > 0 && TimeGMT() > (datetime)expires_unix)
+     {
+      QpLog("INFO", "command " + command_id + " (" + command_type +
+            ") received after expiry; acking EXPIRED");
+      QpSendCommandAck(command_id, QP_ACK_EXPIRED, "received after expires_at");
+      return;
+     }
+
+   // OBSERVE_ONLY (PRD 21.3): the payload is logged, NEVER executed
+   QpLog("INFO", "command " + command_id + " (" + command_type +
+         ") acked OBSERVE_ONLY_ACK (slice 1: receipt only)");
+   QpSendCommandAck(command_id, QP_ACK_OBSERVE_ONLY,
+                    "received; not executed (OBSERVE_ONLY slice 1)");
+  }
+
+//+------------------------------------------------------------------+
+//| Command poll: identity + recently_acked -> agent -> command list |
+//| PRD 2.5: the cloud returns at most one QUEUED command per poll. |
+//+------------------------------------------------------------------+
+bool QpPollCommands()
+  {
+   QpJsonObject o;
+   o.Clear();
+   o.AddStr("ea_version", QP_EA_VERSION);
+   o.AddRaw("terminal", g_terminal_json);
+   o.AddRaw("account", QpAccountJson());
+   o.AddRaw("recently_acked", QpRecentCommandsJson());
+   o.AddStr("observed_at", QpIsoNow());
+   string body = "";
+   if(!QpHttpPost("/ea/v1/commands/poll", o.Dump(), body))
+      return(false);
+
+   string array_json;
+   if(!QpJsonExtractArray(body, "commands", array_json))
+      return(true); // no commands key / empty array -> nothing pending
+
+   string objs[];
+   int n = QpJsonSplitObjects(array_json, objs);
+   for(int i = 0; i < n; i++)
+      QpHandleCommand(objs[i]);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| Economic calendar (MT5 built-in, read-only)                       |
 //+------------------------------------------------------------------+
 string QpCalendarImportanceLabel(const long importance)
@@ -800,6 +1128,11 @@ int OnInit()
       QpLog("ERROR", "HeartbeatSeconds must be within 5..15 (PRD 5.7)");
       return(INIT_PARAMETERS_INCORRECT);
      }
+   if(CommandPollSeconds < 1 || CommandPollSeconds > 120)
+     {
+      QpLog("ERROR", "CommandPollSeconds must be within 1..120");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
 
    EventSetTimer(HeartbeatSeconds);
 
@@ -883,6 +1216,13 @@ void OnTimer()
      {
       if(QpSendConfigPoll())
          g_last_config_at = TimeGMT();
+     }
+
+   // command channel poll (OBSERVE_ONLY acks, never execution - PRD 21.3)
+   if(g_last_command_at == 0 || TimeGMT() - g_last_command_at >= CommandPollSeconds)
+     {
+      if(QpPollCommands())
+         g_last_command_at = TimeGMT();
      }
 
    // economic calendar window (read-only; actual values arrive after release)

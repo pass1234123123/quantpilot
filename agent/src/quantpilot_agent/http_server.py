@@ -12,10 +12,15 @@ Endpoints (all JSON):
     POST /ea/v1/config         identity -> cloud lookup -> config response
                                (synchronous; NOT an event; informational for
                                the EA, OBSERVE_ONLY - PRD 21.3)
-    GET  /ea/v1/commands       S1: always empty list (command channel reserved)
+    POST /ea/v1/commands/poll  identity + recently_acked -> cloud pending
+                               commands -> relay to the EA (PRD 2.5: at most
+                               one command per account per poll)
+    POST /ea/v1/commands/ack   command receipt (OBSERVE_ONLY_ACK, never
+                               execution) -> ea.command_ack event
 
-The agent is OBSERVE_ONLY in this slice: it never returns trade commands and
-contains no order-execution code of any kind (PRD 21.3).
+Slice 1 command channel: the EA only ACKs commands, it never executes them
+(OBSERVE_ONLY - PRD 21.3). The agent contains no order-execution code of any
+kind; it relays opaque command payloads and receipts only.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import httpx
 
 from quantpilot_contracts.constants import (
     EVENT_EA_CALENDAR,
+    EVENT_EA_COMMAND_ACK,
     EVENT_EA_DEALS,
     EVENT_EA_HEARTBEAT,
     EVENT_EA_ORDERS,
@@ -41,6 +47,8 @@ from quantpilot_contracts.constants import (
 )
 from quantpilot_contracts.models import (
     EaCalendarData,
+    EaCommandAckData,
+    EaCommandPollRequest,
     EaDealsData,
     EaHeartbeatData,
     EaOrdersData,
@@ -159,6 +167,47 @@ class AgentHttpServer:
                     }
                 )
 
+            def _handle_command_poll(self, body: dict[str, Any]) -> None:
+                """EA identity + recently_acked -> cloud pending -> relay.
+
+                PRD 2.5: the cloud returns at most one QUEUED command per
+                account per poll (per-account serial execution). The agent
+                relays the payload verbatim; command contents are opaque to
+                it (no execution code here - OBSERVE_ONLY, PRD 21.3).
+                recently_acked echoes the command_ids the EA already
+                processed, letting the cloud reconcile UNKNOWN rows (AT-006)
+                even when the original ack event was lost in transit.
+                """
+                model = EaCommandPollRequest.model_validate(body)
+                sanitized = _sanitize(model.model_dump(mode="json"))
+                terminal = sanitized.get("terminal") or {}
+                account = sanitized.get("account") or {}
+                resp = outer._cloud.post(
+                    "/api/v1/commands/pending",
+                    json={
+                        "data_path_hash": terminal.get("data_path_hash", ""),
+                        "login_ref": account.get("login_ref", ""),
+                        "server": account.get("server", ""),
+                        "recently_acked": sanitized.get("recently_acked") or [],
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json().get("data") or {}
+                commands = data.get("commands") or []
+                info(
+                    "http.command_poll",
+                    resolved=data.get("resolved"),
+                    delivered=len(commands),
+                    reconciled=data.get("reconciled", 0),
+                )
+                self._ok(
+                    {
+                        "commands": commands,
+                        "reconciled": data.get("reconciled", 0),
+                        "resolved": bool(data.get("resolved")),
+                    }
+                )
+
             def log_message(self, fmt: str, *args: Any) -> None:  # route stdlib logs through structured logger
                 info("http.access", line=fmt % args)
 
@@ -168,10 +217,6 @@ class AgentHttpServer:
                     return
                 if not self._authorized():
                     self._err(401, "UNAUTHORIZED", "missing or invalid X-QP-Token")
-                    return
-                if self.path == "/ea/v1/commands":
-                    # S1: command channel reserved, always empty (OBSERVE_ONLY)
-                    self._ok({"commands": []})
                     return
                 self._err(404, "NOT_FOUND", f"no route for GET {self.path}")
 
@@ -192,6 +237,30 @@ class AgentHttpServer:
                     except Exception as exc:
                         warn("http.config_lookup_failed", error=str(exc))
                         self._err(502, "CLOUD_LOOKUP_FAILED", str(exc))
+                    return
+
+                # synchronous command poll: cloud pending -> relay to the EA
+                if route == "/ea/v1/commands/poll":
+                    try:
+                        self._handle_command_poll(body)
+                    except Exception as exc:
+                        warn("http.command_poll_failed", error=str(exc))
+                        self._err(502, "CLOUD_POLL_FAILED", str(exc))
+                    return
+
+                # command receipt -> event stream (at-least-once; the cloud
+                # side dedupes by command_id, PRD AT-005)
+                if route == "/ea/v1/commands/ack":
+                    try:
+                        model = EaCommandAckData.model_validate(body)
+                    except Exception as exc:
+                        warn("http.validation_failed", route=route, error=str(exc))
+                        self._err(400, "VALIDATION_FAILED", str(exc))
+                        return
+                    data = _sanitize(model.model_dump(mode="json"))
+                    outer._event_queue.put(make_event_item(EVENT_EA_COMMAND_ACK, data))
+                    info("http.enqueued", route=route, event_type=EVENT_EA_COMMAND_ACK)
+                    self._ok()
                     return
 
                 try:

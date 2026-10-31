@@ -1,8 +1,8 @@
 """FastAPI application: node/terminal/account routes + health (PRD 13.2).
 
 All responses use the unified envelope {data, error, request_id, timestamp}.
-This slice has NO auth/RBAC yet - routes are read-only or idempotent upserts;
-command routes (POST /api/v1/commands etc.) are intentionally absent.
+This slice has NO auth/RBAC yet; trade commands are channel-only: the EA
+acknowledges receipt and never executes (OBSERVE_ONLY, PRD 21.3).
 """
 
 from __future__ import annotations
@@ -14,29 +14,40 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 
+import psycopg.errors
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from quantpilot_contracts.models import NodeHeartbeatRequest, NodeRegisterRequest
+from quantpilot_contracts.models import (
+    NodeHeartbeatRequest,
+    NodeRegisterRequest,
+    TradeCommandCreate,
+)
 
 from . import db, writers
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
+from .sweeper import CommandSweeper
 
 logger = logging.getLogger("quantpilot.api")
 
 _consumer: NodeEventsConsumer | None = None
+_sweeper: CommandSweeper | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _consumer
+    global _consumer, _sweeper
     db.init_pool()
     _consumer = NodeEventsConsumer()
     _consumer.start()
-    logger.info("api up: pool ready, consumer running")
+    _sweeper = CommandSweeper()
+    _sweeper.start()
+    logger.info("api up: pool ready, consumer + sweeper running")
     yield
+    if _sweeper is not None:
+        _sweeper.stop()
     if _consumer is not None:
         _consumer.stop()
     db.close_pool()
@@ -578,12 +589,13 @@ def put_account_config(account_id: str, body: AccountConfig, request: Request) -
     return ok(db.jsonable(_config_payload(row, account_id)), request)
 
 
-@app.post("/api/v1/config/lookup")
-def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
-    """Resolve an identity tuple (terminal data-path hash + login/server) to
-    the account config. Unresolvable identities get the defaults with
-    resolved=false (cloud stays stateless per doc 4.4)."""
-    row = db.query_one(
+def _resolve_account_by_identity(data_path_hash: str, login_ref: str, server: str) -> dict | None:
+    """Identity tuple (terminal data-path hash + login/server) -> account row.
+
+    Used by /config/lookup and /commands/pending; the cloud stays stateless
+    per doc 4.4 - no extra round-trip is stored on the agent.
+    """
+    return db.query_one(
         """
         SELECT a.id::text AS account_id
           FROM trading_accounts a
@@ -592,8 +604,16 @@ def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
          ORDER BY a.last_seen_at DESC NULLS LAST
          LIMIT 1
         """,
-        (body.data_path_hash, body.login_ref, body.server),
+        (data_path_hash, login_ref, server),
     )
+
+
+@app.post("/api/v1/config/lookup")
+def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
+    """Resolve an identity tuple (terminal data-path hash + login/server) to
+    the account config. Unresolvable identities get the defaults with
+    resolved=false (cloud stays stateless per doc 4.4)."""
+    row = _resolve_account_by_identity(body.data_path_hash, body.login_ref, body.server)
     if row is None:
         payload = _config_payload(None, None)
         payload["resolved"] = False
@@ -603,6 +623,264 @@ def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
     payload = _config_payload(active, row["account_id"])
     payload["resolved"] = True
     return ok(db.jsonable(payload), request)
+
+
+# --------------------------------------------------------------------------
+# trade commands (PRD 13.3-13.5, ADR-004) - durable channel + idempotency +
+# UNKNOWN reconciliation. OBSERVE_ONLY: the EA acks receipt and NEVER executes
+# (PRD 21.3); risk-engine gate fields are slice 2.
+# --------------------------------------------------------------------------
+
+COMMAND_STATUSES = ("QUEUED", "DELIVERED", "ACKED", "EXPIRED", "UNKNOWN")
+COMMAND_MAX_TTL_SECONDS = 600
+
+_COMMAND_SELECT = """
+    SELECT c.command_id::text AS command_id, c.account_id::text AS account_id,
+           c.command_type, c.payload, c.status, c.expires_at,
+           c.created_by, c.strategy_instance_id, c.signal_id,
+           c.delivery_attempts, c.delivered_at, c.acked_at, c.ack_code,
+           c.ack_message, c.reconciled, c.unknown_at, c.expired_at,
+           c.created_at, c.updated_at
+      FROM commands c
+"""
+
+
+class CommandPendingRequest(BaseModel):
+    """POST /api/v1/commands/pending body (agent -> cloud).
+
+    recently_acked echoes command_ids the EA already processed; the cloud
+    reconciles DELIVERED/UNKNOWN commands to ACKED without resending (AT-006).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    data_path_hash: str
+    login_ref: str
+    server: str
+    recently_acked: list[UUID] = []
+
+
+def _command_by_id(command_uuid: UUID) -> dict | None:
+    return db.query_one(_COMMAND_SELECT + " WHERE c.command_id = %s", (command_uuid,))
+
+
+def _command_payload(row: dict, created: bool | None) -> dict:
+    payload = db.jsonable(row)
+    if created is not None:
+        payload["created"] = created
+    return payload
+
+
+@app.post("/api/v1/commands")
+def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
+    """Persist a trade command intent (idempotent on command_id, AT-005/PRD 2.5).
+
+    Creating neither delivers nor executes anything (PRD 13.5: QUEUED means
+    persisted only). A duplicate POST with the same command_id replays the
+    original command state; the same command_id with different content is a
+    client bug and rejected with 409.
+    """
+    account_uuid = _account_or_404(str(body.account_id))
+    now = datetime.now(timezone.utc)
+    if not now < body.expires_at <= now + timedelta(seconds=COMMAND_MAX_TTL_SECONDS):
+        raise HTTPException(400, "expires_at must be in the future and at most 600s ahead")
+    if body.idempotency_key is not None:
+        clash = db.query_one(
+            """
+            SELECT command_id::text AS command_id
+              FROM commands
+             WHERE idempotency_key = %s AND command_id <> %s
+            """,
+            (str(body.idempotency_key), str(body.command_id)),
+        )
+        if clash is not None:
+            raise HTTPException(409, "idempotency_key already used by another command")
+    existing = _command_by_id(body.command_id)
+    if existing is not None:
+        if existing["account_id"] != str(account_uuid) or existing["command_type"] != body.command_type:
+            raise HTTPException(409, "command_id already exists with different content")
+        return ok(_command_payload(existing, created=False), request)
+    try:
+        with db.conn() as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO commands (command_id, idempotency_key, account_id,
+                                      command_type, payload, status, expires_at,
+                                      created_by, strategy_instance_id, signal_id)
+                VALUES (%s, %s, %s, %s, CAST(%s AS jsonb), 'QUEUED', %s, %s, %s, %s)
+                ON CONFLICT (command_id) DO NOTHING
+                RETURNING command_id::text
+                """,
+                (
+                    str(body.command_id),
+                    str(body.idempotency_key) if body.idempotency_key is not None else None,
+                    account_uuid,
+                    body.command_type,
+                    json.dumps(body.payload),
+                    body.expires_at,
+                    body.created_by,
+                    str(body.strategy_instance_id) if body.strategy_instance_id is not None else None,
+                    str(body.signal_id) if body.signal_id is not None else None,
+                ),
+            ).fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        # partial unique index on idempotency_key lost a rare concurrent race
+        raise HTTPException(409, f"idempotency conflict: {exc}") from exc
+    if inserted is None:  # identical concurrent POST: replay the original
+        row = _command_by_id(body.command_id)
+        assert row is not None
+        return ok(_command_payload(row, created=False), request)
+    writers.add_system_event(
+        source="api",
+        event_type="command.created",
+        severity="INFO",
+        payload={
+            "command_id": str(body.command_id),
+            "account_id": str(account_uuid),
+            "command_type": body.command_type,
+            "created_by": body.created_by,
+            "expires_at": body.expires_at.isoformat(),
+            "signal_id": str(body.signal_id) if body.signal_id is not None else None,
+            "strategy_instance_id": str(body.strategy_instance_id)
+            if body.strategy_instance_id is not None
+            else None,
+        },
+    )
+    row = _command_by_id(body.command_id)
+    assert row is not None
+    return ok(_command_payload(row, created=True), request)
+
+
+@app.get("/api/v1/commands")
+def list_commands(
+    request: Request,
+    account_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> JSONResponse:
+    """Command list, newest-first; optional account/status filters."""
+    limit = max(1, min(limit, 500))
+    if status is not None and status not in COMMAND_STATUSES:
+        raise HTTPException(400, f"status must be one of {COMMAND_STATUSES}")
+    where = ["1=1"]
+    params: list = []
+    if account_id is not None:
+        try:
+            params.append(UUID(account_id))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(400, "invalid account_id")
+        where.append("c.account_id = %s")
+    if status is not None:
+        params.append(status)
+        where.append("c.status = %s")
+    rows = db.query(
+        f"{_COMMAND_SELECT} WHERE {' AND '.join(where)} ORDER BY c.created_at DESC LIMIT %s",
+        (*params, limit),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/commands/{command_id}")
+def get_command(command_id: str, request: Request) -> JSONResponse:
+    """Current command state (PRD 13.5: the frontend must show the REAL state)."""
+    try:
+        command_uuid = UUID(command_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "command not found")
+    row = _command_by_id(command_uuid)
+    if row is None:
+        raise HTTPException(404, "command not found")
+    return ok(_command_payload(row, created=None), request)
+
+
+@app.post("/api/v1/commands/pending")
+def pending_commands(body: CommandPendingRequest, request: Request) -> JSONResponse:
+    """Agent -> cloud: hand out the next QUEUED command of an identity-resolved
+    account - at most ONE per fetch (PRD 2.5 per-account serialization) - and
+    reconcile the EA's recently-acked ids first (AT-006).
+
+    Fetching marks the command DELIVERED; a fetched command is never handed
+    out again even if the EA never saw it - it becomes UNKNOWN instead
+    (PRD 5.5: no blind resend).
+    """
+    resolved = _resolve_account_by_identity(body.data_path_hash, body.login_ref, body.server)
+    if resolved is None:
+        return ok({"commands": [], "reconciled": 0, "resolved": False}, request)
+    account_uuid = UUID(resolved["account_id"])
+    reconciled = 0
+    if body.recently_acked:
+        with db.conn() as connection:
+            rows = connection.execute(
+                """
+                UPDATE commands
+                   SET status = 'ACKED', acked_at = now(),
+                       ack_code = 'RECONCILED',
+                       ack_message = 'reconciled via EA recently-acked echo',
+                       reconciled = true, unknown_at = NULL,
+                       updated_at = now(), version = version + 1
+                 WHERE account_id = %s AND command_id = ANY(CAST(%s AS uuid[]))
+                   AND status IN ('DELIVERED', 'UNKNOWN')
+                RETURNING command_id::text, account_id::text
+                """,
+                (account_uuid, [str(u) for u in body.recently_acked]),
+            ).fetchall()
+        reconciled = len(rows)
+        for row in rows:
+            writers.add_system_event(
+                source="api",
+                event_type="command.reconciled",
+                severity="INFO",
+                payload={
+                    "command_id": row[0],
+                    "account_id": row[1],
+                    "detail": "DELIVERED/UNKNOWN command matched the EA's"
+                              " recently-acked echo (AT-006)",
+                },
+            )
+    with db.conn() as connection:
+        row = connection.execute(
+            """
+            UPDATE commands
+               SET status = 'DELIVERED', delivered_at = now(),
+                   delivery_attempts = delivery_attempts + 1,
+                   updated_at = now(), version = version + 1
+             WHERE id IN (
+                    SELECT id FROM commands
+                     WHERE account_id = %s AND status = 'QUEUED' AND expires_at > now()
+                     ORDER BY created_at
+                      FOR UPDATE SKIP LOCKED
+                     LIMIT 1
+                 )
+            RETURNING command_id::text, command_type, payload, expires_at
+            """,
+            (account_uuid,),
+        ).fetchone()
+    commands = []
+    if row is not None:
+        expires = row[3]
+        commands.append(
+            {
+                "command_id": row[0],
+                "command_type": row[1],
+                "payload": row[2],
+                "expires_at": expires.isoformat(),
+                # unix seconds let the EA compare against TimeGMT() without
+                # parsing ISO timestamps (MQL5 has no ISO parser, PRD 21.3)
+                "expires_at_unix": int(expires.timestamp()),
+            }
+        )
+        writers.add_system_event(
+            source="api",
+            event_type="command.delivered",
+            severity="INFO",
+            payload={
+                "command_id": row[0],
+                "account_id": str(account_uuid),
+                "detail": "handed to the local agent for the EA"
+                          " (one per fetch, per-account serialization)",
+            },
+        )
+    return ok({"commands": commands, "reconciled": reconciled, "resolved": True}, request)
 
 
 # --------------------------------------------------------------------------

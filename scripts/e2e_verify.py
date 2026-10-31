@@ -40,6 +40,7 @@ TABLES = [
     "orders",
     "calendar_events",
     "risk_profiles",
+    "commands",
     "system_events",
 ]
 
@@ -219,6 +220,37 @@ def main() -> int:
             n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             ok = n >= 1
             check(f"pg.{table}", ok, f"rows={n}")
+
+        # ---- 3. Command channel invariants (AT-005/AT-006, PRD 13.5) -------
+        dup = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT command_id FROM commands GROUP BY command_id HAVING count(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+        check("pg.commands_unique", dup == 0, f"duplicate_command_ids={dup}")
+
+        acked = conn.execute(
+            "SELECT count(*) FROM commands WHERE status = 'ACKED'"
+        ).fetchone()[0]
+        check("pg.commands_acked", acked >= 1, f"acked={acked}")
+
+        reconciled = conn.execute(
+            "SELECT count(*) FROM commands WHERE status = 'ACKED' AND reconciled"
+        ).fetchone()[0]
+        check("pg.commands_reconciled", reconciled >= 1,
+              f"reconciled_from_unknown={reconciled}")
+
+        expired = conn.execute(
+            "SELECT count(*) FROM commands WHERE status = 'EXPIRED'"
+        ).fetchone()[0]
+        check("pg.commands_expired", expired >= 1, f"expired={expired}")
+
+        cmd_events = conn.execute(
+            "SELECT count(*) FROM system_events WHERE event_type LIKE 'command.%'"
+        ).fetchone()[0]
+        check("pg.command_events", cmd_events >= 5, f"events={cmd_events}")
 
     return finish()
 
