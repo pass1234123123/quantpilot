@@ -1,12 +1,16 @@
 """FastAPI application: node/terminal/account routes + health (PRD 13.2).
 
 All responses use the unified envelope {data, error, request_id, timestamp}.
-Service auth (PRD 14): every /api/* route requires the X-API-Key header;
-RBAC/user roles are deferred to the commercialization phase. Trade commands
-are channel-only: the EA acknowledges receipt and never executes
-(OBSERVE_ONLY, PRD 21.3). The cloud risk gate (PRD 9) refuses
-risk-increasing commands BEFORE they are queued: they land in terminal
-state REJECTED and are never delivered.
+Auth (PRD 14, phase-3 R2): one fail-closed gate, three credential lanes -
+the service key (X-API-Key == QP_API_KEY, machine channel, unchanged),
+Bearer JWTs from username/password login, and per-user qpk_... API keys.
+Named users carry one of four roles (ADMIN/TRADER/ANALYST/VIEWER) and only
+reach accounts they are granted. Trade commands flow through the durable
+channel only; the cloud risk gate (PRD 9) refuses risk-increasing commands
+BEFORE they are queued: they land in terminal state REJECTED and are never
+delivered. EA-side execution is mode-gated (DRY_RUN pre-checks, live orders
+only on DEMO accounts with LiveTrading enabled) with crash recovery via
+EXECUTE_UNRESOLVED + reconciliation (phase-3 R1).
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from quantpilot_contracts.models import (
     TradeCommandCreate,
 )
 
-from . import audit, backtests, command_service, db, reconcile, risk, writers
+from . import audit, auth, backtests, command_service, db, reconcile, risk, writers
 from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
@@ -82,16 +86,28 @@ def healthz() -> JSONResponse:
 
 
 # --------------------------------------------------------------------------
-# service auth (PRD 14): every /api/* route requires the X-API-Key header.
-# Fail-closed: without QP_API_KEY configured the API refuses all traffic
-# (503) instead of silently running open. Non-/api/ paths (/healthz, docs)
-# stay public. The env is read per request so the key can be rotated
-# without a restart.
+# auth gate (PRD 14, phase-3 R2): fail-closed, three credential lanes.
+#
+#   1. service key   X-API-Key == QP_API_KEY -> machine channel (unchanged;
+#                    env read per request so the key can rotate w/o restart)
+#   2. Bearer JWT     username/password login -> HS256 JWT (auth module)
+#   3. user API key   qpk_... (sha256 at rest, revocable) - resolved only
+#                    when the supplied key is not the service key
+#
+# Order of checks, never reordered (fail-closed precedence, tested):
+#   QP_API_KEY not configured -> 503 (ALL traffic incl. login)
+#   -> bad/absent credentials -> 401
+#   -> role deny -> 403 (SERVICE_KEY_ONLY / ADMIN_ONLY / ROLE_FORBIDDEN)
+#   -> account not granted -> 403 ACCOUNT_NOT_GRANTED
+# Non-/api/ paths (/healthz, docs) stay public. An explicit but invalid
+# Authorization header is rejected without falling through to another
+# credential. POST /api/v1/auth/login is exempt from the credential gate
+# (it IS the credential exchange) but never from the fail-closed check.
 # --------------------------------------------------------------------------
 
 
 @app.middleware("http")
-async def require_api_key(request: Request, call_next):
+async def authenticate_request(request: Request, call_next):
     path = request.url.path
     if not path.startswith("/api/"):
         return await call_next(request)
@@ -99,20 +115,47 @@ async def require_api_key(request: Request, call_next):
     if not expected:
         logger.error("QP_API_KEY not configured; refusing API request to %s", path)
         return err(503, "API_KEY_NOT_CONFIGURED", "set QP_API_KEY before exposing the API")
-    supplied = request.headers.get("X-API-Key", "")
-    if not hmac.compare_digest(supplied, expected):
+    if path == "/api/v1/auth/login":
+        request.state.principal = None
+        return await call_next(request)
+    authorization = request.headers.get("Authorization", "")
+    principal: auth.Principal | None = None
+    if authorization:
+        principal = auth.authenticate_bearer(authorization)
+        if principal is None:
+            return err(401, "UNAUTHORIZED", "invalid or expired token")
+    else:
+        supplied = request.headers.get("X-API-Key", "")
+        if supplied and hmac.compare_digest(supplied, expected):
+            principal = auth.Principal(kind="service")
+        elif supplied:
+            principal = auth.authenticate_user_key(supplied)
+    if principal is None:
         logger.warning("rejected unauthenticated API request to %s", path)
-        return err(401, "UNAUTHORIZED", "missing or invalid X-API-Key header")
+        return err(401, "UNAUTHORIZED", "missing or invalid credentials")
+    denied = auth.authorize(principal, request.method, path)
+    if denied is not None:
+        logger.info(
+            "authz deny %s %s: %s (user=%s role=%s)",
+            request.method, path, denied, principal.username, principal.role,
+        )
+        return err(403, denied, auth.DENY_MESSAGES.get(denied, "forbidden"))
+    account_id = auth.account_id_from_path(path)
+    if account_id is not None and not auth.account_granted(principal, account_id):
+        logger.info("account %s not granted to user %s", account_id, principal.username)
+        return err(403, "ACCOUNT_NOT_GRANTED", "this account is not granted to your user")
+    request.state.principal = principal
     return await call_next(request)
 
 
 # --------------------------------------------------------------------------
 # CORS allowlist for the desktop shell. Production desktop builds have no
 # Vite proxy: the Tauri webview (origin http://tauri.localhost) calls the
-# API directly with X-API-Key. Strict allowlist only; extend deployment
-# shapes via QP_CORS_ORIGINS (comma-separated). Registered AFTER the auth
-# middleware so CORS is the outermost layer and preflight OPTIONS requests
-# never hit the key gate.
+# API directly with X-API-Key (service) or Authorization Bearer (user
+# session). Strict allowlist only; extend deployment shapes via
+# QP_CORS_ORIGINS (comma-separated). Registered AFTER the auth middleware
+# so CORS is the outermost layer and preflight OPTIONS requests never hit
+# the key gate.
 # --------------------------------------------------------------------------
 
 _DESKTOP_ORIGINS = (
@@ -126,9 +169,309 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[*_DESKTOP_ORIGINS, *_extra_origins],
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "X-API-Key"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-API-Key"],
     max_age=600,
 )
+
+
+# --------------------------------------------------------------------------
+# auth routes (phase-3 R2): login + identity + personal API keys + user
+# management. Login is the only credential-exempt route (middleware); it
+# still 503s without QP_JWT_SECRET (fail-closed, like QP_API_KEY). Auth
+# events go to system_events via writers.add_system_event - audit_logs is
+# account-scoped and user management has no single-account context.
+# --------------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    """POST /api/v1/auth/login: username + password -> Bearer JWT."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(default="", max_length=128)
+
+
+class UserCreateRequest(BaseModel):
+    """POST /api/v1/auth/users (ADMIN): create a user; account_ids are the
+    initial account grants."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=256)
+    role: Literal["ADMIN", "TRADER", "ANALYST", "VIEWER"]
+    account_ids: list[UUID] = []
+
+
+class UserUpdateRequest(BaseModel):
+    """PATCH /api/v1/auth/users/{id} (ADMIN): partial update; account_ids
+    REPLACES the grant set entirely."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    password: str | None = Field(default=None, min_length=8, max_length=256)
+    role: Literal["ADMIN", "TRADER", "ANALYST", "VIEWER"] | None = None
+    is_active: bool | None = None
+    account_ids: list[UUID] | None = None
+
+
+@app.post("/api/v1/auth/login")
+def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
+    """Exchange username + password for a Bearer JWT (HS256, default 8h).
+
+    Fail-closed like the service key: without QP_JWT_SECRET the endpoint
+    refuses to issue tokens (503) instead of signing with a default.
+    Unknown usernames burn one bcrypt check (timing-safe). Every attempt,
+    success or failure, lands in system_events.
+    """
+    if not os.environ.get("QP_JWT_SECRET", ""):
+        return err(503, "JWT_NOT_CONFIGURED", "set QP_JWT_SECRET before issuing tokens")
+    user = auth.verify_login(body.username, body.password)
+    if user is None:
+        writers.add_system_event(
+            "api", "auth.login_failed", "WARN", {"username": body.username}
+        )
+        return err(401, "INVALID_CREDENTIALS", "invalid username or password")
+    token = auth.issue_token(user["id"], user["username"], user["role"])
+    writers.add_system_event(
+        "api",
+        "auth.login_succeeded",
+        "INFO",
+        {"user_id": user["id"], "username": user["username"]},
+    )
+    return ok(
+        {
+            "token": token,
+            "token_type": "Bearer",
+            "expires_in": auth.TOKEN_TTL_SECONDS,
+            "user": {
+                "user_id": user["id"],
+                "username": user["username"],
+                "role": user["role"],
+            },
+        },
+        request,
+    )
+
+
+@app.get("/api/v1/auth/me")
+def auth_me(request: Request) -> JSONResponse:
+    """Who am I - works for every lane (service key, JWT, user API key)."""
+    p = request.state.principal
+    return ok(
+        {"kind": p.kind, "user_id": p.user_id, "username": p.username, "role": p.role},
+        request,
+    )
+
+
+@app.post("/api/v1/auth/api-keys")
+def create_user_api_key(body: ApiKeyCreateRequest, request: Request) -> JSONResponse:
+    """Mint a personal API key (self-service). The plaintext key is returned
+    EXACTLY ONCE; only its sha256 hash is stored."""
+    p = request.state.principal
+    if p.kind != "user":
+        return err(403, "USER_ONLY", "api keys belong to named users")
+    plaintext, key_hash = auth.generate_api_key()
+    row = db.query_one(
+        """
+        INSERT INTO user_api_keys (user_id, key_prefix, key_hash, label)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id::text AS key_id, key_prefix, label, created_at
+        """,
+        (p.user_id, plaintext[: len(auth.USER_KEY_PREFIX) + 8], key_hash, body.label),
+    )
+    assert row is not None
+    writers.add_system_event(
+        "api",
+        "auth.api_key_created",
+        "INFO",
+        {"user_id": p.user_id, "key_id": row["key_id"], "key_prefix": row["key_prefix"]},
+    )
+    return ok(
+        db.jsonable(
+            {
+                "key_id": row["key_id"],
+                "key": plaintext,
+                "key_prefix": row["key_prefix"],
+                "label": row["label"],
+                "created_at": row["created_at"],
+                "warning": "store this key now - it is shown only once",
+            }
+        ),
+        request,
+    )
+
+
+@app.get("/api/v1/auth/api-keys")
+def list_user_api_keys(request: Request) -> JSONResponse:
+    """Own keys only, and only metadata - never the hash or plaintext."""
+    p = request.state.principal
+    if p.kind != "user":
+        return err(403, "USER_ONLY", "api keys belong to named users")
+    rows = db.query(
+        """
+        SELECT id::text AS key_id, key_prefix, label, created_at, last_used_at, revoked_at
+          FROM user_api_keys
+         WHERE user_id = %s
+         ORDER BY created_at DESC
+        """,
+        (p.user_id,),
+    )
+    return ok(db.jsonable(rows), request)
+
+
+@app.delete("/api/v1/auth/api-keys/{key_id}")
+def revoke_user_api_key(key_id: str, request: Request) -> JSONResponse:
+    """Revoke one of MY keys. Ownership lives in the WHERE clause: a foreign
+    key id 404s exactly like a missing one (no existence oracle)."""
+    p = request.state.principal
+    if p.kind != "user":
+        return err(403, "USER_ONLY", "api keys belong to named users")
+    try:
+        key_uuid = UUID(key_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "api key not found")
+    row = db.query_one(
+        """
+        UPDATE user_api_keys
+           SET revoked_at = now()
+         WHERE id = %s AND user_id = %s AND revoked_at IS NULL
+        RETURNING id::text AS key_id
+        """,
+        (key_uuid, p.user_id),
+    )
+    if row is None:
+        raise HTTPException(404, "api key not found")
+    writers.add_system_event(
+        "api", "auth.api_key_revoked", "WARN", {"user_id": p.user_id, "key_id": row["key_id"]}
+    )
+    return ok({"key_id": row["key_id"], "revoked": True}, request)
+
+
+@app.get("/api/v1/auth/users")
+def list_users(request: Request) -> JSONResponse:
+    """All users with their account grants (ADMIN only via authorize)."""
+    users = db.query(
+        """
+        SELECT id::text AS user_id, username, role, is_active, created_at
+          FROM users
+         ORDER BY created_at
+        """
+    )
+    grants = db.query(
+        "SELECT user_id::text AS user_id, account_id::text AS account_id FROM user_account_grants"
+    )
+    by_user: dict[str, list[str]] = {}
+    for g in grants:
+        by_user.setdefault(g["user_id"], []).append(g["account_id"])
+    data = [{**u, "account_ids": by_user.get(u["user_id"], [])} for u in users]
+    return ok(db.jsonable(data), request)
+
+
+@app.post("/api/v1/auth/users")
+def create_user(body: UserCreateRequest, request: Request) -> JSONResponse:
+    """Create a user (ADMIN). bcrypt cost 12; the plaintext password never
+    reaches SQL logs or system_events."""
+    if db.query_one("SELECT 1 AS one FROM users WHERE username = %s", (body.username,)):
+        return err(409, "USERNAME_TAKEN", "this username already exists")
+    row = db.query_one(
+        """
+        INSERT INTO users (username, password_hash, role)
+        VALUES (%s, %s, %s)
+        RETURNING id::text AS user_id, username, role, is_active, created_at
+        """,
+        (body.username, auth.hash_password(body.password).decode("ascii"), body.role),
+    )
+    assert row is not None
+    for account_id in body.account_ids:
+        db.execute(
+            "INSERT INTO user_account_grants (user_id, account_id) VALUES (%s, %s)",
+            (row["user_id"], account_id),
+        )
+    writers.add_system_event(
+        "api",
+        "auth.user_created",
+        "INFO",
+        {
+            "user_id": row["user_id"],
+            "username": row["username"],
+            "role": row["role"],
+            "account_ids": [str(a) for a in body.account_ids],
+            "created_by": request.state.principal.username,
+        },
+    )
+    return ok(
+        db.jsonable({**row, "account_ids": [str(a) for a in body.account_ids]}), request
+    )
+
+
+@app.patch("/api/v1/auth/users/{user_id}")
+def update_user(user_id: str, body: UserUpdateRequest, request: Request) -> JSONResponse:
+    """Update a user (ADMIN): password / role / active flag; account_ids is
+    a full grant-set replace. JWTs are stateless: a role change applies at
+    the next login, but account grants are re-checked on every request."""
+    try:
+        user_uuid = UUID(user_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "user not found")
+    sets: list[str] = []
+    params: list = []
+    if body.password is not None:
+        sets.append("password_hash = %s")
+        params.append(auth.hash_password(body.password).decode("ascii"))
+    if body.role is not None:
+        sets.append("role = %s")
+        params.append(body.role)
+    if body.is_active is not None:
+        sets.append("is_active = %s")
+        params.append(body.is_active)
+    if sets:
+        row = db.query_one(
+            f"UPDATE users SET {', '.join(sets)} WHERE id = %s"
+            " RETURNING id::text AS user_id, username, role, is_active",
+            (*params, user_uuid),
+        )
+    else:
+        row = db.query_one(
+            "SELECT id::text AS user_id, username, role, is_active FROM users WHERE id = %s",
+            (user_uuid,),
+        )
+    if row is None:
+        raise HTTPException(404, "user not found")
+    if body.account_ids is not None:
+        with db.conn() as connection:
+            connection.execute(
+                "DELETE FROM user_account_grants WHERE user_id = %s", (user_uuid,)
+            )
+            for account_id in body.account_ids:
+                connection.execute(
+                    "INSERT INTO user_account_grants (user_id, account_id) VALUES (%s, %s)",
+                    (user_uuid, account_id),
+                )
+    writers.add_system_event(
+        "api",
+        "auth.user_updated",
+        "INFO",
+        {
+            "user_id": row["user_id"],
+            "fields": [k for k, v in body.model_dump().items() if v is not None],
+            "updated_by": request.state.principal.username,
+        },
+    )
+    grants = db.query(
+        "SELECT account_id::text AS account_id FROM user_account_grants WHERE user_id = %s",
+        (user_uuid,),
+    )
+    return ok(
+        db.jsonable({**row, "account_ids": [g["account_id"] for g in grants]}), request
+    )
 
 
 # --------------------------------------------------------------------------
@@ -198,17 +541,29 @@ def list_terminals(request: Request) -> JSONResponse:
 
 @app.get("/api/v1/accounts")
 def list_accounts(request: Request) -> JSONResponse:
-    rows = db.query(
-        """
+    """Accounts the caller may see (phase-3 R2): the service lane and ADMIN
+    see everything; other named users only the accounts they were granted
+    (list-level isolation - an ungranted account must not even appear)."""
+    base = """
         SELECT a.id::text AS account_id, a.terminal_id::text AS terminal_id,
                t.node_id::text AS node_id, a.login_ref, a.server, a.company,
                a.currency, a.margin_mode, a.account_mode, a.leverage,
                a.status, a.last_seen_at
           FROM trading_accounts a
           JOIN mt5_terminals t ON t.id = a.terminal_id
+    """
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and principal.kind == "user" and not principal.is_admin:
+        rows = db.query(
+            base
+            + """
+          JOIN user_account_grants g ON g.account_id = a.id AND g.user_id = %s
          ORDER BY a.created_at
-        """
-    )
+            """,
+            (principal.user_id,),
+        )
+    else:
+        rows = db.query(base + " ORDER BY a.created_at")
     return ok(db.jsonable(rows), request)
 
 
@@ -665,8 +1020,10 @@ def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
 # trade commands (PRD 13.3-13.5, ADR-004) - durable channel + idempotency +
 # UNKNOWN reconciliation + cloud risk gate (PRD 9). The gate runs at creation
 # for risk-increasing types; REJECT persists the command in terminal state
-# REJECTED (never delivered, sweeper ignores it). OBSERVE_ONLY overall: even
-# an ALLOWED command is only acked, never executed by the EA (PRD 21.3).
+# REJECTED (never delivered, sweeper ignores it). EA-side execution is
+# mode-gated: DRY_RUN pre-checks, live orders only on DEMO accounts with
+# LiveTrading enabled (phase-3 R1 adds EXECUTE_UNRESOLVED crash recovery);
+# every other mode is acknowledge-only.
 # --------------------------------------------------------------------------
 
 COMMAND_STATUSES = ("QUEUED", "DELIVERED", "ACKED", "EXPIRED", "UNKNOWN", "REJECTED")
