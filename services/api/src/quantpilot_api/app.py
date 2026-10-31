@@ -834,10 +834,13 @@ _RISK_STATE_SELECT = """
 
 
 class RiskStopRequest(BaseModel):
-    """POST /api/v1/risk/stop body: durable STOP_NEW_RISK (PRD 3.3).
+    """POST /api/v1/risk/stop body: durable breaker state (PRD 3.3, 9.5).
 
-    scope=GLOBAL stops every account; scope=ACCOUNT stops one. locked=True
-    writes LOCKED (9.5: needs a human to confirm the resume explicitly).
+    scope=GLOBAL stops every account; scope=ACCOUNT stops one. status picks
+    any of the five non-NORMAL 9.5 states (default STOP_NEW_RISK);
+    locked=True remains the shorthand for status=LOCKED. Asking for a state
+    weaker than the current one is refused - de-escalation must go through
+    POST /api/v1/risk/resume.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -846,6 +849,11 @@ class RiskStopRequest(BaseModel):
     account_id: UUID | None = None
     reason: str = Field(default="", max_length=512)
     locked: bool = False
+    status: Literal["WARNING", "STOP_NEW_RISK", "CANCEL_PENDING",
+                    "MANAGE_EXISTING", "LOCKED"] | None = Field(
+        default=None,
+        description="target 9.5 breaker state; default STOP_NEW_RISK",
+    )
     updated_by: str = Field(default="api", max_length=64)
 
     @model_validator(mode="after")
@@ -854,6 +862,8 @@ class RiskStopRequest(BaseModel):
             raise ValueError("scope=ACCOUNT requires account_id")
         if self.scope == "GLOBAL" and self.account_id is not None:
             raise ValueError("scope=GLOBAL must not carry account_id")
+        if self.locked and self.status is not None and self.status != "LOCKED":
+            raise ValueError("use either locked=true or status, not both")
         return self
 
 
@@ -921,13 +931,24 @@ def risk_state(request: Request, account_id: str | None = None) -> JSONResponse:
 
 @app.post("/api/v1/risk/stop")
 def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
-    """Set STOP_NEW_RISK (or LOCKED). Durable + audited (PRD 3.3: the state
-    change must never be lost). Broadcast to the EA/agent is a later slice;
-    the cloud gate reads this state on every new-risk command."""
+    """Set a durable 9.5 breaker state (default STOP_NEW_RISK, LOCKED via
+    locked=True). Durable + audited (PRD 3.3: the state change must never be
+    lost). De-escalation is refused with 409 - leaving a breaker state goes
+    through POST /api/v1/risk/resume (LOCKED needs confirm_locked there).
+    Broadcast to the EA/agent is a later slice; the cloud gate reads this
+    state on every new-risk command."""
     account_uuid: UUID | None = None
     if body.scope == "ACCOUNT":
         account_uuid = _account_or_404(str(body.account_id))
-    status = "LOCKED" if body.locked else "STOP_NEW_RISK"
+    status = "LOCKED" if body.locked else (body.status or "STOP_NEW_RISK")
+    current_row = _stop_row(body.scope, account_uuid)
+    current = current_row["status"] if current_row is not None else "NORMAL"
+    if risk.RISK_STATE_RANK[current] > risk.RISK_STATE_RANK[status]:
+        raise HTTPException(
+            409,
+            f"de-escalation from {current} to {status} is not allowed; "
+            "use POST /api/v1/risk/resume instead",
+        )
     conflict_target = (
         "ON CONFLICT (scope) WHERE account_id IS NULL"
         if body.scope == "GLOBAL"

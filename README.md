@@ -18,7 +18,10 @@ Decimal 风险预算和同一风控闸门生成持久命令，但 EA 仍只回�
 - 命令通道：`commands` 状态机（QUEUED→DELIVERED→ACKED / EXPIRED / UNKNOWN / REJECTED）、
   command_id 幂等、UNKNOWN 对账（迟到 ack / EA recently-acked 回显，永不盲重发）
 - 风控引擎（执行侧）：创建时闸门按 PRD 9.2 顺序检查；拒绝即落终态 REJECTED（永不投递）
-  + `risk_decisions` 审计；全局/账户级 STOP_NEW_RISK / LOCKED 持久状态（PRD 3.3/9.5）
+  + `risk_decisions` 审计；PRD 9.5 六态熔断状态机（NORMAL/WARNING/STOP_NEW_RISK/
+  CANCEL_PENDING/MANAGE_EXISTING/LOCKED）持久化于 `risk_states`，WARNING 只警示
+  不拦截，后四态禁止新增风险；闸门评估时按日亏指标自动升级（≥50% 限额 → WARNING，
+  ≥100% → STOP_NEW_RISK，只升不降、不碰人工态）
 - 策略引擎（PRD 7）：EA v1.5.0 按周期上报已收盘 bar（`symbol_bars` 投影，回填/增量/
   重同步幂等）→ 无状态窗口重放评估 → `strategy_signals`（边沿触发，UNIQUE 去重，
   doc 7.5）；首批 3 策略 ma_cross / rsi_momentum / trend_following；坏 bar 跳过并
@@ -116,7 +119,12 @@ pnpm build      # 类型检查 + 产线构建
 - `GET|PUT /api/v1/accounts/{id}/config`：配置读取/更新（filters / expert / risk / ai /
   automation 五段，版本号单调递增，PUT 即全量替换）
 - `GET /api/v1/risk/state`、`POST /api/v1/risk/stop`、`POST /api/v1/risk/resume`：
-  全局/账户级停止状态（LOCKED 恢复需 `confirm_locked=true`，PRD 9.5）
+  全局/账户级熔断状态，PRD 9.5 六态 NORMAL → WARNING → STOP_NEW_RISK →
+  CANCEL_PENDING → MANAGE_EXISTING → LOCKED。`/stop` 可指定五种非 NORMAL
+  目标态（`status` 字段，默认 STOP_NEW_RISK；`locked=true` 等价 LOCKED），并拒绝
+  降级（409，降级必须走 `/resume`）；LOCKED 恢复另需 `confirm_locked=true`。
+  闸门评估时日亏 ≥50% 限额自动升级 WARNING、≥100% 自动升级 STOP_NEW_RISK
+  （`risk.auto_escalated` 系统事件留痕，只升不降，永不触碰人工设置的三态）
 - `GET /api/v1/risk/decisions`：闸门决定审计（account_id / command_id 过滤）
 
 风控闸门检查顺序遵循 PRD 9.2（停止状态 → 快照新鲜度/权限 → 日亏/回撤/保证金/连亏

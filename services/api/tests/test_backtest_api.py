@@ -95,8 +95,19 @@ class BacktestContractTests(unittest.TestCase):
 
 class BacktestRouteTests(unittest.TestCase):
     def setUp(self) -> None:
-        # route tests run behind the X-API-Key middleware
-        os.environ.setdefault("QP_API_KEY", TEST_API_KEY)
+        # route tests run behind the X-API-Key middleware; force the key so
+        # the suite is hermetic even when the repo .env (loaded at import
+        # time by config.py) already defines a different QP_API_KEY
+        original = os.environ.get("QP_API_KEY")
+        os.environ["QP_API_KEY"] = TEST_API_KEY
+
+        def restore() -> None:
+            if original is None:
+                os.environ.pop("QP_API_KEY", None)
+            else:
+                os.environ["QP_API_KEY"] = original
+
+        self.addCleanup(restore)
         self.client = TestClient(__import__("quantpilot_api.app", fromlist=["app"]).app)
         self.instance_id = uuid4()
         self.key = uuid4()

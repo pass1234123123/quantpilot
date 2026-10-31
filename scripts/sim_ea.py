@@ -517,6 +517,20 @@ def main() -> int:
         put_config(lambda d: d["risk"].update(max_daily_loss_fraction="0.001"))
         # today: realized -63.54 + floating 13.10 -> daily_loss 50.44 > 9.98
         gate("daily_loss", "REJECT", "DAILY_LOSS_EXCEEDED")
+        # the same breach must have auto-escalated the durable 9.5 account
+        # state to STOP_NEW_RISK (>=100% of the daily loss limit); assert
+        # it, then resume so the next gate case starts from NORMAL again
+        st = client.get(API + "/api/v1/risk/state",
+                        params={"account_id": account_id}).json().get("data") or {}
+        auto_stopped = st.get("status") == "STOP_NEW_RISK"
+        print(f"[risk] auto_escalation: status={st.get('status')} reason={st.get('reason')}")
+        if not auto_stopped:
+            failures += 1
+        resumed = client.post(API + "/api/v1/risk/resume", json={
+            "scope": "ACCOUNT", "account_id": account_id, "updated_by": "sim_ea",
+        })
+        if resumed.status_code != 200:
+            failures += 1
         put_config(lambda d: d["risk"].update(max_daily_loss_fraction="0", max_consecutive_losses=2))
         gate("consecutive_losses", "REJECT", "CONSECUTIVE_LOSSES")
         reset_config()

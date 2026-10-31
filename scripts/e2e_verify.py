@@ -387,6 +387,33 @@ def main() -> int:
               acc_state.status_code == 200 and acc_st.get("status") == "NORMAL",
               f"status={acc_state.status_code} state={acc_st.get('status')}")
 
+        # PRD 9.5 six-state breaker: every non-NORMAL state is settable and
+        # visible; /stop must refuse de-escalation (resume is the only exit)
+        for target in ("WARNING", "CANCEL_PENDING", "MANAGE_EXISTING"):
+            r = client.post(f"{API}/api/v1/risk/stop", json={
+                "scope": "ACCOUNT", "account_id": sim_id, "status": target,
+                "reason": "e2e 9.5 states", "updated_by": "e2e_verify",
+            })
+            shown = client.get(f"{API}/api/v1/risk/state",
+                               params={"account_id": sim_id}).json()["data"]
+            check(f"api.risk_state_{target.lower()}",
+                  r.status_code == 200 and shown.get("status") == target,
+                  f"set={r.status_code} shown={shown.get('status')}")
+        r409 = client.post(f"{API}/api/v1/risk/stop", json={
+            "scope": "ACCOUNT", "account_id": sim_id, "status": "WARNING",
+            "reason": "try weaken", "updated_by": "e2e_verify",
+        })
+        check("api.risk_stop_refuses_de_escalation", r409.status_code == 409,
+              f"status={r409.status_code} body={r409.text[:120]}")
+        rr = client.post(f"{API}/api/v1/risk/resume", json={
+            "scope": "ACCOUNT", "account_id": sim_id, "updated_by": "e2e_verify",
+        })
+        back = client.get(f"{API}/api/v1/risk/state",
+                          params={"account_id": sim_id}).json()["data"]
+        check("api.risk_state_resumed_normal",
+              rr.status_code == 200 and back.get("status") == "NORMAL",
+              f"resume={rr.status_code} status={back.get('status')}")
+
         rej = client.get(f"{API}/api/v1/commands",
                          params={"account_id": sim_id, "status": "REJECTED"}).json()["data"]
         check("api.commands_rejected", len(rej) >= 5, f"rejected={len(rej)}")

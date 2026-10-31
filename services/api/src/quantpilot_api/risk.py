@@ -50,6 +50,18 @@ logger = logging.getLogger("quantpilot.risk")
 # reconcile) passes the gate untouched - PRD 2.5 forbids only NEW risk
 RISK_INCREASING_TYPES = frozenset({"OPEN_MARKET", "PLACE_PENDING"})
 
+# PRD 9.5 circuit-breaker states in escalation order. WARNING is an early
+# warning (approaching a threshold) and does NOT block new risk; every state
+# past it does. CANCEL_PENDING / MANAGE_EXISTING / LOCKED are entered via the
+# stop API (later execution slices add their order actions); auto escalation
+# only walks NORMAL -> WARNING -> STOP_NEW_RISK and never backwards.
+RISK_STATES = ("NORMAL", "WARNING", "STOP_NEW_RISK", "CANCEL_PENDING",
+               "MANAGE_EXISTING", "LOCKED")
+RISK_STATE_RANK = {name: rank for rank, name in enumerate(RISK_STATES)}
+BLOCKING_RISK_STATES = frozenset(RISK_STATES[2:])
+# auto WARNING once the daily loss reaches half of the configured limit
+AUTO_WARNING_FRACTION = Decimal("0.5")
+
 # reason codes (single source of truth; surfaced in risk_decisions and events)
 R_GLOBAL_STOP = "GLOBAL_STOP_NEW_RISK"
 R_ACCOUNT_STOP = "ACCOUNT_STOP_NEW_RISK"
@@ -154,6 +166,71 @@ def _stop_states(account_id: UUID) -> dict[str, str | None]:
     return out
 
 
+def escalate_auto_state(
+    account_id: UUID,
+    *,
+    daily_loss: Decimal,
+    daily_limit: Decimal,
+    updated_by: str = "risk-engine",
+) -> dict[str, str] | None:
+    """Auto-escalate the ACCOUNT breaker state from live loss metrics (9.5).
+
+    daily_loss >= AUTO_WARNING_FRACTION x limit -> WARNING;
+    daily_loss >= limit -> STOP_NEW_RISK. Never de-escalates, never rewrites
+    a state it cannot strictly climb (manual states past STOP_NEW_RISK are
+    never touched). Returns {"from", "to"} when a transition happened.
+    """
+    if daily_limit <= 0:
+        return None
+    ratio = daily_loss / daily_limit
+    if ratio >= Decimal(1):
+        target = "STOP_NEW_RISK"
+    elif ratio >= AUTO_WARNING_FRACTION:
+        target = "WARNING"
+    else:
+        return None
+    row = db.query_one(
+        "SELECT status FROM risk_states WHERE scope = 'ACCOUNT' AND account_id = %s",
+        (account_id,),
+    )
+    current = row["status"] if row is not None else "NORMAL"
+    if RISK_STATE_RANK[current] >= RISK_STATE_RANK[target]:
+        return None
+    pct = (ratio * Decimal(100)).quantize(Decimal("0.1"))
+    reason = f"auto: daily loss {pct}% of limit"
+    with db.conn() as connection:
+        connection.execute(
+            """
+            INSERT INTO risk_states (scope, account_id, status, reason, updated_by)
+            VALUES ('ACCOUNT', %s, %s, %s, %s)
+            ON CONFLICT (account_id) WHERE account_id IS NOT NULL
+            DO UPDATE SET status = EXCLUDED.status,
+                          reason = EXCLUDED.reason,
+                          updated_by = EXCLUDED.updated_by,
+                          updated_at = now(),
+                          version = risk_states.version + 1
+            """,
+            (account_id, target, reason, updated_by),
+        )
+    from . import writers  # local import: writers has no risk dependency cycle
+    writers.add_system_event(
+        source="risk-engine",
+        event_type="risk.auto_escalated",
+        severity="WARN" if target == "STOP_NEW_RISK" else "INFO",
+        payload={
+            "account_id": str(account_id),
+            "from": current,
+            "to": target,
+            "reason": reason,
+            "daily_loss": str(daily_loss),
+            "daily_limit": str(daily_limit),
+        },
+    )
+    logger.info("risk state auto-escalated account=%s %s -> %s",
+                account_id, current, target)
+    return {"from": current, "to": target}
+
+
 def evaluate_command(
     account_id: UUID,
     command_type: str,
@@ -201,12 +278,13 @@ def evaluate_command(
         return RiskDecision("REJECT", [reason], snap_json)
 
     # ---- 1. system level: durable stop states (PRD 3.3, 9.5) --------------
+    # WARNING is an early warning and does not block; everything past it does
     stops = _stop_states(account_id)
     snap["stop_states"] = {"global": stops["GLOBAL"], "account": stops["ACCOUNT"]}
-    if stops["GLOBAL"] != "NORMAL":
+    if stops["GLOBAL"] in BLOCKING_RISK_STATES:
         snap["stop_reason"] = stops["global_reason"]
         return reject(R_GLOBAL_STOP)
-    if stops["ACCOUNT"] != "NORMAL":
+    if stops["ACCOUNT"] in BLOCKING_RISK_STATES:
         snap["stop_reason"] = stops["account_reason"]
         return reject(R_ACCOUNT_STOP)
 
@@ -270,6 +348,16 @@ def evaluate_command(
     if daily_limit_fraction > 0:
         daily_limit = daily_limit_fraction * basis
         snap["daily_loss_limit"] = daily_limit
+        # converge the durable 9.5 state to live metrics (WARNING at half
+        # the limit, STOP_NEW_RISK at the limit) before the reject check; a
+        # failed state write is logged and retried on the next evaluation
+        try:
+            escalate_auto_state(
+                account_id, daily_loss=daily_loss, daily_limit=daily_limit
+            )
+        except Exception:
+            logger.exception("auto state escalation failed for account %s",
+                             account_id)
         if daily_loss >= daily_limit:
             return reject(R_DAILY_LOSS)
 
