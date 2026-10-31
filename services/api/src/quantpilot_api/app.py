@@ -1311,6 +1311,18 @@ def create_backtest(
     return ok(db.jsonable(result), request)
 
 
+@app.get("/api/v1/backtests")
+def list_backtests(
+    request: Request,
+    account_id: UUID | None = None,
+    strategy_instance_id: UUID | None = None,
+    limit: int = 100,
+) -> JSONResponse:
+    """Backtest job summaries, newest first; optional account/instance filters."""
+    rows = backtests.list_backtests(account_id, strategy_instance_id, limit)
+    return ok(db.jsonable(rows), request)
+
+
 @app.get("/api/v1/backtests/{job_id}")
 def get_backtest(job_id: str, request: Request) -> JSONResponse:
     try:

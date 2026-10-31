@@ -87,14 +87,20 @@ pnpm dev        # http://127.0.0.1:5173
 pnpm build      # 类型检查 + 产线构建
 ```
 
-- **真实数据面板**：KPI 带（余额/净值/浮动盈亏/保证金等 ← 最新快照）、持仓明细
+- **实时链路面板**：KPI 带（余额/净值/浮动盈亏/保证金等 ← 最新快照）、持仓明细
   （EA 实时同步，`GET /api/v1/accounts/{id}/positions`，每 10s 随心跳刷新）、
   Equity & Balance Graph（快照历史）、Market Watch（品种发现 + 实时点差）、
-  Performance（成交统计/日盈亏）、Risk Management（`risk_profiles` 配置 + 停止状态）、
-  News Filter（日历事件）、Permission Signal / Trading Status / Account Info、
-  侧栏 System Status；每 30s 自动刷新。
-- **示例数据面板**：Profit Monitor、Filtering / Expert Settings 等——对应数据链路
-  （策略引擎/命令下发 UI）在后续切片实现。
+  Performance（成交统计/日盈亏）、Risk Management（`risk_profiles` 配置 + 停止状态
+  + `risk_decisions` 决定审计）、News Filter（日历事件）、Permission Signal /
+  Trading Status / Account Info、侧栏 System Status；每 30s 自动刷新。
+- **策略与命令面板**：策略引擎（策略目录 + 账户实例绑定/启停/参数修订，实例启停调
+  `POST .../strategy-instances/{iid}/status`）、交易信号（`strategy_signals` 边沿触发
+  流，方向/强度/参考价/SL/TP/触发原因）、命令通道（`commands` 状态机流 +
+  `risk_decisions` 审计，REJECTED 永不投递）、回测研究（任务列表 + 点击行内联加载
+  `GET /api/v1/backtests/{id}` 完整指标报告）；信号为建议性（PRD 7.1），EA 保持
+  OBSERVE_ONLY。
+- **配置面板**：Profit Monitor、Filtering / Expert Settings（`risk_profiles.config_json`
+  filters/expert 段，云端版本号展示 + PUT 保存）；OBSERVE_ONLY 下仅存储与展示。
 
 ## 命令通道与风控 API（本阶段）
 
@@ -169,6 +175,8 @@ signal_decision 等仅写入 `risk_decisions.risk_snapshot.ai` 供审计，绝�
 - `POST /api/v1/backtests`：创建并同步执行回测；必须提供 UUID `Idempotency-Key` 请求头，
   body 包含 `strategy_instance_id`、带时区的 `range_start/range_end`、`initial_balance`、
   `volume` 和 `cost_model`。相同键与请求体重放直接返回原报告；相同键不同请求体返回 409。
+- `GET /api/v1/backtests`：任务摘要列表（最新在前；`account_id` /
+  `strategy_instance_id` / `limit` 过滤，上限 500）。
 - `GET /api/v1/backtests/{id}`：查询任务状态、固定策略/参数快照、数据 hash、指标、
   交易明细、成本拆分与权益曲线。
 

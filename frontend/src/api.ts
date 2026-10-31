@@ -248,6 +248,173 @@ export interface AccountConfigData {
   created_at: string | null
 }
 
+export interface StrategyRow {
+  strategy_id: string
+  code: string
+  name: string
+  description: string | null
+  status: string
+  strategy_version_id: string
+  version: string
+  artifact_hash: string
+  config_schema: Record<string, unknown>
+  created_at: string
+}
+
+export interface StrategyInstanceRow {
+  instance_id: string
+  account_id: string
+  strategy_code: string
+  strategy_version: string
+  strategy_version_id: string
+  broker_symbol: string
+  timeframe: string
+  config: Record<string, unknown>
+  config_revision: number
+  status: 'ENABLED' | 'DISABLED'
+  created_at: string
+  updated_at: string
+}
+
+export interface SignalPayload {
+  direction: 'BUY' | 'SELL'
+  strength: string
+  reference_price: string | null
+  proposed_stop_loss?: string | null
+  proposed_take_profit?: string | null
+  reason_codes: string[]
+  valid_until?: string | null
+  market_data_at?: string | null
+}
+
+export interface SignalRow {
+  id: string
+  signal_id: string
+  account_id: string
+  strategy_instance_id: string
+  signal_json: SignalPayload
+  source_bar_time: string
+  generated_at: string
+  expires_at: string | null
+}
+
+export interface CommandRow {
+  command_id: string
+  account_id: string
+  command_type: string
+  payload: Record<string, unknown>
+  status: string
+  expires_at: string | null
+  created_by: string
+  strategy_instance_id: string | null
+  signal_id: string | null
+  delivery_attempts: number
+  delivered_at: string | null
+  acked_at: string | null
+  ack_code: string | null
+  ack_message: string | null
+  reconciled: boolean
+  unknown_at: string | null
+  expired_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface RiskDecisionRow {
+  id: string
+  account_id: string
+  command_id: string
+  signal_id: string | null
+  decision: string
+  reason_codes: string[] | null
+  config_version: number
+  decided_at: string
+}
+
+export interface BacktestJobSummary {
+  job_id: string
+  account_id: string
+  strategy_code: string
+  broker_symbol: string
+  timeframe: string
+  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+  range_start: string
+  range_end: string
+  config_revision: number
+  initial_balance: string
+  volume: string
+  data_hash: string | null
+  error: string
+  created_at: string
+  completed_at: string | null
+}
+
+export interface BacktestMetrics {
+  initial_balance: string
+  final_balance: string
+  net_profit: string
+  max_drawdown: string
+  max_drawdown_pct: number
+  profit_factor: string | null
+  win_rate: number
+  expectancy: string
+  sharpe: number | null
+  sortino: number | null
+  recovery_factor: string | null
+  exposure: number
+  average_holding_minutes: string
+  trade_count: number
+  winning_trades: number
+  losing_trades: number
+  cost_breakdown: Record<string, string>
+}
+
+export interface BacktestReport {
+  job_id: string
+  strategy: {
+    code: string
+    version: string
+    config: Record<string, unknown>
+    config_revision: number
+  }
+  data: {
+    bar_count: number
+    sha256: string
+    first_bar_time: string
+    last_bar_time: string
+  }
+  assumptions: Record<string, unknown>
+  trades: Array<{
+    source_bar_time: string
+    entry_time: string
+    exit_time: string
+    direction: 'BUY' | 'SELL'
+    volume: string
+    entry_price: string
+    exit_price: string
+    gross_profit: string
+    net_profit: string
+    costs: Record<string, string>
+    exit_reason: string
+    holding_minutes: string
+    reason_codes: string[]
+  }>
+  equity_curve: Array<{ bar_time: string; equity: string }>
+  metrics: BacktestMetrics
+}
+
+export interface BacktestJobDetail extends BacktestJobSummary {
+  strategy_version: string
+  config: Record<string, unknown>
+  cost_model: Record<string, unknown>
+  idempotency_key: string
+  request_hash: string
+  metrics: BacktestMetrics | null
+  report: BacktestReport | null
+  report_uri: string | null
+  updated_at: string
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
   if (!res.ok) {
@@ -297,6 +464,24 @@ export const api = {
   getConfig: (accountId: string) => get<AccountConfigData>(`/api/v1/accounts/${accountId}/config`),
   saveConfig: (accountId: string, config: { filters: FiltersConfig; expert: ExpertConfig }) =>
     send<AccountConfigData>(`/api/v1/accounts/${accountId}/config`, 'PUT', config),
+  strategies: () => get<StrategyRow[]>('/api/v1/strategies'),
+  strategyInstances: (accountId: string) =>
+    get<StrategyInstanceRow[]>(`/api/v1/accounts/${accountId}/strategy-instances`),
+  setInstanceStatus: (accountId: string, instanceId: string, status: 'ENABLED' | 'DISABLED') =>
+    send<StrategyInstanceRow>(
+      `/api/v1/accounts/${accountId}/strategy-instances/${instanceId}/status`,
+      'POST',
+      { status },
+    ),
+  signals: (accountId: string, limit = 100) =>
+    get<SignalRow[]>(`/api/v1/accounts/${accountId}/signals?limit=${limit}`),
+  commands: (accountId: string, limit = 100) =>
+    get<CommandRow[]>(`/api/v1/commands?account_id=${accountId}&limit=${limit}`),
+  riskDecisions: (accountId: string, limit = 100) =>
+    get<RiskDecisionRow[]>(`/api/v1/risk/decisions?account_id=${accountId}&limit=${limit}`),
+  backtests: (accountId: string, limit = 50) =>
+    get<BacktestJobSummary[]>(`/api/v1/backtests?account_id=${accountId}&limit=${limit}`),
+  backtest: (jobId: string) => get<BacktestJobDetail>(`/api/v1/backtests/${jobId}`),
 }
 
 /** Parse API decimal strings ("9980.00000000", "0E-8") safely. */

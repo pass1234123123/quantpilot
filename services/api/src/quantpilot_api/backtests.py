@@ -57,6 +57,39 @@ def deterministic_backtest_id(idempotency_key: UUID) -> UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, f"quantpilot-backtest-v1:{idempotency_key}")
 
 
+def list_backtests(
+    account_id: UUID | None = None,
+    strategy_instance_id: UUID | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Job summaries, newest first; optional account/instance filters."""
+    where = ["1=1"]
+    params: list[Any] = []
+    if account_id is not None:
+        where.append("j.account_id = %s")
+        params.append(account_id)
+    if strategy_instance_id is not None:
+        where.append("j.strategy_instance_id = %s")
+        params.append(strategy_instance_id)
+    params.append(max(1, min(limit, 500)))
+    return db.query(
+        f"""
+        SELECT j.id::text AS job_id, j.account_id::text AS account_id,
+               s.code AS strategy_code, j.broker_symbol, j.timeframe,
+               j.status, j.range_start, j.range_end, j.config_revision,
+               j.initial_balance, j.volume, j.data_hash, j.error,
+               j.created_at, j.completed_at
+          FROM backtest_jobs j
+          JOIN strategy_versions sv ON sv.id = j.strategy_version_id
+          JOIN strategies s ON s.id = sv.strategy_id
+         WHERE {" AND ".join(where)}
+         ORDER BY j.created_at DESC
+         LIMIT %s
+        """,
+        tuple(params),
+    )
+
+
 def get_backtest(job_id: UUID) -> dict[str, Any] | None:
     return db.query_one(
         """
@@ -262,4 +295,5 @@ __all__ = [
     "create_backtest",
     "deterministic_backtest_id",
     "get_backtest",
+    "list_backtests",
 ]

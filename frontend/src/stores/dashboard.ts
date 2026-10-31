@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type CalendarEventRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type SnapshotPoint, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -21,6 +21,12 @@ export const useDashboardStore = defineStore('dashboard', {
     performance: null as PerformanceData | null,
     config: null as AccountConfigData | null,
     configSaving: false,
+    strategies: [] as StrategyRow[],
+    instances: [] as StrategyInstanceRow[],
+    signals: [] as SignalRow[],
+    commands: [] as CommandRow[],
+    decisions: [] as RiskDecisionRow[],
+    backtests: [] as BacktestJobSummary[],
     lastRefreshAt: '' as string,
   }),
   getters: {
@@ -53,16 +59,18 @@ export const useDashboardStore = defineStore('dashboard', {
         await api.health()
         this.apiHealthy = true
 
-        const [nodes, terminals, accounts, events] = await Promise.all([
+        const [nodes, terminals, accounts, events, strategies] = await Promise.all([
           api.nodes(),
           api.terminals(),
           api.accounts(),
           api.events(100).catch(() => [] as SystemEventRow[]),
+          api.strategies().catch(() => [] as StrategyRow[]),
         ])
         this.nodes = nodes
         this.terminals = terminals
         this.accounts = accounts
         this.events = events
+        this.strategies = strategies
 
         if (!this.selectedAccountId && accounts.length > 0) {
           this.selectedAccountId = accounts[0].account_id
@@ -90,7 +98,15 @@ export const useDashboardStore = defineStore('dashboard', {
       this.calendar = []
       this.performance = null
       this.config = null
-      const [snapshot, history, symbols, positions, deals, orders, calendar, performance, config] = await Promise.all([
+      this.instances = []
+      this.signals = []
+      this.commands = []
+      this.decisions = []
+      this.backtests = []
+      const [
+        snapshot, history, symbols, positions, deals, orders, calendar,
+        performance, config, instances, signals, commands, decisions, backtests,
+      ] = await Promise.all([
         api.snapshot(accountId).catch(() => null),
         api.snapshots(accountId, 500).catch(() => [] as SnapshotPoint[]),
         api.symbols(accountId).catch(() => [] as SymbolRow[]),
@@ -100,6 +116,11 @@ export const useDashboardStore = defineStore('dashboard', {
         api.calendar(accountId, 48).catch(() => [] as CalendarEventRow[]),
         api.performance(accountId, 30).catch(() => null),
         api.getConfig(accountId).catch(() => null),
+        api.strategyInstances(accountId).catch(() => [] as StrategyInstanceRow[]),
+        api.signals(accountId, 100).catch(() => [] as SignalRow[]),
+        api.commands(accountId, 100).catch(() => [] as CommandRow[]),
+        api.riskDecisions(accountId, 100).catch(() => [] as RiskDecisionRow[]),
+        api.backtests(accountId, 50).catch(() => [] as BacktestJobSummary[]),
       ])
       if (this.selectedAccountId !== accountId) return
       this.snapshot = snapshot
@@ -111,6 +132,20 @@ export const useDashboardStore = defineStore('dashboard', {
       this.calendar = calendar
       this.performance = performance
       this.config = config
+      this.instances = instances
+      this.signals = signals
+      this.commands = commands
+      this.decisions = decisions
+      this.backtests = backtests
+    },
+    async setInstanceStatus(instanceId: string, status: 'ENABLED' | 'DISABLED') {
+      if (!this.selectedAccountId) return
+      try {
+        const updated = await api.setInstanceStatus(this.selectedAccountId, instanceId, status)
+        this.instances = this.instances.map((i) => (i.instance_id === instanceId ? updated : i))
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e)
+      }
     },
     async saveConfig() {
       if (!this.selectedAccountId || !this.config) return

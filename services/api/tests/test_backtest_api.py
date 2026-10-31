@@ -123,6 +123,19 @@ class BacktestRouteTests(unittest.TestCase):
         response = self.client.post("/api/v1/backtests", json=body_dict(self.instance_id))
         self.assertEqual(response.status_code, 422)
 
+    def test_list_backtests_filters_by_account_and_wraps_envelope(self) -> None:
+        from quantpilot_api import backtests
+
+        rows = [{"job_id": str(uuid4()), "status": "COMPLETED", "strategy_code": "ma_cross"}]
+        with patch.object(backtests, "list_backtests", return_value=rows) as listed:
+            response = self.client.get(f"/api/v1/backtests?account_id={self.instance_id}&limit=5")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json()["error"])
+        self.assertEqual(response.json()["data"], rows)
+        listed.assert_called_once()
+        self.assertEqual(listed.call_args.args, (self.instance_id, None, 5))
+
 
 if __name__ == "__main__":
     unittest.main()
