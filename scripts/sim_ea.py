@@ -94,7 +94,8 @@ def sim_symbols() -> list[dict]:
 
 
 def main() -> int:
-    client = httpx.Client(timeout=10)
+    # trust_env=False: never route 127.0.0.1 through a system proxy
+    client = httpx.Client(timeout=10, trust_env=False)
     failures = 0
 
     def post(path: str, body: dict) -> None:
@@ -406,6 +407,169 @@ def main() -> int:
         s2b = command_status(cmd2)
         print(f"[commands] cmd2 after echo={s2b} reconciled={rec.get('reconciled')}")
         if s2b != "ACKED":
+            failures += 1
+
+        # 10g. risk gate (slice 2, PRD 9): REJECT persists the command in
+        # terminal state REJECTED with reason codes; idempotent replay returns
+        # the same row; REJECTED commands are never delivered
+        def put_config(mutate) -> None:
+            nonlocal failures
+            doc = client.get(f"{API}/api/v1/accounts/{account_id}/config").json()["data"]["config"]
+            mutate(doc)
+            r = client.put(f"{API}/api/v1/accounts/{account_id}/config", json=doc)
+            if r.status_code != 200:
+                failures += 1
+                print(f"[risk] config PUT failed: {r.status_code} {r.text[:120]}")
+
+        def reset_config() -> None:
+            nonlocal failures
+            # defaults (all risk thresholds OFF, PRD 9.6) + a high daily order
+            # cap so repeated same-day runs never trip MAX_DAILY_ORDERS
+            r = client.put(
+                f"{API}/api/v1/accounts/{account_id}/config",
+                json={"filters": {"max_daily_orders": 500}},
+            )
+            if r.status_code != 200:
+                failures += 1
+                print(f"[risk] config reset failed: {r.status_code}")
+
+        def open_market(cid: str, **over) -> dict:
+            payload = {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "volume": "0.10",
+                "stop_loss": "1.07900",
+                "take_profit": "1.09000",
+                "max_deviation_points": 20,
+                "magic_number": 20260831,
+            }
+            payload.update(over)
+            r = client.post(API + "/api/v1/commands", json={
+                "command_id": cid,
+                "account_id": account_id,
+                "command_type": "OPEN_MARKET",
+                "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+                "created_by": "sim_ea",
+                "payload": payload,
+            })
+            return r.json().get("data") or {}
+
+        rejected_ids: list[str] = []
+
+        def gate(name: str, want_decision: str, want_reason: str | None = None, **over) -> str:
+            nonlocal failures
+            cid = str(uuid.uuid4())
+            data = open_market(cid, **over)
+            rd = data.get("risk_decision") or {}
+            ok_decision = rd.get("decision") == want_decision
+            ok_reason = want_reason is None or rd.get("reason_codes") == [want_reason]
+            ok_status = want_decision != "REJECT" or data.get("status") == "REJECTED"
+            if want_reason is not None:
+                rejected_ids.append(cid)
+            print(f"[risk] {name}: decision={rd.get('decision')} "
+                  f"reasons={rd.get('reason_codes')} status={data.get('status')}")
+            if not (ok_decision and ok_reason and ok_status):
+                failures += 1
+            return cid
+
+        reset_config()
+        gate("allow_default", "ALLOW")
+        cid_sl = gate("sl_required", "REJECT", "STOP_LOSS_REQUIRED", stop_loss=None)
+        gate("spec_unknown", "REJECT", "SYMBOL_SPEC_UNKNOWN", symbol="NOPEXYZ")
+        gate("volume_below_min", "REJECT", "VOLUME_BELOW_MIN", volume="0.001")
+        gate("volume_not_on_step", "REJECT", "VOLUME_NOT_ON_STEP", volume="0.015")
+        gate("invalid_sl", "REJECT", "INVALID_STOP_LOSS", stop_loss="1.09000")
+
+        put_config(lambda d: d["risk"].update(per_trade_risk_fraction="0.001"))
+        # EURUSD: |1.08135 - 1.07900| / 0.00001 * 1.0 * 0.10 = 23.5 > 0.001*9980
+        gate("per_trade_reject", "REJECT", "PER_TRADE_RISK_EXCEEDED")
+        put_config(lambda d: d["risk"].update(per_trade_risk_fraction="0.01"))
+        gate("per_trade_allow", "ALLOW")  # budget 99.8 > 23.5
+        put_config(lambda d: d["risk"].update(quote_max_age_seconds=1))
+        time.sleep(2)
+        gate("estimate_unavailable", "REJECT", "RISK_ESTIMATE_UNAVAILABLE")
+        reset_config()
+
+        # seed a losing closed deal for daily-loss + consecutive-loss tests
+        post(
+            "/ea/v1/deals",
+            {
+                "ea_version": "1.0.0",
+                "terminal": terminal(),
+                "account": account(),
+                "batch_index": 0,
+                "batch_total": 1,
+                "deals": [
+                    deal(700003, 600003, 900003, "EURUSD", "SELL", "OUT", "1.27123000", "-60.00"),
+                ],
+                "observed_at": iso_now(),
+            },
+        )
+        time.sleep(1)
+        put_config(lambda d: d["risk"].update(max_daily_loss_fraction="0.001"))
+        # today: realized -63.54 + floating 13.10 -> daily_loss 50.44 > 9.98
+        gate("daily_loss", "REJECT", "DAILY_LOSS_EXCEEDED")
+        put_config(lambda d: d["risk"].update(max_daily_loss_fraction="0", max_consecutive_losses=2))
+        gate("consecutive_losses", "REJECT", "CONSECUTIVE_LOSSES")
+        reset_config()
+
+        # account-level stop, LOCKED variant (9.5: manual confirm to resume)
+        r = client.post(API + "/api/v1/risk/stop", json={
+            "scope": "ACCOUNT", "account_id": account_id,
+            "reason": "sim test", "locked": True, "updated_by": "sim_ea",
+        })
+        stopped = r.status_code == 200 and r.json().get("data", {}).get("status") == "LOCKED"
+        gate("account_locked", "REJECT", "ACCOUNT_STOP_NEW_RISK")
+        r409 = client.post(API + "/api/v1/risk/resume", json={
+            "scope": "ACCOUNT", "account_id": account_id,
+        })
+        needs_confirm = r409.status_code == 409
+        r = client.post(API + "/api/v1/risk/resume", json={
+            "scope": "ACCOUNT", "account_id": account_id, "confirm_locked": True,
+        })
+        resumed = r.status_code == 200 and r.json().get("data", {}).get("status") == "NORMAL"
+        print(f"[risk] account_locked set={stopped} resume_409={needs_confirm} resumed={resumed}")
+        if not (stopped and needs_confirm and resumed):
+            failures += 1
+        gate("account_resumed_allow", "ALLOW")
+
+        # global stop + state endpoint
+        r = client.post(API + "/api/v1/risk/stop", json={
+            "scope": "GLOBAL", "reason": "sim global", "updated_by": "sim_ea",
+        })
+        gate("global_stop", "REJECT", "GLOBAL_STOP_NEW_RISK")
+        state = client.get(API + "/api/v1/risk/state").json().get("data") or {}
+        state_ok = (state.get("global") or {}).get("status") == "STOP_NEW_RISK"
+        r = client.post(API + "/api/v1/risk/resume", json={"scope": "GLOBAL"})
+        gate("global_resumed_allow", "ALLOW")
+        print(f"[risk] global state visible={state_ok}")
+        if not state_ok:
+            failures += 1
+
+        # idempotent replay of a REJECTED command returns the same row
+        replay = open_market(cid_sl, stop_loss=None)
+        replay_ok = (
+            replay.get("created") is False
+            and replay.get("status") == "REJECTED"
+            and (replay.get("risk_decision") or {}).get("reason_codes") == ["STOP_LOSS_REQUIRED"]
+        )
+        print(f"[risk] rejected_replay same_row={replay_ok}")
+        if not replay_ok:
+            failures += 1
+
+        # REJECTED commands are never delivered: drain QUEUED leftovers and
+        # make sure none of the rejected ids ever comes back
+        delivered: list[str] = []
+        for _ in range(12):
+            got = poll([]).get("commands", [])
+            if not got:
+                break
+            delivered.append(got[0]["command_id"])
+            ack(got[0]["command_id"])
+        leaked = [c for c in delivered if c in rejected_ids]
+        print(f"[risk] rejected_never_delivered={not leaked} "
+              f"(delivered={len(delivered)} rejected={len(rejected_ids)})")
+        if leaked:
             failures += 1
 
     # 11. config poll: agent must resolve the identity and relay a config

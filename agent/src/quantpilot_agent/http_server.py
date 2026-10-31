@@ -122,12 +122,29 @@ class AgentHttpServer:
                 supplied = self.headers.get("X-QP-Token", "")
                 return hmac.compare_digest(supplied, outer._token)
 
+            def _drain_request_body(self) -> None:
+                """Consume an unread request body so HTTP/1.1 keep-alive
+                framing stays intact for the next request on this connection."""
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    return
+                if length <= 0:
+                    return
+                if length <= MAX_BODY_BYTES:
+                    self.rfile.read(length)
+                else:
+                    self.close_connection = True  # too big to drain cheaply
+
             def _read_json(self) -> Any:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:
                     length = 0
-                if length <= 0 or length > MAX_BODY_BYTES:
+                if length <= 0:
+                    return None
+                if length > MAX_BODY_BYTES:
+                    self.close_connection = True  # refuse without draining
                     return None
                 raw = self.rfile.read(length)
                 try:
@@ -222,6 +239,7 @@ class AgentHttpServer:
 
             def do_POST(self) -> None:  # noqa: N802
                 if not self._authorized():
+                    self._drain_request_body()
                     self._err(401, "UNAUTHORIZED", "missing or invalid X-QP-Token")
                     return
                 route = self.path.rstrip("/")

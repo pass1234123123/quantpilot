@@ -40,6 +40,8 @@ TABLES = [
     "orders",
     "calendar_events",
     "risk_profiles",
+    "risk_states",
+    "risk_decisions",
     "commands",
     "system_events",
 ]
@@ -214,6 +216,42 @@ def main() -> int:
               f"status={lk.status_code} resolved={lk_data.get('resolved')} "
               f"version={lk_data.get('version')}")
 
+        # ---- risk engine (slice 2, PRD 9): stop states + gate audit -------
+        st = client.get(f"{API}/api/v1/risk/state")
+        st_data = st.json().get("data") or {}
+        check("api.risk_state",
+              st.status_code == 200 and (st_data.get("global") or {}).get("status") == "NORMAL",
+              f"status={st.status_code} global={(st_data.get('global') or {}).get('status')}")
+        acc_state = client.get(f"{API}/api/v1/risk/state", params={"account_id": sim_id})
+        acc_st = acc_state.json().get("data") or {}
+        check("api.risk_state_account",
+              acc_state.status_code == 200 and acc_st.get("status") == "NORMAL",
+              f"status={acc_state.status_code} state={acc_st.get('status')}")
+
+        rej = client.get(f"{API}/api/v1/commands",
+                         params={"account_id": sim_id, "status": "REJECTED"}).json()["data"]
+        check("api.commands_rejected", len(rej) >= 5, f"rejected={len(rej)}")
+        if rej:
+            one = client.get(f"{API}/api/v1/commands/{rej[0]['command_id']}").json()["data"]
+            rd = one.get("risk_decision") or {}
+            check("api.risk_decision_attached",
+                  rd.get("decision") == "REJECT" and bool(rd.get("reason_codes")),
+                  f"decision={rd.get('decision')} reasons={rd.get('reason_codes')}")
+            print(f"       rejected command: {one.get('command_type')} "
+                  f"reasons={rd.get('reason_codes')}")
+
+        decs = client.get(f"{API}/api/v1/risk/decisions",
+                          params={"account_id": sim_id}).json()["data"]
+        check("api.risk_decisions", len(decs) >= 10, f"decisions={len(decs)}")
+        allows = [d for d in decs if d.get("decision") == "ALLOW"]
+        check("api.risk_decisions_allow", len(allows) >= 4, f"allows={len(allows)}")
+
+        cfg = client.get(f"{API}/api/v1/accounts/{sim_id}/config").json()["data"]["config"]
+        check("api.config_risk_section",
+              cfg.get("risk", {}).get("per_trade_risk_fraction") == "0"
+              and cfg.get("risk", {}).get("require_stop_loss") is True,
+              f"per_trade={cfg.get('risk', {}).get('per_trade_risk_fraction')}")
+
     # ---- 2. PostgreSQL row counts ------------------------------------------
     with psycopg.connect(PG_DSN) as conn:
         for table in TABLES:
@@ -251,6 +289,63 @@ def main() -> int:
             "SELECT count(*) FROM system_events WHERE event_type LIKE 'command.%'"
         ).fetchone()[0]
         check("pg.command_events", cmd_events >= 5, f"events={cmd_events}")
+
+        # ---- 4. Risk gate invariants (PRD 9, doc 12.2) ---------------------
+        rejected = conn.execute(
+            "SELECT count(*) FROM commands WHERE status = 'REJECTED'"
+        ).fetchone()[0]
+        check("pg.commands_rejected", rejected >= 5, f"rejected={rejected}")
+
+        # every REJECT decision pairs with a REJECTED command (no REJECT
+        # command ever reaches QUEUED/DELIVERED, and no ALLOW lands REJECTED)
+        mismatched = conn.execute(
+            """
+            SELECT count(*) FROM risk_decisions d
+              JOIN commands c ON c.command_id = d.command_id
+             WHERE (d.decision = 'REJECT' AND c.status <> 'REJECTED')
+                OR (d.decision = 'ALLOW' AND c.status = 'REJECTED')
+            """
+        ).fetchone()[0]
+        check("pg.risk_decision_command_consistent", mismatched == 0,
+              f"mismatches={mismatched}")
+
+        orphan_decisions = conn.execute(
+            """
+            SELECT count(*) FROM risk_decisions d
+              LEFT JOIN commands c ON c.command_id = d.command_id
+             WHERE c.command_id IS NULL
+            """
+        ).fetchone()[0]
+        check("pg.risk_decisions_have_commands", orphan_decisions == 0,
+              f"orphans={orphan_decisions}")
+
+        # REJECTED is terminal: never delivered, no attempts, never acked
+        leaked_rejected = conn.execute(
+            """
+            SELECT count(*) FROM commands
+             WHERE status = 'REJECTED'
+               AND (delivered_at IS NOT NULL OR delivery_attempts > 0
+                    OR acked_at IS NOT NULL)
+            """
+        ).fetchone()[0]
+        check("pg.rejected_never_delivered", leaked_rejected == 0,
+              f"leaked={leaked_rejected}")
+
+        risk_events = conn.execute(
+            "SELECT count(*) FROM system_events WHERE event_type LIKE 'risk.%'"
+        ).fetchone()[0]
+        check("pg.risk_events", risk_events >= 4, f"events={risk_events}")
+
+        dup_decisions = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT command_id FROM risk_decisions
+                 GROUP BY command_id HAVING count(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+        check("pg.risk_decisions_unique", dup_decisions == 0,
+              f"duplicate_decisions={dup_decisions}")
 
     return finish()
 

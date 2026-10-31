@@ -2,7 +2,9 @@
 
 All responses use the unified envelope {data, error, request_id, timestamp}.
 This slice has NO auth/RBAC yet; trade commands are channel-only: the EA
-acknowledges receipt and never executes (OBSERVE_ONLY, PRD 21.3).
+acknowledges receipt and never executes (OBSERVE_ONLY, PRD 21.3). The cloud
+risk gate (PRD 9) refuses risk-increasing commands BEFORE they are queued:
+they land in terminal state REJECTED and are never delivered.
 """
 
 from __future__ import annotations
@@ -12,12 +14,13 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 import psycopg.errors
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from quantpilot_contracts.models import (
     NodeHeartbeatRequest,
@@ -25,7 +28,8 @@ from quantpilot_contracts.models import (
     TradeCommandCreate,
 )
 
-from . import db, writers
+from . import db, risk, writers
+from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
 from .sweeper import CommandSweeper
@@ -466,41 +470,10 @@ def list_system_events(request: Request, limit: int = 100, severity: str | None 
 
 
 # --------------------------------------------------------------------------
-# account config (doc 12.2 risk_profiles) - OBSERVE_ONLY slice: the config is
-# stored and served for observation; nothing in this system enforces it.
+# account config (doc 12.2 risk_profiles) - filters/expert are handed down to
+# the EA (which only logs them, PRD 21.3); the risk section is enforced by
+# the cloud gate at command creation (PRD 9). Shape: account_config.py.
 # --------------------------------------------------------------------------
-
-class FiltersConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    news_filter: bool = True
-    high_impact_only: bool = True
-    session_filter: bool = False
-    max_spread: bool = True
-    slippage_guard: bool = True
-    weekend_block: bool = False
-    max_daily_orders: int = Field(default=10, ge=1, le=1000)
-    max_positions: int = Field(default=5, ge=1, le=500)
-
-
-class ExpertConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    auto_trading: bool = True
-    sound_alert: bool = False
-    popup_alert: bool = True
-    notification_alert: bool = False
-    close_on_opposite: bool = True
-    magic_number: int = Field(default=123456, ge=0)
-    order_comment: str = Field(default="QuantPilot", max_length=63)
-
-
-class AccountConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    filters: FiltersConfig = Field(default_factory=FiltersConfig)
-    expert: ExpertConfig = Field(default_factory=ExpertConfig)
-
 
 class ConfigLookupRequest(BaseModel):
     """Identity tuple -> account config (called by the local agent for an EA)."""
@@ -553,6 +526,14 @@ def _active_config_row(account_uuid: UUID) -> dict | None:
         """,
         (account_uuid,),
     )
+
+
+def _effective_config(account_uuid: UUID) -> tuple[AccountConfig, int]:
+    """Validated account config for the gate; defaults + version 0 if unset."""
+    row = _active_config_row(account_uuid)
+    if row is None:
+        return AccountConfig(), 0
+    return AccountConfig.model_validate(row["config_json"]), row["version"]
 
 
 @app.get("/api/v1/accounts/{account_id}/config")
@@ -627,11 +608,13 @@ def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
 
 # --------------------------------------------------------------------------
 # trade commands (PRD 13.3-13.5, ADR-004) - durable channel + idempotency +
-# UNKNOWN reconciliation. OBSERVE_ONLY: the EA acks receipt and NEVER executes
-# (PRD 21.3); risk-engine gate fields are slice 2.
+# UNKNOWN reconciliation + cloud risk gate (PRD 9). The gate runs at creation
+# for risk-increasing types; REJECT persists the command in terminal state
+# REJECTED (never delivered, sweeper ignores it). OBSERVE_ONLY overall: even
+# an ALLOWED command is only acked, never executed by the EA (PRD 21.3).
 # --------------------------------------------------------------------------
 
-COMMAND_STATUSES = ("QUEUED", "DELIVERED", "ACKED", "EXPIRED", "UNKNOWN")
+COMMAND_STATUSES = ("QUEUED", "DELIVERED", "ACKED", "EXPIRED", "UNKNOWN", "REJECTED")
 COMMAND_MAX_TTL_SECONDS = 600
 
 _COMMAND_SELECT = """
@@ -675,6 +658,10 @@ def _command_payload(row: dict, created: bool | None) -> dict:
 def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
     """Persist a trade command intent (idempotent on command_id, AT-005/PRD 2.5).
 
+    Risk-increasing types (OPEN_MARKET, PLACE_PENDING) pass the cloud risk
+    gate first (PRD 3.2/9.1): REJECT stores the command in terminal state
+    REJECTED with a risk_decisions audit row - it is never delivered.
+
     Creating neither delivers nor executes anything (PRD 13.5: QUEUED means
     persisted only). A duplicate POST with the same command_id replays the
     original command state; the same command_id with different content is a
@@ -699,7 +686,22 @@ def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
     if existing is not None:
         if existing["account_id"] != str(account_uuid) or existing["command_type"] != body.command_type:
             raise HTTPException(409, "command_id already exists with different content")
-        return ok(_command_payload(existing, created=False), request)
+        payload = _command_payload(existing, created=False)
+        decision = risk.decision_for_command(body.command_id)
+        if decision is not None:
+            payload["risk_decision"] = decision
+        return ok(payload, request)
+
+    decision = None
+    initial_status = "QUEUED"
+    if body.command_type in risk.RISK_INCREASING_TYPES:
+        config, config_version = _effective_config(account_uuid)
+        decision = risk.evaluate_command(
+            account_uuid, body.command_type, body.payload, config, config_version
+        )
+        if decision.decision == "REJECT":
+            initial_status = "REJECTED"
+
     try:
         with db.conn() as connection:
             inserted = connection.execute(
@@ -707,7 +709,7 @@ def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
                 INSERT INTO commands (command_id, idempotency_key, account_id,
                                       command_type, payload, status, expires_at,
                                       created_by, strategy_instance_id, signal_id)
-                VALUES (%s, %s, %s, %s, CAST(%s AS jsonb), 'QUEUED', %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, CAST(%s AS jsonb), %s, %s, %s, %s, %s)
                 ON CONFLICT (command_id) DO NOTHING
                 RETURNING command_id::text
                 """,
@@ -717,6 +719,7 @@ def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
                     account_uuid,
                     body.command_type,
                     json.dumps(body.payload),
+                    initial_status,
                     body.expires_at,
                     body.created_by,
                     str(body.strategy_instance_id) if body.strategy_instance_id is not None else None,
@@ -730,6 +733,14 @@ def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
         row = _command_by_id(body.command_id)
         assert row is not None
         return ok(_command_payload(row, created=False), request)
+
+    if decision is not None:
+        risk.record_decision(
+            account_uuid,
+            body.command_id,
+            str(body.signal_id) if body.signal_id is not None else None,
+            decision,
+        )
     writers.add_system_event(
         source="api",
         event_type="command.created",
@@ -738,6 +749,7 @@ def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
             "command_id": str(body.command_id),
             "account_id": str(account_uuid),
             "command_type": body.command_type,
+            "status": initial_status,
             "created_by": body.created_by,
             "expires_at": body.expires_at.isoformat(),
             "signal_id": str(body.signal_id) if body.signal_id is not None else None,
@@ -746,9 +758,32 @@ def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
             else None,
         },
     )
+    if decision is not None and decision.decision == "REJECT":
+        writers.add_system_event(
+            source="api",
+            event_type="risk.rejected",
+            severity="WARN",
+            payload={
+                "command_id": str(body.command_id),
+                "account_id": str(account_uuid),
+                "command_type": body.command_type,
+                "reason_codes": decision.reason_codes,
+                "config_version": decision.snapshot.get("config_version", 0),
+                "detail": "cloud risk gate refused the new-risk command; stored"
+                          " as REJECTED and never delivered (PRD 9.1)",
+            },
+        )
     row = _command_by_id(body.command_id)
     assert row is not None
-    return ok(_command_payload(row, created=True), request)
+    payload = _command_payload(row, created=True)
+    if decision is not None:
+        payload["risk_decision"] = {
+            "decision": decision.decision,
+            "reason_codes": decision.reason_codes,
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+            "config_version": decision.snapshot.get("config_version", 0),
+        }
+    return ok(payload, request)
 
 
 @app.get("/api/v1/commands")
@@ -782,7 +817,8 @@ def list_commands(
 
 @app.get("/api/v1/commands/{command_id}")
 def get_command(command_id: str, request: Request) -> JSONResponse:
-    """Current command state (PRD 13.5: the frontend must show the REAL state)."""
+    """Current command state (PRD 13.5: the frontend must show the REAL state),
+    including the risk-gate decision when the command was gated."""
     try:
         command_uuid = UUID(command_id)
     except (ValueError, AttributeError, TypeError):
@@ -790,7 +826,11 @@ def get_command(command_id: str, request: Request) -> JSONResponse:
     row = _command_by_id(command_uuid)
     if row is None:
         raise HTTPException(404, "command not found")
-    return ok(_command_payload(row, created=None), request)
+    payload = _command_payload(row, created=None)
+    decision = risk.decision_for_command(command_uuid)
+    if decision is not None:
+        payload["risk_decision"] = decision
+    return ok(payload, request)
 
 
 @app.post("/api/v1/commands/pending")
@@ -881,6 +921,239 @@ def pending_commands(body: CommandPendingRequest, request: Request) -> JSONRespo
             },
         )
     return ok({"commands": commands, "reconciled": reconciled, "resolved": True}, request)
+
+
+# --------------------------------------------------------------------------
+# risk engine: stop states + gate decisions (PRD 9, 3.3, doc 12.2)
+# --------------------------------------------------------------------------
+
+_RISK_STATE_SELECT = """
+    SELECT scope, account_id::text AS account_id, status, reason,
+           updated_by, updated_at, version
+      FROM risk_states
+"""
+
+
+class RiskStopRequest(BaseModel):
+    """POST /api/v1/risk/stop body: durable STOP_NEW_RISK (PRD 3.3).
+
+    scope=GLOBAL stops every account; scope=ACCOUNT stops one. locked=True
+    writes LOCKED (9.5: needs a human to confirm the resume explicitly).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["GLOBAL", "ACCOUNT"]
+    account_id: UUID | None = None
+    reason: str = Field(default="", max_length=512)
+    locked: bool = False
+    updated_by: str = Field(default="api", max_length=64)
+
+    @model_validator(mode="after")
+    def _scope_matches_account(self) -> "RiskStopRequest":
+        if self.scope == "ACCOUNT" and self.account_id is None:
+            raise ValueError("scope=ACCOUNT requires account_id")
+        if self.scope == "GLOBAL" and self.account_id is not None:
+            raise ValueError("scope=GLOBAL must not carry account_id")
+        return self
+
+
+class RiskResumeRequest(RiskStopRequest):
+    """POST /api/v1/risk/resume body: back to NORMAL (idempotent)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_locked: bool = Field(
+        default=False, description="required to leave the LOCKED state (PRD 9.5)"
+    )
+
+
+def _stop_row(scope: str, account_uuid: UUID | None) -> dict | None:
+    if scope == "GLOBAL":
+        return db.query_one(
+            f"{_RISK_STATE_SELECT} WHERE scope = 'GLOBAL' AND account_id IS NULL",
+            (),
+        )
+    return db.query_one(
+        f"{_RISK_STATE_SELECT} WHERE scope = 'ACCOUNT' AND account_id = %s",
+        (account_uuid,),
+    )
+
+
+def _state_payload(row: dict | None, scope: str, account_id: str | None) -> dict:
+    if row is None:
+        # absence means NORMAL (only the GLOBAL row is seeded)
+        return {
+            "scope": scope,
+            "account_id": account_id,
+            "status": "NORMAL",
+            "reason": "",
+            "updated_by": None,
+            "updated_at": None,
+            "version": 0,
+        }
+    payload = db.jsonable(row)
+    payload["account_id"] = account_id if row["account_id"] is None else row["account_id"]
+    return payload
+
+
+@app.get("/api/v1/risk/state")
+def risk_state(request: Request, account_id: str | None = None) -> JSONResponse:
+    """Effective stop states: GLOBAL + per-account rows (absent = NORMAL).
+
+    With account_id, returns the single account's effective state.
+    """
+    if account_id is not None:
+        account_uuid = _account_or_404(account_id)
+        row = _stop_row("ACCOUNT", account_uuid)
+        return ok(_state_payload(row, "ACCOUNT", account_id), request)
+    global_row = _stop_row("GLOBAL", None)
+    account_rows = db.query(
+        f"{_RISK_STATE_SELECT} WHERE scope = 'ACCOUNT' ORDER BY updated_at DESC"
+    )
+    return ok(
+        {
+            "global": _state_payload(global_row, "GLOBAL", None),
+            "accounts": [_state_payload(r, "ACCOUNT", r["account_id"]) for r in account_rows],
+        },
+        request,
+    )
+
+
+@app.post("/api/v1/risk/stop")
+def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
+    """Set STOP_NEW_RISK (or LOCKED). Durable + audited (PRD 3.3: the state
+    change must never be lost). Broadcast to the EA/agent is a later slice;
+    the cloud gate reads this state on every new-risk command."""
+    account_uuid: UUID | None = None
+    if body.scope == "ACCOUNT":
+        account_uuid = _account_or_404(str(body.account_id))
+    status = "LOCKED" if body.locked else "STOP_NEW_RISK"
+    conflict_target = (
+        "ON CONFLICT (scope) WHERE account_id IS NULL"
+        if body.scope == "GLOBAL"
+        else "ON CONFLICT (account_id) WHERE account_id IS NOT NULL"
+    )
+    with db.conn() as connection:
+        connection.execute(
+            f"""
+            INSERT INTO risk_states (scope, account_id, status, reason, updated_by)
+            VALUES (%s, %s, %s, %s, %s)
+            {conflict_target}
+            DO UPDATE SET status = EXCLUDED.status,
+                          reason = EXCLUDED.reason,
+                          updated_by = EXCLUDED.updated_by,
+                          updated_at = now(),
+                          version = risk_states.version + 1
+            """,
+            (body.scope, account_uuid, status, body.reason, body.updated_by),
+        )
+    writers.add_system_event(
+        source="api",
+        event_type="risk.stop_set",
+        severity="WARN",
+        payload={
+            "scope": body.scope,
+            "account_id": str(account_uuid) if account_uuid else None,
+            "status": status,
+            "reason": body.reason,
+            "updated_by": body.updated_by,
+        },
+    )
+    row = _stop_row(body.scope, account_uuid)
+    assert row is not None
+    return ok(_state_payload(row, body.scope, str(account_uuid) if account_uuid else None), request)
+
+
+@app.post("/api/v1/risk/resume")
+def risk_resume(body: RiskResumeRequest, request: Request) -> JSONResponse:
+    """Return to NORMAL. LOCKED requires confirm_locked=true (PRD 9.5)."""
+    account_uuid: UUID | None = None
+    if body.scope == "ACCOUNT":
+        account_uuid = _account_or_404(str(body.account_id))
+    row = _stop_row(body.scope, account_uuid)
+    if row is None:
+        # already NORMAL - idempotent no-op
+        return ok(_state_payload(None, body.scope, str(account_uuid) if account_uuid else None), request)
+    if row["status"] == "LOCKED" and not body.confirm_locked:
+        raise HTTPException(409, "LOCKED state requires confirm_locked=true to resume")
+    if row["status"] == "NORMAL":
+        return ok(_state_payload(row, body.scope, str(account_uuid) if account_uuid else None), request)
+    with db.conn() as connection:
+        # scope-scoped WHERE built per branch: a NULL param inside
+        # "IS NULL" cannot be type-inferred by PostgreSQL
+        if body.scope == "GLOBAL":
+            connection.execute(
+                """
+                UPDATE risk_states
+                   SET status = 'NORMAL', reason = '', updated_by = %s,
+                       updated_at = now(), version = version + 1
+                 WHERE scope = 'GLOBAL' AND account_id IS NULL
+                """,
+                (body.updated_by,),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE risk_states
+                   SET status = 'NORMAL', reason = '', updated_by = %s,
+                       updated_at = now(), version = version + 1
+                 WHERE scope = 'ACCOUNT' AND account_id = %s
+                """,
+                (body.updated_by, account_uuid),
+            )
+    writers.add_system_event(
+        source="api",
+        event_type="risk.stop_cleared",
+        severity="INFO",
+        payload={
+            "scope": body.scope,
+            "account_id": str(account_uuid) if account_uuid else None,
+            "updated_by": body.updated_by,
+            "detail": "resumed to NORMAL; new-risk commands pass the gate again",
+        },
+    )
+    row = _stop_row(body.scope, account_uuid)
+    assert row is not None
+    return ok(_state_payload(row, body.scope, str(account_uuid) if account_uuid else None), request)
+
+
+@app.get("/api/v1/risk/decisions")
+def risk_decisions(
+    request: Request,
+    account_id: str | None = None,
+    command_id: str | None = None,
+    limit: int = 100,
+) -> JSONResponse:
+    """Gate decision audit trail (doc 12.2 risk_decisions), newest first."""
+    limit = max(1, min(limit, 500))
+    where = ["1=1"]
+    params: list = []
+    if account_id is not None:
+        try:
+            params.append(UUID(account_id))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(400, "invalid account_id")
+        where.append("d.account_id = %s")
+    if command_id is not None:
+        try:
+            params.append(UUID(command_id))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(400, "invalid command_id")
+        where.append("d.command_id = %s")
+    rows = db.query(
+        f"""
+        SELECT d.id::text AS id, d.account_id::text AS account_id,
+               d.command_id::text AS command_id, d.signal_id, d.decision,
+               d.reason_codes, d.config_version, d.decided_at
+          FROM risk_decisions d
+         WHERE {' AND '.join(where)}
+         ORDER BY d.decided_at DESC
+         LIMIT %s
+        """,
+        (*params, limit),
+    )
+    return ok(db.jsonable(rows), request)
 
 
 # --------------------------------------------------------------------------
