@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
-import { api } from '../../api'
+import { api, type AuthUser } from '../../api'
 
 const store = useDashboardStore()
 
@@ -51,10 +51,79 @@ async function testConn() {
 
 const timeText = (iso: string | null) =>
   iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '—'
+
+// 用户登录（phase-3 R2）：JWT 通道，与服务密钥通道并存
+const loginUser = ref<AuthUser | null>(api.currentUser())
+const loginName = ref('')
+const loginPass = ref('')
+const loginBusy = ref(false)
+const loginError = ref('')
+const loginOk = ref(false)
+
+async function doLogin() {
+  if (!loginName.value.trim() || !loginPass.value) return
+  loginBusy.value = true
+  loginError.value = ''
+  loginOk.value = false
+  try {
+    loginUser.value = await api.login(loginName.value.trim(), loginPass.value)
+    loginPass.value = ''
+    loginOk.value = true
+  } catch (e) {
+    loginError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    loginBusy.value = false
+  }
+}
+
+function doLogout() {
+  api.logout()
+  loginUser.value = null
+  loginOk.value = false
+  loginError.value = ''
+}
 </script>
 
 <template>
   <div class="settings">
+    <div class="qp-panel">
+      <div class="qp-panel__title">
+        用户登录
+        <span class="qp-live-badge">JWT</span>
+      </div>
+      <template v-if="loginUser">
+        <div class="settings__rows">
+          <div class="settings__row"><span>用户名</span><b>{{ loginUser.username }}</b></div>
+          <div class="settings__row"><span>角色</span><b>{{ loginUser.role }}</b></div>
+          <div class="settings__row"><span>认证方式</span><b class="qp-up">Bearer Token（默认 8 小时有效）</b></div>
+        </div>
+        <div class="settings__conn">
+          <el-button size="small" type="danger" plain @click="doLogout">登出</el-button>
+          <el-tag v-if="loginOk" type="success" size="small">登录成功</el-tag>
+        </div>
+      </template>
+      <template v-else>
+        <div class="settings__rows">
+          <div class="settings__row">
+            <span>用户名</span>
+            <el-input v-model="loginName" placeholder="用户名" size="small" style="width: 240px" @keyup.enter="doLogin" />
+          </div>
+          <div class="settings__row">
+            <span>密码</span>
+            <el-input v-model="loginPass" type="password" show-password placeholder="密码" size="small" style="width: 240px" @keyup.enter="doLogin" />
+          </div>
+        </div>
+        <div class="settings__conn">
+          <el-button size="small" type="primary" :loading="loginBusy" @click="doLogin">登录</el-button>
+          <el-tag v-if="loginError" type="danger" size="small">失败：{{ loginError }}</el-tag>
+        </div>
+      </template>
+      <div class="settings__note">
+        <p>· 登录后以个人身份调用 API（角色与账户授权由管理员分配）；Token 过期自动失效并回退服务密钥通道。</p>
+        <p>· 未登录时沿用服务密钥（开发代理注入 / 桌面直连配置）。</p>
+      </div>
+    </div>
+
     <div class="qp-panel">
       <div class="qp-panel__title">
         系统信息

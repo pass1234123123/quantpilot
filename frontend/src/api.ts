@@ -511,10 +511,27 @@ function apiKeyHeaders(): Record<string, string> {
   return key ? { 'X-API-Key': key } : {}
 }
 
+// User session (phase-3 R2): a JWT from username/password login takes
+// precedence over the service key. The backend rejects any request that
+// carries an Authorization header outright, so never send both at once.
+function authHeaders(): Record<string, string> {
+  const token = localStorage.getItem('qp.token') ?? ''
+  if (token) return { Authorization: `Bearer ${token}` }
+  return apiKeyHeaders()
+}
+
+// A 401 with a token present means the session expired (or was revoked):
+// drop it so later requests fall back to the service-key lane.
+function dropSession(): void {
+  localStorage.removeItem('qp.token')
+  localStorage.removeItem('qp.user')
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(withBase(path), {
-    headers: { Accept: 'application/json', ...apiKeyHeaders() },
+    headers: { Accept: 'application/json', ...authHeaders() },
   })
+  if (res.status === 401) dropSession()
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} on ${path}`)
   }
@@ -536,11 +553,12 @@ async function send<T>(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-      ...apiKeyHeaders(),
+      ...authHeaders(),
       ...(extraHeaders ?? {}),
     },
     body: JSON.stringify(payload),
   })
+  if (res.status === 401) dropSession()
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as ApiEnvelope<T> | null
     if (body?.error) {
@@ -555,7 +573,52 @@ async function send<T>(
   return body.data
 }
 
+export interface AuthUser {
+  user_id: string
+  username: string
+  role: string
+}
+
+interface LoginResponse {
+  token: string
+  token_type: string
+  expires_in: number
+  user: AuthUser
+}
+
 export const api = {
+  // Login posts WITHOUT authHeaders(): the backend rejects requests that
+  // carry an Authorization header, and a stale token must not block a fresh
+  // login. Persisted as qp.token / qp.user (r3-secure moves this to the
+  // OS credential store).
+  login: async (username: string, password: string): Promise<AuthUser> => {
+    const res = await fetch(withBase('/api/v1/auth/login'), {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    })
+    const body = (await res.json().catch(() => null)) as ApiEnvelope<LoginResponse> | null
+    if (!res.ok || !body || body.error || !body.data?.token) {
+      const code = body?.error?.code ?? `HTTP ${res.status}`
+      const message = body?.error?.message ?? '登录失败'
+      throw new Error(`${code}: ${message}`)
+    }
+    localStorage.setItem('qp.token', body.data.token)
+    localStorage.setItem('qp.user', JSON.stringify(body.data.user))
+    return body.data.user
+  },
+  logout: () => {
+    dropSession()
+  },
+  currentUser: (): AuthUser | null => {
+    const raw = localStorage.getItem('qp.user')
+    if (!raw) return null
+    try {
+      return JSON.parse(raw) as AuthUser
+    } catch {
+      return null
+    }
+  },
   health: () => get<{ status: string; db: string }>('/healthz'),
   nodes: () => get<NodeInfo[]>('/api/v1/nodes'),
   terminals: () => get<TerminalInfo[]>('/api/v1/terminals'),
