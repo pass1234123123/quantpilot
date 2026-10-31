@@ -116,7 +116,12 @@ class BacktestRouteTests(unittest.TestCase):
         from quantpilot_api import backtests
 
         job_id = backtests.deterministic_backtest_id(self.key)
-        stored = {"job_id": str(job_id), "status": "COMPLETED", "metrics": {}}
+        stored = {
+            "job_id": str(job_id),
+            "account_id": str(uuid4()),
+            "status": "COMPLETED",
+            "metrics": {},
+        }
         with patch.object(backtests, "create_backtest", return_value=stored) as create:
             response = self.client.post(
                 "/api/v1/backtests",

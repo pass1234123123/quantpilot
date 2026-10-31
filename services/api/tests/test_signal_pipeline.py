@@ -622,6 +622,7 @@ class CommandServiceTests(unittest.TestCase):
             patch.object(command_service.risk, "evaluate_command", return_value=decision) as evaluate,
             patch.object(command_service.risk, "record_decision") as record,
             patch.object(command_service.writers, "add_system_event"),
+            patch.object(command_service.audit, "record"),
         ):
             result = command_service.create_command(
                 body,

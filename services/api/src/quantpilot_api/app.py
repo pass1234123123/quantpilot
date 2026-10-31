@@ -32,7 +32,7 @@ from quantpilot_contracts.models import (
     TradeCommandCreate,
 )
 
-from . import backtests, command_service, db, risk, writers
+from . import audit, backtests, command_service, db, risk, writers
 from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
@@ -589,6 +589,13 @@ def put_account_config(account_id: str, body: AccountConfig, request: Request) -
             (account_uuid, account_uuid, doc),
         )
     row = _active_config_row(account_uuid)
+    audit.record(
+        account_uuid,
+        "CONFIG_UPDATE",
+        "account_config",
+        account_id,
+        {"version": (row or {}).get("version")},
+    )
     return ok(db.jsonable(_config_payload(row, account_id)), request)
 
 
@@ -1253,6 +1260,13 @@ def set_strategy_instance_status(
             """,
             (body.status, UUID(instance_id), account_uuid),
         )
+    audit.record(
+        account_uuid,
+        "INSTANCE_STATUS_UPDATE",
+        "strategy_instance",
+        str(instance_id),
+        {"status": body.status},
+    )
     return ok(db.jsonable(_instance_or_404(account_uuid, instance_id)), request)
 
 
@@ -1275,6 +1289,13 @@ def update_strategy_instance_config(
             """,
             (json.dumps(config), UUID(instance_id), account_uuid),
         )
+    audit.record(
+        account_uuid,
+        "INSTANCE_CONFIG_UPDATE",
+        "strategy_instance",
+        str(instance_id),
+        {"config_keys": sorted(config.keys())},
+    )
     return ok(db.jsonable(_instance_or_404(account_uuid, instance_id)), request)
 
 
@@ -1358,6 +1379,13 @@ def create_backtest(
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    audit.record(
+        UUID(result["account_id"]),
+        "BACKTEST_CREATE",
+        "backtest",
+        result["job_id"],
+        {"strategy_instance_id": result.get("strategy_instance_id")},
+    )
     return ok(db.jsonable(result), request)
 
 
@@ -1443,7 +1471,7 @@ def ai_analyze(account_id: str, body: AiAnalyzeRequest, request: Request) -> JSO
     row. With the account AI mode OFF (doc 8.5) no analysis runs and the
     response carries ai_mode=OFF.
     """
-    _account_or_404(account_id)
+    account_uuid = _account_or_404(account_id)
     if body.timeframe not in _TIMEFRAMES:
         raise HTTPException(400, f"timeframe must be one of {_TIMEFRAMES}")
     from . import ai_engine
@@ -1453,7 +1481,42 @@ def ai_analyze(account_id: str, body: AiAnalyzeRequest, request: Request) -> JSO
     )
     if error is not None:
         raise HTTPException(404, error)
+    audit.record(
+        account_uuid,
+        "AI_ANALYZE",
+        "ai_analysis",
+        (analysis or {}).get("analysis_id"),
+        {
+            "broker_symbol": body.broker_symbol,
+            "timeframe": body.timeframe,
+            "ai_mode": mode,
+        },
+    )
     return ok({"ai_mode": mode, "analysis": analysis}, request)
+
+
+# --------------------------------------------------------------------------
+# Operation audit trail (phase-2 task 6): read side for the audit center.
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/v1/audit-logs")
+def get_audit_logs(
+    request: Request,
+    account_id: str | None = None,
+    action: str | None = None,
+    limit: int = 100,
+) -> JSONResponse:
+    """Structured operation audit, newest first; optional account/action
+    filters. Written best-effort by every state-changing route."""
+    account_uuid: UUID | None = None
+    if account_id is not None:
+        try:
+            account_uuid = UUID(account_id)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(400, "invalid account_id") from None
+    rows = audit.list_audit_logs(account_uuid, action, max(1, min(limit, 500)))
+    return ok(db.jsonable(rows), request)
 
 
 # --------------------------------------------------------------------------

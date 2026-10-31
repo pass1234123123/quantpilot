@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type AiAnalysisRow, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type CreateBacktestPayload, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type AiAnalysisRow, type AuditLogRow, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type CreateBacktestPayload, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -29,6 +29,8 @@ export const useDashboardStore = defineStore('dashboard', {
     backtests: [] as BacktestJobSummary[],
     aiAnalyses: [] as AiAnalysisRow[],
     aiRunning: false,
+    auditLogs: [] as AuditLogRow[],
+    auditLoading: false,
     backtestCreating: false,
     lastRefreshAt: '' as string,
   }),
@@ -176,6 +178,18 @@ export const useDashboardStore = defineStore('dashboard', {
         return null
       } finally {
         this.backtestCreating = false
+      }
+    },
+    /** 审计日志查询（phase-2 task 6：全局或按账户/操作过滤，最新在前） */
+    async refreshAuditLogs(accountId?: string, action?: string, limit = 100) {
+      this.auditLoading = true
+      try {
+        this.auditLogs = await api.auditLogs(accountId, action, limit)
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e)
+        this.auditLogs = []
+      } finally {
+        this.auditLoading = false
       }
     },
     async setInstanceStatus(instanceId: string, status: 'ENABLED' | 'DISABLED') {

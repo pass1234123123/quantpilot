@@ -22,6 +22,7 @@ const navItems: NavItem[] = [
   { key: 'commands', label: '命令通道' },
   { key: 'backtests', label: '回测研究' },
   { key: 'ai', label: 'AI 分析' },
+  { key: 'audit', label: '审计日志' },
   { key: 'filtering', label: '过滤设置' },
   { key: 'expert', label: 'EA 设置' },
   { key: 'journal', label: '交易日志' },

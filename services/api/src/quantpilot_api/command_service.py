@@ -10,7 +10,7 @@ from uuid import UUID
 import psycopg.errors
 from quantpilot_contracts.models import TradeCommandCreate
 
-from . import db, risk, writers
+from . import audit, db, risk, writers
 from .account_config import AccountConfig
 
 COMMAND_MAX_TTL_SECONDS = 600
@@ -177,6 +177,17 @@ def create_command(
             "strategy_instance_id": str(body.strategy_instance_id)
             if body.strategy_instance_id is not None
             else None,
+        },
+    )
+    audit.record(
+        account_uuid,
+        "COMMAND_CREATE",
+        "command",
+        str(body.command_id),
+        {
+            "command_type": body.command_type,
+            "status": initial_status,
+            "created_by": body.created_by,
         },
     )
     if decision is not None and decision.decision == "REJECT":

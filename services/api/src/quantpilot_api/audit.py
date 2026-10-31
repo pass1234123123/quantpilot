@@ -1,0 +1,89 @@
+"""Best-effort operation audit trail (phase-2 task 6, PRD 14 audit story).
+
+audit_logs records who/what/when for every state-changing cloud operation
+(config saves, instance updates, command creation, backtest creation, AI
+triggers). record() is best-effort BY DESIGN: an audit write failure must
+never break the audited operation - it logs loudly instead. The read side
+powers GET /api/v1/audit-logs behind the standard X-API-Key gate.
+
+Actor: in the single service API-key phase (PRD 14) there are no user
+identities yet, so every row is attributed to ACTOR="api-key"; RBAC will
+introduce real actors in the commercialization phase.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+from uuid import UUID
+
+from . import db
+
+logger = logging.getLogger("quantpilot.audit")
+
+ACTOR = "api-key"
+
+LIMIT_MAX = 500
+
+_INSERT = """
+    INSERT INTO audit_logs (account_id, actor, action, object_type, object_id, payload)
+    VALUES (%s, %s, %s, %s, %s, CAST(%s AS jsonb))
+"""
+
+_SELECT = """
+    SELECT l.id::text AS id, l.account_id::text AS account_id, l.actor,
+           l.action, l.object_type, l.object_id, l.payload, l.created_at
+      FROM audit_logs l
+"""
+
+
+def record(
+    account_id: UUID,
+    action: str,
+    object_type: str,
+    object_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Append one audit row; NEVER raises (auditing must not break the
+    audited operation - failures are logged loudly instead)."""
+    try:
+        db.execute(
+            _INSERT,
+            (
+                account_id,
+                ACTOR,
+                action,
+                object_type,
+                object_id,
+                json.dumps(payload) if payload is not None else None,
+            ),
+        )
+    except Exception:  # noqa: BLE001 - best-effort by design
+        logger.exception(
+            "audit write failed: action=%s object_type=%s object_id=%s",
+            action,
+            object_type,
+            object_id,
+        )
+
+
+def list_audit_logs(
+    account_id: UUID | None = None,
+    action: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Audit rows, newest first; optional account/action filters."""
+    where = ["1=1"]
+    params: list[Any] = []
+    if account_id is not None:
+        where.append("l.account_id = %s")
+        params.append(account_id)
+    if action is not None:
+        where.append("l.action = %s")
+        params.append(action)
+    params.append(max(1, min(limit, LIMIT_MAX)))
+    return db.query(
+        _SELECT + f" WHERE {' AND '.join(where)} ORDER BY l.created_at DESC LIMIT %s",
+        tuple(params),
+    )

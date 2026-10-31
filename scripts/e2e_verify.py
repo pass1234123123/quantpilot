@@ -55,6 +55,7 @@ TABLES = [
     "backtest_jobs",
     "backtest_results",
     "system_events",
+    "audit_logs",
 ]
 
 failures = 0

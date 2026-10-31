@@ -487,6 +487,17 @@ export interface AiAnalyzeResult {
   analysis: AiAnalysisDoc | null
 }
 
+export interface AuditLogRow {
+  id: string
+  account_id: string
+  actor: string
+  action: string
+  object_type: string
+  object_id: string | null
+  payload: Record<string, unknown> | null
+  created_at: string
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
   if (!res.ok) {
@@ -581,6 +592,12 @@ export const api = {
       `/api/v1/accounts/${accountId}/ai/analyze`,
       'POST',
       { broker_symbol: brokerSymbol, timeframe },
+    ),
+  auditLogs: (accountId?: string, action?: string, limit = 100) =>
+    get<AuditLogRow[]>(
+      `/api/v1/audit-logs?limit=${limit}${accountId ? `&account_id=${accountId}` : ''}${
+        action ? `&action=${encodeURIComponent(action)}` : ''
+      }`,
     ),
 }
 
