@@ -92,6 +92,12 @@ class EaHeartbeatData(BaseModel):
     free_margin: Money = Field(default=Decimal("0"))
     currency: str
     open_positions: int
+    # phase-3 P2: the EA reports its run mode (OBSERVE_ONLY / DRY_RUN /
+    # LIVE, derived from its DryRunMode / LiveTrading inputs) so the cloud
+    # and UI display the REAL mode. Kept a free string on purpose: a
+    # future EA value must not break the heartbeat; the cloud normalizes
+    # unknown labels to NULL at the storage edge. Absent on pre-1.9 EAs.
+    run_mode: str | None = None
     observed_at: datetime
 
 

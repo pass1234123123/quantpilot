@@ -23,7 +23,7 @@ from uuid import uuid4
 def _heartbeat_body(run_mode=None, with_mode_key=True):
     body = {
         "ea_version": "1.9.0",
-        "terminal": {"build": 4030},
+        "terminal": {"build": 4030, "data_path": "C:/mt5/data"},
         "account": {
             "login_ref": "25385951",
             "server": "Tickmill-Demo",
@@ -82,6 +82,33 @@ class DeriveRunModeTests(unittest.TestCase):
         self.assertEqual(EA_RUN_MODE_OBSERVE_ONLY, "OBSERVE_ONLY")
         self.assertEqual(EA_RUN_MODE_DRY_RUN, "DRY_RUN")
         self.assertEqual(EA_RUN_MODE_LIVE, "LIVE")
+
+
+# ---------------------------------------------------------------------------
+# contract: the wire model must accept run_mode (agent validates EAs through
+# StrictModel extra="forbid" - a missing field would DROP every EA heartbeat)
+# ---------------------------------------------------------------------------
+
+
+class HeartbeatContractTests(unittest.TestCase):
+    def test_model_accepts_reported_run_mode(self) -> None:
+        from quantpilot_contracts.models import EaHeartbeatData
+
+        model = EaHeartbeatData.model_validate(_heartbeat_body(run_mode="DRY_RUN"))
+        self.assertEqual(model.run_mode, "DRY_RUN")
+
+    def test_model_defaults_run_mode_to_none(self) -> None:
+        from quantpilot_contracts.models import EaHeartbeatData
+
+        model = EaHeartbeatData.model_validate(_heartbeat_body(with_mode_key=False))
+        self.assertIsNone(model.run_mode)
+
+    def test_unknown_run_mode_does_not_break_the_heartbeat(self) -> None:
+        """Forward compatibility: a future EA value parses; the storage edge normalizes."""
+        from quantpilot_contracts.models import EaHeartbeatData
+
+        model = EaHeartbeatData.model_validate(_heartbeat_body(run_mode="FUTURE_MODE"))
+        self.assertEqual(model.run_mode, "FUTURE_MODE")
 
 
 # ---------------------------------------------------------------------------
