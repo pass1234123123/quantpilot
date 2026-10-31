@@ -72,7 +72,7 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.80"
+#property version   "1.90"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
