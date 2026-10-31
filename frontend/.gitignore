@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Tauri auto-generated artifacts (ACL schemas etc., rebuilt on every tauri build)
+src-tauri/gen/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
