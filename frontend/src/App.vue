@@ -21,6 +21,7 @@ import StrategiesPanel from './components/panels/StrategiesPanel.vue'
 import SignalsPanel from './components/panels/SignalsPanel.vue'
 import CommandsPanel from './components/panels/CommandsPanel.vue'
 import BacktestsPanel from './components/panels/BacktestsPanel.vue'
+import AiPanel from './components/panels/AiPanel.vue'
 
 // 轻量视图状态机（不引入 vue-router，零新依赖）
 type ViewKey =
@@ -31,6 +32,7 @@ type ViewKey =
   | 'signals'
   | 'commands'
   | 'backtests'
+  | 'ai'
   | 'filtering'
   | 'expert'
   | 'journal'
@@ -50,6 +52,7 @@ const viewMeta: Record<ViewKey, { title: string; sub: string }> = {
   signals: { title: '交易信号', sub: '云端收盘 bar 评估 · 边沿触发去重' },
   commands: { title: '命令通道', sub: '命令状态机与风控闸门审计 · OBSERVE_ONLY' },
   backtests: { title: '回测研究', sub: '可复现历史回测任务与指标报告' },
+  ai: { title: 'AI 分析', sub: '市场状态识别与策略适用性 · ADVISORY 建议性 · 不参与交易许可' },
   filtering: { title: '过滤设置', sub: '云端版本化配置 · EA 拉取生效' },
   expert: { title: 'EA 设置', sub: '云端版本化配置 · EA 拉取生效' },
   journal: { title: '交易日志', sub: '成交与挂单历史 · 真实经纪商数据' },
@@ -157,6 +160,7 @@ onBeforeUnmount(() => {
         <SignalsPanel v-else-if="activeView === 'signals'" />
         <CommandsPanel v-else-if="activeView === 'commands'" />
         <BacktestsPanel v-else-if="activeView === 'backtests'" />
+        <AiPanel v-else-if="activeView === 'ai'" />
         <FilteringPanel v-else-if="activeView === 'filtering'" />
         <ExpertPanel v-else-if="activeView === 'expert'" />
         <TradeJournalPanel v-else-if="activeView === 'journal'" />

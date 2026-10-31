@@ -21,6 +21,7 @@ const navItems: NavItem[] = [
   { key: 'signals', label: '交易信号' },
   { key: 'commands', label: '命令通道' },
   { key: 'backtests', label: '回测研究' },
+  { key: 'ai', label: 'AI 分析' },
   { key: 'filtering', label: '过滤设置' },
   { key: 'expert', label: 'EA 设置' },
   { key: 'journal', label: '交易日志' },

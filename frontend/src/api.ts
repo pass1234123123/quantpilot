@@ -238,13 +238,18 @@ export interface ExpertConfig {
   order_comment: string
 }
 
+/** AI 运行模式（doc 8.5）：OFF 关闭 / ADVISORY 仅建议展示 */
+export interface AiModeConfig {
+  mode: 'OFF' | 'ADVISORY'
+}
+
 export interface AccountConfigData {
   account_id: string | null
   version: number
   status: string
   source: string
   resolved?: boolean
-  config: { filters: FiltersConfig; expert: ExpertConfig }
+  config: { filters: FiltersConfig; expert: ExpertConfig; ai?: AiModeConfig }
   created_at: string | null
 }
 
@@ -415,6 +420,54 @@ export interface BacktestJobDetail extends BacktestJobSummary {
   updated_at: string
 }
 
+/** AI 分析 doc 8.4：output_json 严格结构（统计版 regime 分类器） */
+export interface AiStrategyScore {
+  strategy_id: string
+  score: number
+  reason_codes: string[]
+}
+
+export interface AiAnalysisDoc {
+  analysis_id: string
+  model_provider: string
+  model_id: string
+  prompt_version: string
+  created_at: string
+  input_snapshot_id: string
+  market_regime: 'TREND_UP' | 'TREND_DOWN' | 'RANGE' | 'HIGH_VOL' | 'UNKNOWN'
+  regime_confidence: number
+  strategy_scores: AiStrategyScore[]
+  signal_decision: 'ALLOW' | 'REVIEW'
+  risk_flags: string[]
+  explanation: string
+  expires_at: string
+  source_bar_time: string
+  duration_ms: number
+  cost: string
+}
+
+export interface AiAnalysisRow {
+  id: string
+  analysis_id: string
+  account_id: string
+  broker_symbol: string
+  timeframe: string
+  model_provider: string
+  model_id: string
+  prompt_version: string
+  input_hash: string
+  output_json: AiAnalysisDoc
+  source_bar_time: string
+  created_at: string
+  expires_at: string
+  duration_ms: number
+}
+
+export interface AiAnalyzeResult {
+  ai_mode: 'OFF' | 'ADVISORY'
+  analysis: AiAnalysisDoc | null
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { Accept: 'application/json' } })
   if (!res.ok) {
@@ -482,6 +535,14 @@ export const api = {
   backtests: (accountId: string, limit = 50) =>
     get<BacktestJobSummary[]>(`/api/v1/backtests?account_id=${accountId}&limit=${limit}`),
   backtest: (jobId: string) => get<BacktestJobDetail>(`/api/v1/backtests/${jobId}`),
+  aiAnalyses: (accountId: string, limit = 100) =>
+    get<AiAnalysisRow[]>(`/api/v1/accounts/${accountId}/ai/analyses?limit=${limit}`),
+  aiAnalyze: (accountId: string, brokerSymbol: string, timeframe: string) =>
+    send<AiAnalyzeResult>(
+      `/api/v1/accounts/${accountId}/ai/analyze`,
+      'POST',
+      { broker_symbol: brokerSymbol, timeframe },
+    ),
 }
 
 /** Parse API decimal strings ("9980.00000000", "0E-8") safely. */

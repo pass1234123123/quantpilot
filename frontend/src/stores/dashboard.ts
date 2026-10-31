@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
+import { api, num, type AccountConfigData, type AccountInfo, type AccountSnapshot, type AiAnalysisRow, type BacktestJobSummary, type CalendarEventRow, type CommandRow, type DealRow, type NodeInfo, type OrderRow, type PerformanceData, type PositionRow, type RiskDecisionRow, type SignalRow, type SnapshotPoint, type StrategyInstanceRow, type StrategyRow, type SymbolRow, type SystemEventRow, type TerminalInfo } from '../api'
 
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
@@ -27,6 +27,8 @@ export const useDashboardStore = defineStore('dashboard', {
     commands: [] as CommandRow[],
     decisions: [] as RiskDecisionRow[],
     backtests: [] as BacktestJobSummary[],
+    aiAnalyses: [] as AiAnalysisRow[],
+    aiRunning: false,
     lastRefreshAt: '' as string,
   }),
   getters: {
@@ -103,9 +105,11 @@ export const useDashboardStore = defineStore('dashboard', {
       this.commands = []
       this.decisions = []
       this.backtests = []
+      this.aiAnalyses = []
       const [
         snapshot, history, symbols, positions, deals, orders, calendar,
         performance, config, instances, signals, commands, decisions, backtests,
+        aiAnalyses,
       ] = await Promise.all([
         api.snapshot(accountId).catch(() => null),
         api.snapshots(accountId, 500).catch(() => [] as SnapshotPoint[]),
@@ -121,6 +125,7 @@ export const useDashboardStore = defineStore('dashboard', {
         api.commands(accountId, 100).catch(() => [] as CommandRow[]),
         api.riskDecisions(accountId, 100).catch(() => [] as RiskDecisionRow[]),
         api.backtests(accountId, 50).catch(() => [] as BacktestJobSummary[]),
+        api.aiAnalyses(accountId, 100).catch(() => [] as AiAnalysisRow[]),
       ])
       if (this.selectedAccountId !== accountId) return
       this.snapshot = snapshot
@@ -137,6 +142,24 @@ export const useDashboardStore = defineStore('dashboard', {
       this.commands = commands
       this.decisions = decisions
       this.backtests = backtests
+      this.aiAnalyses = aiAnalyses
+    },
+    /** 手动触发一次 AI 分析（doc 8.4；ADVISORY 仅建议，OFF 时返回 ai_mode=OFF） */
+    async runAiAnalysis(brokerSymbol: string, timeframe: string) {
+      if (!this.selectedAccountId) return null
+      this.aiRunning = true
+      try {
+        const result = await api.aiAnalyze(this.selectedAccountId, brokerSymbol, timeframe)
+        this.aiAnalyses = await api
+          .aiAnalyses(this.selectedAccountId, 100)
+          .catch(() => [] as AiAnalysisRow[])
+        return result
+      } catch (e) {
+        this.error = e instanceof Error ? e.message : String(e)
+        return null
+      } finally {
+        this.aiRunning = false
+      }
     },
     async setInstanceStatus(instanceId: string, status: 'ENABLED' | 'DISABLED') {
       if (!this.selectedAccountId) return
