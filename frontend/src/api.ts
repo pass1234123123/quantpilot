@@ -498,8 +498,23 @@ export interface AuditLogRow {
   created_at: string
 }
 
+// Desktop production mode (Tauri) has no Vite dev proxy: allow configuring a
+// direct API base URL + key in the Settings panel, persisted in localStorage.
+// Dev mode leaves both empty -> relative paths + proxy-injected key (unchanged).
+function withBase(path: string): string {
+  const base = localStorage.getItem('qp.apiBase') ?? ''
+  return base ? `${base.replace(/\/+$/, '')}${path}` : path
+}
+
+function apiKeyHeaders(): Record<string, string> {
+  const key = localStorage.getItem('qp.apiKey') ?? ''
+  return key ? { 'X-API-Key': key } : {}
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path, { headers: { Accept: 'application/json' } })
+  const res = await fetch(withBase(path), {
+    headers: { Accept: 'application/json', ...apiKeyHeaders() },
+  })
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} on ${path}`)
   }
@@ -516,11 +531,12 @@ async function send<T>(
   payload: unknown,
   extraHeaders?: Record<string, string>,
 ): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(withBase(path), {
     method,
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
+      ...apiKeyHeaders(),
       ...(extraHeaders ?? {}),
     },
     body: JSON.stringify(payload),

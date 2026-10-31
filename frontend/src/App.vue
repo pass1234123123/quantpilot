@@ -71,6 +71,14 @@ const viewSub = computed(() => viewMeta[activeView.value].sub)
 const store = useDashboardStore()
 let timer: ReturnType<typeof setInterval> | null = null
 
+// Tauri webview detection (desktop shell), no extra package dependency.
+const isDesktopShell = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+// Desktop production builds have no Vite proxy: when API calls fail and no
+// direct connection is configured, guide the user to Settings.
+const desktopNeedsConfig = computed(
+  () => isDesktopShell && !localStorage.getItem('qp.apiBase') && !!store.error,
+)
+
 onMounted(() => {
   store.refreshAll()
   timer = setInterval(() => store.refreshAll(), 30000)
@@ -111,6 +119,16 @@ onBeforeUnmount(() => {
           </el-button>
         </div>
       </header>
+
+      <el-alert
+        v-if="desktopNeedsConfig"
+        title="桌面模式：尚未配置 API 连接"
+        description="桌面安装版没有 Vite 代理，请到「设置 → 桌面连接」填写 API 地址与 API Key 后保存。"
+        type="warning"
+        show-icon
+        :closable="false"
+        style="margin-bottom: 12px"
+      />
 
       <el-alert
         v-if="store.error"

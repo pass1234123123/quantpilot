@@ -23,6 +23,7 @@ from uuid import UUID
 
 import psycopg.errors
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -103,6 +104,31 @@ async def require_api_key(request: Request, call_next):
         logger.warning("rejected unauthenticated API request to %s", path)
         return err(401, "UNAUTHORIZED", "missing or invalid X-API-Key header")
     return await call_next(request)
+
+
+# --------------------------------------------------------------------------
+# CORS allowlist for the desktop shell. Production desktop builds have no
+# Vite proxy: the Tauri webview (origin http://tauri.localhost) calls the
+# API directly with X-API-Key. Strict allowlist only; extend deployment
+# shapes via QP_CORS_ORIGINS (comma-separated). Registered AFTER the auth
+# middleware so CORS is the outermost layer and preflight OPTIONS requests
+# never hit the key gate.
+# --------------------------------------------------------------------------
+
+_DESKTOP_ORIGINS = (
+    "http://tauri.localhost",
+    "tauri://localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+_extra_origins = [o.strip() for o in os.getenv("QP_CORS_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[*_DESKTOP_ORIGINS, *_extra_origins],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "X-API-Key"],
+    max_age=600,
+)
 
 
 # --------------------------------------------------------------------------
