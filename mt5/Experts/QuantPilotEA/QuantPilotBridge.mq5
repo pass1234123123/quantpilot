@@ -19,6 +19,10 @@
 //|     receipt (DUPLICATE/EXPIRED/OBSERVE_ONLY_ACK), DRY_RUN pre-      |
 //|     trade checks, or live CTrade execution on DEMO accounts        |
 //|     only (slice 3, behind the LiveTrading input; PRD 21.3)         |
+//|   - persists a crash-safe execution journal for live mutating     |
+//|     commands: verdict + broker tickets hit disk before the ack;   |
+//|     a startup scan re-sends owed acks and flags interrupted       |
+//|     commands EXECUTE_UNRESOLVED - never a blind local re-run      |
 //|   - sends a shutdown note on removal                             |
 //|                                                                   |
 //| Command channel (PRD 13.5 + AT-005/AT-006):                       |
@@ -27,6 +31,13 @@
 //|     sent (terminal GlobalVariable "QPCMD_<id>", survives EA      |
 //|     reloads); a lost ack is still reconcilable via the           |
 //|     recently_acked echo on the next poll (AT-006)                 |
+//|   - R1 crash-safety: live commands that mutate broker state get  |
+//|     a disk journal (QuantPilot\cmdstate\<id>.json) BEFORE the     |
+//|     processed mark; the verdict + broker tickets are persisted    |
+//|     BEFORE the ack POST; the startup/periodic scan re-sends owed |
+//|     acks and acks interrupted commands EXECUTE_UNRESOLVED for   |
+//|     cloud-side reconciliation - an interrupted command is NEVER |
+//|     re-executed locally (no blind retries, acceptance C3)        |
 //|   - duplicate commands get ack_code=DUPLICATE, no side effects    |
 //|   - commands past expires_at get ack_code=EXPIRED - expired        |
 //|     commands are NEVER executed, in any mode (acceptance C3)      |
@@ -61,13 +72,13 @@
 //| Account switching inside the terminal re-triggers registration.   |
 //+------------------------------------------------------------------+
 #property copyright "QuantPilot AI"
-#property version   "1.70"
+#property version   "1.80"
 #property strict
 
 #include <QuantPilot\QpJson.mqh>
 #include <Trade\Trade.mqh>
 
-#define QP_EA_VERSION        "1.7.0"
+#define QP_EA_VERSION        "1.8.0"
 #define QP_HTTP_TIMEOUT_MS  5000
 #define QP_SYMBOLS_PER_BATCH 25
 #define QP_SPEC_REFRESH_SEC  3600   // re-report full specs hourly
@@ -88,6 +99,9 @@
 #define QP_ACK_EXECUTE_FAIL   "EXECUTE_FAILED"
 #define QP_ACK_EXECUTE_REJ    "EXECUTE_REJECTED"
 #define QP_ACK_NOT_DEMO       "LIVE_REFUSED_NOT_DEMO"
+#define QP_ACK_UNRESOLVED     "EXECUTE_UNRESOLVED"   // interrupted execution: reconcile, never blind-retry (R1)
+#define QP_CMDSTATE_DIR       "QuantPilot\\cmdstate\\" // per-command execution journals (R1)
+#define QP_CMDSTATE_RETENTION_SEC 604800              // prune delivered journals after 7 days
 
 //--- inputs (PRD 5.7 subset relevant to this slice)
 input string AgentEndpoint    = "http://127.0.0.1:8787"; // Local agent base URL (loopback only)
@@ -118,6 +132,7 @@ datetime g_last_deals_at   = 0;    // when the deals channel last succeeded
 datetime g_last_config_at  = 0;    // when the config poll last succeeded
 datetime g_last_calendar_at = 0;  // when the calendar report last succeeded
 datetime g_last_command_at = 0;   // when the command poll last succeeded
+datetime g_last_cmdstate_scan = 0; // when the journal scan last ran (R1)
 string   g_recent_command_ids[]; // recently acked command_ids (echo ring)
 
 //--- closed-bar reporting state (one slot per configured timeframe)
@@ -1106,11 +1121,173 @@ string QpRecentCommandsJson()
   }
 
 //+------------------------------------------------------------------+
-//| Command ack: receipt / DRY_RUN verdict / live-execution outcome  |
+//| Crash-safe command execution journal (phase-3 R1).               |
+//| A LIVE command that mutates broker state is journaled EXECUTING  |
+//| on disk BEFORE the processed mark and the CTrade call; the final  |
+//| verdict + broker tickets are persisted BEFORE the ack POST; the   |
+//| acked flag right after it. A crash can therefore never silently   |
+//| lose a verdict: the scan re-sends owed acks and flags interrupted |
+//| commands EXECUTE_UNRESOLVED - it NEVER re-executes them locally;  |
+//| the cloud reconciles those against broker projections before any  |
+//| operator re-issue.                                                |
+//+------------------------------------------------------------------+
+#define QP_CMDSTATE_EXECUTING "EXECUTING"
+#define QP_CMDSTATE_FINAL     "FINAL"
+
+// command types that mutate broker state in LIVE mode - only these get
+// a journal (receipts and DRY_RUN verdicts stay memoryless as before)
+bool QpCommandMutatesBrokerState(const string command_type)
+  {
+   return(command_type == "OPEN_MARKET" || command_type == "PLACE_PENDING" ||
+          command_type == "MODIFY_POSITION" || command_type == "CLOSE_POSITION" ||
+          command_type == "CANCEL_ORDER");
+  }
+
+struct QpCommandState
+  {
+   string command_id;
+   string command_type;
+   string state;             // EXECUTING | FINAL
+   string ack_code;          // final verdict ("" while EXECUTING)
+   string ack_message;
+   string order_ticket;      // "0" = none / keep stored value
+   string deal_ticket;
+   string position_ticket;
+   bool   acked;             // ack POST reached the local agent
+   long   updated_unix;
+  };
+
+string QpCommandStatePath(const string command_id)
+  {
+   return(QP_CMDSTATE_DIR + command_id + ".json");
+  }
+
+bool QpCommandStateExists(const string command_id)
+  {
+   return(FileIsExist(QpCommandStatePath(command_id)));
+  }
+
+void QpCommandStateWrite(const string command_id, const QpCommandState &state)
+  {
+   QpJsonObject o;
+   o.Clear();
+   o.AddStr("command_id", state.command_id);
+   o.AddStr("command_type", state.command_type);
+   o.AddStr("state", state.state);
+   o.AddStr("ack_code", state.ack_code);
+   o.AddStr("ack_message", state.ack_message);
+   o.AddStr("order_ticket", state.order_ticket);
+   o.AddStr("deal_ticket", state.deal_ticket);
+   o.AddStr("position_ticket", state.position_ticket);
+   o.AddInt("acked", state.acked ? 1 : 0);
+   o.AddInt("updated_unix", state.updated_unix);
+   int handle = FileOpen(QpCommandStatePath(command_id),
+                        FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+     {
+      QpLog("ERROR", "cmdstate write failed for " + command_id +
+            " (err=" + IntegerToString(GetLastError()) +
+            "); journal NOT on disk - ack will still be attempted");
+      return;
+     }
+   FileWriteString(handle, o.Dump());
+   FileFlush(handle);
+   FileClose(handle);
+  }
+
+bool QpCommandStateLoad(const string command_id, QpCommandState &state)
+  {
+   int handle = FileOpen(QpCommandStatePath(command_id),
+                        FILE_READ | FILE_TXT | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+      return(false);
+   string json = FileReadString(handle);
+   FileClose(handle);
+   state.command_id      = command_id;
+   state.command_type    = QpJsonGetString(json, "command_type");
+   state.state           = QpJsonGetString(json, "state");
+   state.ack_code        = QpJsonGetString(json, "ack_code");
+   state.ack_message     = QpJsonGetString(json, "ack_message");
+   state.order_ticket    = QpJsonGetString(json, "order_ticket");
+   state.deal_ticket     = QpJsonGetString(json, "deal_ticket");
+   state.position_ticket = QpJsonGetString(json, "position_ticket");
+   state.acked           = (QpJsonGetLong(json, "acked") != 0);
+   state.updated_unix    = QpJsonGetLong(json, "updated_unix");
+   if(state.state == "")
+      state.state = QP_CMDSTATE_EXECUTING; // torn write -> assume the worst
+   return(true);
+  }
+
+// journal a live mutating command as EXECUTING BEFORE the processed mark
+// and the CTrade call - a crash anywhere past this point is recoverable
+void QpCommandStateInit(const string command_id, const string command_type)
+  {
+   if(QpCommandStateExists(command_id))
+      return; // recovery / duplicate delivery: never re-init a journal
+   QpCommandState state;
+   state.command_id      = command_id;
+   state.command_type    = command_type;
+   state.state           = QP_CMDSTATE_EXECUTING;
+   state.ack_code        = "";
+   state.ack_message     = "";
+   state.order_ticket    = "0";
+   state.deal_ticket     = "0";
+   state.position_ticket = "0";
+   state.acked           = false;
+   state.updated_unix    = (long)TimeGMT();
+   QpCommandStateWrite(command_id, state);
+  }
+
+// persist the final verdict + broker tickets BEFORE the ack POST (a lost
+// ack must never lose the broker outcome). Tickets of 0 keep the stored
+// value; an already-delivered (acked) journal is never overwritten.
+void QpCommandStateSetOutcome(const string command_id, const string ack_code,
+                              const string ack_message, const long order_ticket,
+                              const long deal_ticket, const long position_ticket)
+  {
+   QpCommandState state;
+   if(!QpCommandStateLoad(command_id, state))
+      return; // no journal (receipt / DRY_RUN paths): nothing to persist
+   if(state.acked)
+      return; // verdict already delivered - keep the stored record intact
+   state.state         = QP_CMDSTATE_FINAL;
+   state.ack_code      = ack_code;
+   state.ack_message   = ack_message;
+   if(order_ticket > 0)
+      state.order_ticket = IntegerToString(order_ticket);
+   if(deal_ticket > 0)
+      state.deal_ticket = IntegerToString(deal_ticket);
+   if(position_ticket > 0)
+      state.position_ticket = IntegerToString(position_ticket);
+   state.acked        = false; // outcome known, ack still owed
+   state.updated_unix = (long)TimeGMT();
+   QpCommandStateWrite(command_id, state);
+  }
+
+void QpCommandStateSetAcked(const string command_id, const bool sent)
+  {
+   QpCommandState state;
+   if(!QpCommandStateLoad(command_id, state))
+      return;
+   state.acked        = sent;
+   state.updated_unix = (long)TimeGMT();
+   QpCommandStateWrite(command_id, state);
+  }
+
+//+------------------------------------------------------------------+
+//| Command ack: receipt / DRY_RUN verdict / live-execution outcome   |
+//| Broker tickets ride along on live outcomes (cloud reconciliation |
+//| material, R1). The verdict is journaled BEFORE the POST and the   |
+//| acked flag right after it - a lost ack is re-sent by the journal  |
+//| scan, never silently dropped.                                    |
 //+------------------------------------------------------------------+
 bool QpSendCommandAck(const string command_id, const string ack_code,
-                      const string ack_message)
+                      const string ack_message,
+                      const long order_ticket = 0, const long deal_ticket = 0,
+                      const long position_ticket = 0)
   {
+   QpCommandStateSetOutcome(command_id, ack_code, ack_message,
+                            order_ticket, deal_ticket, position_ticket);
    QpJsonObject o;
    o.Clear();
    o.AddStr("ea_version", QP_EA_VERSION);
@@ -1119,8 +1296,122 @@ bool QpSendCommandAck(const string command_id, const string ack_code,
    o.AddStr("command_id", command_id);
    o.AddStr("ack_code", ack_code);
    o.AddStr("ack_message", ack_message);
+   if(order_ticket > 0)
+      o.AddStr("order_ticket", IntegerToString(order_ticket));
+   if(deal_ticket > 0)
+      o.AddStr("deal_ticket", IntegerToString(deal_ticket));
+   if(position_ticket > 0)
+      o.AddStr("position_ticket", IntegerToString(position_ticket));
    o.AddStr("observed_at", QpIsoNow());
-   return(QpHttpPost("/ea/v1/commands/ack", o.Dump()));
+   bool sent = QpHttpPost("/ea/v1/commands/ack", o.Dump());
+   QpCommandStateSetAcked(command_id, sent);
+   return(sent);
+  }
+
+//+------------------------------------------------------------------+
+//| Journal recovery (R1): an interrupted or unacknowledged command.  |
+//| EXECUTING = the crash straddled the CTrade call - the broker      |
+//| outcome is UNKNOWN: ack EXECUTE_UNRESOLVED so the cloud can      |
+//| reconcile against broker state. NEVER re-execute locally.        |
+//| FINAL + !acked = verdict recorded but never delivered: re-send    |
+//| the stored verdict verbatim (idempotent on the cloud side).       |
+//| Returns true when the journal owed an ack (callers stop here).    |
+//+------------------------------------------------------------------+
+bool QpCommandStateRecover(const string command_id)
+  {
+   QpCommandState state;
+   if(!QpCommandStateLoad(command_id, state))
+      return(false);
+   if(state.state == QP_CMDSTATE_EXECUTING)
+     {
+      QpLog("WARN", "cmdstate recover: " + command_id + " (" + state.command_type +
+            ") was interrupted mid-execution - acking " + QP_ACK_UNRESOLVED +
+            "; the cloud must reconcile the broker outcome, NO local re-execution");
+      QpRememberCommand(command_id);
+      QpSendCommandAck(command_id, QP_ACK_UNRESOLVED,
+                       "EA restarted while " + state.command_type + " was executing; " +
+                       "outcome uncertain - confirm against broker state before any re-issue");
+      return(true);
+     }
+   if(!state.acked)
+     {
+      QpLog("WARN", "cmdstate recover: re-sending stored verdict " + state.ack_code +
+            " for " + command_id + " (previous ack undelivered)");
+      QpRememberCommand(command_id);
+      QpSendCommandAck(command_id, state.ack_code, state.ack_message,
+                       StringToInteger(state.order_ticket),
+                       StringToInteger(state.deal_ticket),
+                       StringToInteger(state.position_ticket));
+      return(true);
+     }
+   return(false); // final and delivered: nothing owed
+  }
+
+// "<uuid>.json" (with or without a folder prefix) -> command id
+string QpCommandIdFromFilename(const string filename)
+  {
+   string name = filename;
+   if(StringLen(name) > 5 && StringFind(name, ".json") == StringLen(name) - 5)
+      name = StringSubstr(name, 0, StringLen(name) - 5);
+   for(int i = StringLen(name) - 1; i >= 0; i--)
+      if(StringGetCharacter(name, i) == '\\')
+        {
+         name = StringSubstr(name, i + 1);
+         break;
+        }
+   return(name);
+  }
+
+// Scan the journal directory: prune fully-acked journals past retention,
+// back-fill dedup marks wiped by a terminal restart, and recover every
+// journal that still owes an ack (e.g. the local agent was down). Runs
+// once in OnInit and at most every 60s from OnTimer.
+void QpCommandStateScan()
+  {
+   string filename;
+   long   find = FileFindFirst(QP_CMDSTATE_DIR + "*.json", filename);
+   if(find == INVALID_HANDLE)
+      return;
+   string names[];
+   while(filename != "")
+     {
+      int n = ArraySize(names);
+      ArrayResize(names, n + 1);
+      names[n] = filename;
+      if(!FileFindNext(find, filename))
+         break;
+     }
+   FileFindClose(find);
+
+   int recovered = 0;
+   for(int i = 0; i < ArraySize(names); i++)
+     {
+      string id = QpCommandIdFromFilename(names[i]);
+      if(id == "")
+         continue;
+      QpCommandState state;
+      if(!QpCommandStateLoad(id, state))
+         continue;
+      if(state.acked &&
+         (long)TimeGMT() - state.updated_unix >= QP_CMDSTATE_RETENTION_SEC)
+        {
+         FileDelete(QpCommandStatePath(id)); // delivered long ago: prune
+         continue;
+        }
+      if(!QpCommandProcessed(id))
+        {
+         // terminal restart wiped the GlobalVariables - restore the dedup
+         // mark so a re-delivered command cannot execute twice
+         QpMarkCommandProcessed(id);
+         if(state.acked)
+            QpRememberCommand(id); // already delivered: echo ring only
+        }
+      if(!state.acked && QpCommandStateRecover(id))
+         recovered++;
+     }
+   if(recovered > 0)
+      QpLog("WARN", "cmdstate scan: recovered " + IntegerToString(recovered) +
+            " unacknowledged command journal(s)");
   }
 
 //+------------------------------------------------------------------+
@@ -1571,7 +1862,8 @@ void QpExecuteOpenOrPending(const string cmd_json, const string command_id,
                        command_type + " executed: " + tickets +
                        " price=" + DoubleToString(g_trade.ResultPrice(), 8) +
                        " volume=" + DoubleToString(g_trade.ResultVolume(), 8) +
-                       " retcode=" + IntegerToString((int)retcode));
+                       " retcode=" + IntegerToString((int)retcode),
+                       (long)g_trade.ResultOrder(), (long)g_trade.ResultDeal(), 0);
      }
    else
      {
@@ -1668,7 +1960,8 @@ void QpExecuteModifyPosition(const string payload_json, const string command_id)
                        "MODIFY_POSITION executed: position=" + IntegerToString((long)ticket) +
                        " sl=" + DoubleToString(new_sl, 8) +
                        " tp=" + DoubleToString(new_tp, 8) +
-                       " retcode=" + IntegerToString((int)retcode));
+                       " retcode=" + IntegerToString((int)retcode),
+                       0, 0, (long)ticket);
      }
    else
      {
@@ -1733,7 +2026,8 @@ void QpExecuteClosePosition(const string payload_json, const string command_id)
                        " closed=" + DoubleToString(closed, 8) +
                        " remaining=" + DoubleToString(remaining, 8) +
                        " deal=" + IntegerToString((long)g_trade.ResultDeal()) +
-                       " retcode=" + IntegerToString((int)retcode));
+                       " retcode=" + IntegerToString((int)retcode),
+                       0, (long)g_trade.ResultDeal(), (long)ticket);
      }
    else
      {
@@ -1768,7 +2062,8 @@ void QpExecuteCancelOrder(const string payload_json, const string command_id)
             IntegerToString((long)ticket));
       QpSendCommandAck(command_id, QP_ACK_EXECUTED,
                        "CANCEL_ORDER executed: order=" + IntegerToString((long)ticket) +
-                       " retcode=" + IntegerToString((int)retcode));
+                       " retcode=" + IntegerToString((int)retcode),
+                       (long)ticket, 0, 0);
      }
    else
      {
@@ -1842,13 +2137,22 @@ void QpHandleCommand(const string cmd_json)
       return;
      }
 
-   // duplicate delivery (at-least-once transport): ack DUPLICATE, no effects
-   if(QpCommandProcessed(command_id))
+   // duplicate delivery (at-least-once transport): recover a journal that
+   // still owes an ack FIRST, else ack DUPLICATE - never any side effects
+   if(QpCommandProcessed(command_id) || QpCommandStateExists(command_id))
      {
+      if(QpCommandStateRecover(command_id))
+         return; // the journal just re-sent its verdict
       QpLog("DEBUG", "command " + command_id + " duplicate; acking DUPLICATE");
       QpSendCommandAck(command_id, QP_ACK_DUPLICATE, "already processed (terminal dedup)");
       return;
      }
+
+   // crash-safe journal (R1): a live command that mutates broker state is
+   // journaled EXECUTING on disk BEFORE the processed mark and the CTrade
+   // call - a crash anywhere past this point leaves a recoverable journal
+   if(!DryRunMode && LiveTrading && QpCommandMutatesBrokerState(command_type))
+      QpCommandStateInit(command_id, command_type);
 
    // mark FIRST, ack second: if this ack is lost in transit, the next poll's
    // recently_acked echo still lets the cloud reconcile the UNKNOWN row
@@ -2214,6 +2518,10 @@ int OnInit()
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
    g_trade.SetAsyncMode(false);
 
+   // R1: recover journals from a previous run (owed acks re-sent, crashed
+   // executions flagged EXECUTE_UNRESOLVED) BEFORE polling for new commands
+   QpCommandStateScan();
+
    EventSetTimer(HeartbeatSeconds);
 
    // first registration attempt; agent may not be up yet - OnTimer retries
@@ -2309,6 +2617,14 @@ void OnTimer()
      {
       if(QpPollCommands())
          g_last_command_at = TimeGMT();
+     }
+
+   // R1: periodic journal sweep - re-send acks that failed while the local
+   // agent was down, throttled to one sweep per minute
+   if(g_last_cmdstate_scan == 0 || TimeGMT() - g_last_cmdstate_scan >= 60)
+     {
+      QpCommandStateScan();
+      g_last_cmdstate_scan = TimeGMT();
      }
 
    // economic calendar window (read-only; actual values arrive after release)

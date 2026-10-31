@@ -33,7 +33,7 @@ from quantpilot_contracts.models import (
     TradeCommandCreate,
 )
 
-from . import audit, backtests, command_service, db, risk, writers
+from . import audit, backtests, command_service, db, reconcile, risk, writers
 from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
@@ -677,6 +677,7 @@ _COMMAND_SELECT = """
            c.created_by, c.strategy_instance_id, c.signal_id,
            c.delivery_attempts, c.delivered_at, c.acked_at, c.ack_code,
            c.ack_message, c.reconciled, c.unknown_at, c.expired_at,
+           c.exec_order_ticket, c.exec_deal_ticket, c.exec_position_ticket,
            c.created_at, c.updated_at
       FROM commands c
 """
@@ -695,6 +696,17 @@ class CommandPendingRequest(BaseModel):
     login_ref: str
     server: str
     recently_acked: list[UUID] = []
+
+
+class ReconcileVerdictRequest(BaseModel):
+    """POST /api/v1/commands/{id}/reconcile body: the operator's verdict on an
+    uncertain command outcome (phase-3 R1). The command is never re-issued
+    blindly - the verdict is confirmed against broker state first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: str
+    note: str = ""
 
 
 def _command_by_id(command_uuid: UUID) -> dict | None:
@@ -745,6 +757,36 @@ def list_commands(
         (*params, limit),
     )
     return ok(db.jsonable(rows), request)
+
+
+@app.get("/api/v1/commands/unresolved")
+def list_unresolved_commands(request: Request) -> JSONResponse:
+    """Commands with uncertain outcomes (UNKNOWN / EXECUTE_UNRESOLVED) that
+    await an operator reconciliation verdict (phase-3 R1, acceptance v2
+    P1 #1). Never re-issued blindly - confirm against broker state first."""
+    return ok(reconcile.unresolved_commands(), request)
+
+
+@app.get("/api/v1/commands/{command_id}/reconcile")
+def command_reconcile_evidence(command_id: str, request: Request) -> JSONResponse:
+    """Broker-state evidence (positions/orders/deals) for one command plus a
+    conservative suggested verdict for the operator."""
+    try:
+        return ok(reconcile.evidence(command_id), request)
+    except command_service.CommandError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+@app.post("/api/v1/commands/{command_id}/reconcile")
+def command_reconcile_apply(
+    command_id: str, body: ReconcileVerdictRequest, request: Request
+) -> JSONResponse:
+    """Record the operator's verdict on an uncertain outcome: terminal ACKED
+    + reconciled=true, fully audited (COMMAND_RECONCILE)."""
+    try:
+        return ok(reconcile.apply(command_id, body.verdict, note=body.note), request)
+    except command_service.CommandError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
 
 
 @app.get("/api/v1/commands/{command_id}")

@@ -560,7 +560,14 @@ class EaCommandAckData(BaseModel):
     DUPLICATE | EXPIRED | DRY_RUN_PASSED | DRY_RUN_REJECTED (dry-run
     pre-trade checks, no execution) | EXECUTED | EXECUTE_FAILED |
     EXECUTE_REJECTED | LIVE_REFUSED_NOT_DEMO (slice 3 live execution on
-    DEMO accounts only, behind the EA's LiveTrading input; PRD 21.3).
+    DEMO accounts only, behind the EA's LiveTrading input; PRD 21.3) |
+    EXECUTE_UNRESOLVED (phase-3 R1: the terminal died mid-execution, the
+    outcome is uncertain and the command must be reconciled against the
+    broker state - never blindly re-executed).
+
+    The structured ticket fields (phase-3 R1) carry the broker execution
+    evidence so the cloud can reconcile without parsing ack_message. They
+    are optional: v1.7.0 acks without them stay valid.
     """
 
     model_config = StrictModel
@@ -572,3 +579,6 @@ class EaCommandAckData(BaseModel):
     ack_code: str = Field(max_length=64)
     ack_message: str = Field(default="", max_length=512)
     observed_at: datetime
+    order_ticket: str = Field(default="", max_length=32)
+    deal_ticket: str = Field(default="", max_length=32)
+    position_ticket: str = Field(default="", max_length=32)

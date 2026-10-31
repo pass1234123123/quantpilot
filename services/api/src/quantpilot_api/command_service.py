@@ -21,6 +21,7 @@ COMMAND_SELECT = """
            c.created_by, c.strategy_instance_id, c.signal_id,
            c.delivery_attempts, c.delivered_at, c.acked_at, c.ack_code,
            c.ack_message, c.reconciled, c.unknown_at, c.expired_at,
+           c.exec_order_ticket, c.exec_deal_ticket, c.exec_position_ticket,
            c.created_at, c.updated_at
       FROM commands c
 """

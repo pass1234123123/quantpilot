@@ -715,6 +715,31 @@ def handle_command_ack(data: dict[str, Any]) -> None:
             """,
             (data.get("ack_code"), data.get("ack_message") or None, command_uuid, _uuid(account_id)),
         ).fetchone()
+        # structured execution evidence (phase-3 R1, EA v1.8.0): optional
+        # order/deal/position tickets stored on the row so reconciliation
+        # matches broker projections by ticket instead of parsing ack_message.
+        # Separate statement so v1.7.0 acks without tickets change nothing.
+        order_ticket = str(data.get("order_ticket") or "")
+        deal_ticket = str(data.get("deal_ticket") or "")
+        position_ticket = str(data.get("position_ticket") or "")
+        if order_ticket or deal_ticket or position_ticket:
+            connection.execute(
+                """
+                UPDATE commands
+                   SET exec_order_ticket    = COALESCE(%s, exec_order_ticket),
+                       exec_deal_ticket     = COALESCE(%s, exec_deal_ticket),
+                       exec_position_ticket = COALESCE(%s, exec_position_ticket),
+                       updated_at           = now()
+                 WHERE command_id = %s AND account_id = %s
+                """,
+                (
+                    order_ticket or None,
+                    deal_ticket or None,
+                    position_ticket or None,
+                    command_uuid,
+                    _uuid(account_id),
+                ),
+            )
     if row is not None:
         add_system_event(
             source="api-consumer",
@@ -726,8 +751,28 @@ def handle_command_ack(data: dict[str, Any]) -> None:
                 "ack_code": data.get("ack_code"),
                 "ack_message": data.get("ack_message"),
                 "ea_version": data.get("ea_version"),
+                "order_ticket": order_ticket or None,
+                "deal_ticket": deal_ticket or None,
+                "position_ticket": position_ticket or None,
             },
         )
+        # phase-3 R1: an interrupted execution is a FINAL ack (never a retry)
+        # but its outcome is uncertain - demand reconciliation against the
+        # broker projections before any re-issue (acceptance v2 P1 #1).
+        if str(data.get("ack_code") or "") == "EXECUTE_UNRESOLVED":
+            add_system_event(
+                source="api-consumer",
+                event_type="command.execute_unresolved",
+                severity="WARN",
+                payload={
+                    "command_id": command_id,
+                    "account_id": account_id,
+                    "detail": "EA interrupted mid-execution: outcome UNCERTAIN."
+                              " Do NOT re-issue blindly - confirm against broker"
+                              " state (positions/orders/deals) via the reconcile"
+                              " endpoints first",
+                },
+            )
         return
     # no transition happened: idempotent redelivery (already ACKED) or an
     # ack that does not match a deliverable command of this account
