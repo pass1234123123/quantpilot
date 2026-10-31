@@ -834,10 +834,11 @@ def handle_bars(data: dict[str, Any]) -> None:
     # AI analysis (PRD 8): same bar-close trigger (doc 8.6, never per-tick).
     # Analyses are advisory display artifacts (doc 8.5 ADVISORY), so a failure
     # here is logged + isolated - it must never stall the bars projection.
+    analysis = None
     try:
         from . import ai_engine
 
-        ai_engine.analyze_newest_bar(account_id, broker_symbol, timeframe, newest[0])
+        analysis = ai_engine.analyze_newest_bar(account_id, broker_symbol, timeframe, newest[0])
     except Exception as exc:
         add_system_event(
             source="api-consumer",
@@ -847,6 +848,28 @@ def handle_bars(data: dict[str, Any]) -> None:
                 "account_id": account_id,
                 "broker_symbol": broker_symbol,
                 "timeframe": timeframe,
+                "error": str(exc),
+            },
+        )
+
+    # Strategy automation is opt-in inside the pipeline. AI is audit context
+    # only, and any pipeline failure is isolated from the committed bars.
+    try:
+        from . import signal_pipeline
+
+        signal_pipeline.process_newest_bar(
+            account_id, broker_symbol, timeframe, newest[0], ai_analysis=analysis
+        )
+    except Exception as exc:
+        add_system_event(
+            source="api-consumer",
+            event_type="signal.pipeline_failed",
+            severity="WARN",
+            payload={
+                "account_id": account_id,
+                "broker_symbol": broker_symbol,
+                "timeframe": timeframe,
+                "source_bar_time": newest[0].isoformat(),
                 "error": str(exc),
             },
         )

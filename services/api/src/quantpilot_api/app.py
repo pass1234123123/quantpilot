@@ -28,7 +28,7 @@ from quantpilot_contracts.models import (
     TradeCommandCreate,
 )
 
-from . import db, risk, writers
+from . import command_service, db, risk, writers
 from .account_config import AccountConfig
 from .consumer import NodeEventsConsumer
 from .envelope import err, ok
@@ -529,14 +529,6 @@ def _active_config_row(account_uuid: UUID) -> dict | None:
     )
 
 
-def _effective_config(account_uuid: UUID) -> tuple[AccountConfig, int]:
-    """Validated account config for the gate; defaults + version 0 if unset."""
-    row = _active_config_row(account_uuid)
-    if row is None:
-        return AccountConfig(), 0
-    return AccountConfig.model_validate(row["config_json"]), row["version"]
-
-
 @app.get("/api/v1/accounts/{account_id}/config")
 def get_account_config(account_id: str, request: Request) -> JSONResponse:
     """Current account config; falls back to defaults when none was saved."""
@@ -616,7 +608,6 @@ def config_lookup(body: ConfigLookupRequest, request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------
 
 COMMAND_STATUSES = ("QUEUED", "DELIVERED", "ACKED", "EXPIRED", "UNKNOWN", "REJECTED")
-COMMAND_MAX_TTL_SECONDS = 600
 
 _COMMAND_SELECT = """
     SELECT c.command_id::text AS command_id, c.account_id::text AS account_id,
@@ -657,133 +648,11 @@ def _command_payload(row: dict, created: bool | None) -> dict:
 
 @app.post("/api/v1/commands")
 def create_command(body: TradeCommandCreate, request: Request) -> JSONResponse:
-    """Persist a trade command intent (idempotent on command_id, AT-005/PRD 2.5).
-
-    Risk-increasing types (OPEN_MARKET, PLACE_PENDING) pass the cloud risk
-    gate first (PRD 3.2/9.1): REJECT stores the command in terminal state
-    REJECTED with a risk_decisions audit row - it is never delivered.
-
-    Creating neither delivers nor executes anything (PRD 13.5: QUEUED means
-    persisted only). A duplicate POST with the same command_id replays the
-    original command state; the same command_id with different content is a
-    client bug and rejected with 409.
-    """
-    account_uuid = _account_or_404(str(body.account_id))
-    now = datetime.now(timezone.utc)
-    if not now < body.expires_at <= now + timedelta(seconds=COMMAND_MAX_TTL_SECONDS):
-        raise HTTPException(400, "expires_at must be in the future and at most 600s ahead")
-    if body.idempotency_key is not None:
-        clash = db.query_one(
-            """
-            SELECT command_id::text AS command_id
-              FROM commands
-             WHERE idempotency_key = %s AND command_id <> %s
-            """,
-            (str(body.idempotency_key), str(body.command_id)),
-        )
-        if clash is not None:
-            raise HTTPException(409, "idempotency_key already used by another command")
-    existing = _command_by_id(body.command_id)
-    if existing is not None:
-        if existing["account_id"] != str(account_uuid) or existing["command_type"] != body.command_type:
-            raise HTTPException(409, "command_id already exists with different content")
-        payload = _command_payload(existing, created=False)
-        decision = risk.decision_for_command(body.command_id)
-        if decision is not None:
-            payload["risk_decision"] = decision
-        return ok(payload, request)
-
-    decision = None
-    initial_status = "QUEUED"
-    if body.command_type in risk.RISK_INCREASING_TYPES:
-        config, config_version = _effective_config(account_uuid)
-        decision = risk.evaluate_command(
-            account_uuid, body.command_type, body.payload, config, config_version
-        )
-        if decision.decision == "REJECT":
-            initial_status = "REJECTED"
-
+    """HTTP envelope for the shared durable-command creation core."""
     try:
-        with db.conn() as connection:
-            inserted = connection.execute(
-                """
-                INSERT INTO commands (command_id, idempotency_key, account_id,
-                                      command_type, payload, status, expires_at,
-                                      created_by, strategy_instance_id, signal_id)
-                VALUES (%s, %s, %s, %s, CAST(%s AS jsonb), %s, %s, %s, %s, %s)
-                ON CONFLICT (command_id) DO NOTHING
-                RETURNING command_id::text
-                """,
-                (
-                    str(body.command_id),
-                    str(body.idempotency_key) if body.idempotency_key is not None else None,
-                    account_uuid,
-                    body.command_type,
-                    json.dumps(body.payload),
-                    initial_status,
-                    body.expires_at,
-                    body.created_by,
-                    str(body.strategy_instance_id) if body.strategy_instance_id is not None else None,
-                    str(body.signal_id) if body.signal_id is not None else None,
-                ),
-            ).fetchone()
-    except psycopg.errors.UniqueViolation as exc:
-        # partial unique index on idempotency_key lost a rare concurrent race
-        raise HTTPException(409, f"idempotency conflict: {exc}") from exc
-    if inserted is None:  # identical concurrent POST: replay the original
-        row = _command_by_id(body.command_id)
-        assert row is not None
-        return ok(_command_payload(row, created=False), request)
-
-    if decision is not None:
-        risk.record_decision(
-            account_uuid,
-            body.command_id,
-            str(body.signal_id) if body.signal_id is not None else None,
-            decision,
-        )
-    writers.add_system_event(
-        source="api",
-        event_type="command.created",
-        severity="INFO",
-        payload={
-            "command_id": str(body.command_id),
-            "account_id": str(account_uuid),
-            "command_type": body.command_type,
-            "status": initial_status,
-            "created_by": body.created_by,
-            "expires_at": body.expires_at.isoformat(),
-            "signal_id": str(body.signal_id) if body.signal_id is not None else None,
-            "strategy_instance_id": str(body.strategy_instance_id)
-            if body.strategy_instance_id is not None
-            else None,
-        },
-    )
-    if decision is not None and decision.decision == "REJECT":
-        writers.add_system_event(
-            source="api",
-            event_type="risk.rejected",
-            severity="WARN",
-            payload={
-                "command_id": str(body.command_id),
-                "account_id": str(account_uuid),
-                "command_type": body.command_type,
-                "reason_codes": decision.reason_codes,
-                "config_version": decision.snapshot.get("config_version", 0),
-                "detail": "cloud risk gate refused the new-risk command; stored"
-                          " as REJECTED and never delivered (PRD 9.1)",
-            },
-        )
-    row = _command_by_id(body.command_id)
-    assert row is not None
-    payload = _command_payload(row, created=True)
-    if decision is not None:
-        payload["risk_decision"] = {
-            "decision": decision.decision,
-            "reason_codes": decision.reason_codes,
-            "decided_at": datetime.now(timezone.utc).isoformat(),
-            "config_version": decision.snapshot.get("config_version", 0),
-        }
+        payload = command_service.create_command(body)
+    except command_service.CommandError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     return ok(payload, request)
 
 

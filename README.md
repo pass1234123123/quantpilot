@@ -7,7 +7,8 @@ EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL �
 （M15/H1 基线，PRD 22.2）。新账户默认 `OBSERVE_ONLY` 状态。云端命令通道已通
 （下发/确认/幂等/对账），但 EA 收到后仅回执（`OBSERVE_ONLY_ACK`），不执行任何
 交易；风险增加型命令在下发前过云端风控闸门。云端策略引擎消费收盘 bar 产生**建议
-性信号**（PRD 7.1：策略不直接下单），信号→命令接线在后续切片实现。
+性信号**（PRD 7.1：策略不直接下单）；显式开启账户级自动生成后，信号可经聚合、
+Decimal 风险预算和同一风控闸门生成持久命令，但 EA 仍只回执、不执行。
 
 ## 已完成切片
 
@@ -26,6 +27,9 @@ EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL �
   EMA20/50 → TREND_UP/TREND_DOWN/RANGE/HIGH_VOL/UNKNOWN）+ Strategy Evaluator
   适用评分；`ai_analyses` 落库严格 doc 8.4 结构；input_hash 幂等（重投不重复）；
   首版仅 OFF / ADVISORY 模式（8.5），分析仅展示、永不改变交易许可（8.1）
+- 策略自动化闭环（PRD 3.2/9.3）：同 source bar 同向信号聚合为一条命令，最强信号
+  提供交易价位；反向信号记冲突且不建单；Decimal 风险预算按 volume_step 向下取整；
+  确定性 command_id 保证 JetStream 重放幂等；AI 仅作为风险审计上下文，不参与许可决策
 
 ## 目录结构
 
@@ -33,7 +37,7 @@ EA(MT5) → 本地 Agent → NATS JetStream → 云端 FastAPI → PostgreSQL �
 packages/contracts/   Pydantic 数据契约 + NATS subject + 共享常量
 agent/                本地节点：终端发现 + HTTP 接收(8787) + JetStream 发布
 services/api/         FastAPI：JetStream 消费入库 + 查询路由 + 命令通道 + 风控闸门
-                     （risk.py 闸门 / account_config.py 账户配置模型）
+                     （signal_pipeline.py 聚合 / command_service.py 共用命令核心）
 frontend/             Web 仪表盘（Vue3 + Element Plus + Pinia + Lightweight Charts）
 mt5/                  MQL5 源码（Experts/QuantPilotEA + Include/QuantPilot）
 infra/postgres/       Alembic 迁移（0001–0010，含 risk / 策略引擎表）
@@ -63,8 +67,9 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 冒烟与验收：
 
 ```powershell
-.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件（注册/心跳/规格/持仓/命令/风控闸门/策略实例/收盘bar/信号）
-.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API 端点 + 21 张表落库 + 风控/信号不变量
+.venv\Scripts\python -m unittest discover -s services/api/tests -v  # 自动化闭环单元测试
+.venv\Scripts\python scripts\sim_ea.py       # 合成 EA 事件 + 开关/聚合/冲突/风控/AI/重放场景
+.venv\Scripts\python scripts\e2e_verify.py   # 全链路验收：API + 23 张表 + 风控/信号/自动化不变量
 ```
 
 ## Web 仪表盘（frontend/）
@@ -94,8 +99,8 @@ pnpm build      # 类型检查 + 产线构建
   先过云端风控闸门，REJECT 直接落终态 `REJECTED`，响应附 `risk_decision`）
 - `GET /api/v1/commands/{id}`：查询状态（QUEUED / DELIVERED / ACKED / EXPIRED /
   UNKNOWN / REJECTED）
-- `GET|PUT /api/v1/accounts/{id}/config`：配置读取/更新（filters / expert / risk 三段，
-  版本号单调递增，PUT 即全量替换）
+- `GET|PUT /api/v1/accounts/{id}/config`：配置读取/更新（filters / expert / risk / ai /
+  automation 五段，版本号单调递增，PUT 即全量替换）
 - `GET /api/v1/risk/state`、`POST /api/v1/risk/stop`、`POST /api/v1/risk/resume`：
   全局/账户级停止状态（LOCKED 恢复需 `confirm_locked=true`，PRD 9.5）
 - `GET /api/v1/risk/decisions`：闸门决定审计（account_id / command_id 过滤）
@@ -120,8 +125,9 @@ pnpm build      # 类型检查 + 产线构建
 评估语义（PRD 7）：仅批次最新收盘 bar 触发；引擎无状态——从 `symbol_bars` 重放
 指标窗口（warmup 不足跳过）；边沿触发 + `UNIQUE(instance, source_bar_time)` 去重
 （doc 7.5），JetStream 重投不产生重复信号；单实例评估失败仅记 system event，不阻塞
-bar 投影；毒 bar（OHLC 越界）跳过并发 `ea.bars_dropped` 防无限重投。**信号仅建议，
-永不直接下单**（PRD 7.1）；信号→聚合→风控→命令接线在后续切片。
+bar 投影；毒 bar（OHLC 越界）跳过并发 `ea.bars_dropped` 防无限重投。策略引擎本身
+不直接下单（PRD 7.1）；只有账户显式设置 `automation.command_generation=true` 且
+`risk.per_trade_risk_fraction` 非零时，自动化 pipeline 才创建风险预算命令。
 
 EA 侧 v1.5.0 新增输入：`BarTimeframes`（默认 `M15,H1`，PRD 22.2）、
 `BarHistoryCount`（默认 500，首次上线回填历史 bar 数）。
@@ -137,9 +143,23 @@ EA 侧 v1.5.0 新增输入：`BarTimeframes`（默认 `M15,H1`，PRD 22.2）、
 成本记 0，doc 8.6 治理字段齐全：provider/model/prompt_version/input_hash/耗时/成本）。
 触发时机与策略评估相同——收盘 bar 落库后（doc 8.6：LLM 不按 tick 调用；首版无 LLM
 但保持同一节流节奏）。账户配置 `ai.mode`（`risk_profiles.config_json` 第四段，默认
-`ADVISORY`，doc 8.5）：`OFF` = 完全不分析（AI 故障回退位），`ADVISORY` = 仅展示。
+`ADVISORY`，doc 8.5）：`OFF` = 完全不分析（AI 故障回退位），`ADVISORY` = 仅建议与审计。
 分析失败仅记 system event（`ai.analysis_failed`），不阻塞 bar 投影。FILTER /
-REGIME_ROUTING 模式待验证后启用；信号→分析→风控→命令的接线在后续切片。
+REGIME_ROUTING 模式待验证后启用。自动命令创建时，AI 的 analysis_id、regime、
+signal_decision 等仅写入 `risk_decisions.risk_snapshot.ai` 供审计，绝不改变 ALLOW/REJECT。
+
+### 策略自动化闭环
+
+收盘 bar 落库后依次执行：策略评估 → AI ADVISORY 分析 → 同 bar 信号聚合 → Decimal
+风险预算 sizing → 共用命令创建核心 → 云端风控闸门 → durable command。HTTP 与自动化
+入口共用 `command_service`，TTL、幂等、风险拒绝和审计语义一致。
+
+- 自动生成默认 OFF；开关与非零风险预算必须同时满足，sizing 失败记
+  `signal.command_failed`，不创建命令。
+- 同向多信号只建一单，强度最高者为 primary（signal_id 确定性打破平局），全部
+  signal_id 写入风险快照；同 bar 反向信号记 `signal.conflict`，不建单。
+- command_id 由账户/品种/周期/source bar/direction 确定性生成，重放返回原命令；
+  REJECT 以 `REJECTED` 持久化且永不投递。EA 始终保持 OBSERVE_ONLY。
 
 数据库变更（如换库）：
 

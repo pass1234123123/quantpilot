@@ -108,6 +108,14 @@ class AiConfig(BaseModel):
     mode: Literal["OFF", "ADVISORY"] = "ADVISORY"
 
 
+class AutomationConfig(BaseModel):
+    """Strategy-to-command automation; always opt-in (PRD 13.4/21.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_generation: bool = False
+
+
 class AccountConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -115,3 +123,4 @@ class AccountConfig(BaseModel):
     expert: ExpertConfig = Field(default_factory=ExpertConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     ai: AiConfig = Field(default_factory=AiConfig)
+    automation: AutomationConfig = Field(default_factory=AutomationConfig)

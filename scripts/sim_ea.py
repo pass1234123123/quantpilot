@@ -16,6 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import httpx
+import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "contracts" / "src"))
 from quantpilot_contracts.envfile import load_env_file  # noqa: E402
@@ -26,6 +27,7 @@ load_env_file(ROOT / ".env")
 AGENT = f"http://{os.environ.get('QP_AGENT_HOST','127.0.0.1')}:{os.environ.get('QP_AGENT_PORT','8787')}"
 API = os.environ.get("QP_API_BASE_URL", "http://127.0.0.1:8000")
 TOKEN = os.environ["QP_AGENT_TOKEN"]
+PG_DSN = os.environ["QP_PG_DSN"]
 
 HEADERS = {"X-QP-Token": TOKEN, "Content-Type": "application/json"}
 
@@ -277,13 +279,13 @@ def main() -> int:
     accounts = client.get(API + "/api/v1/accounts").json()["data"]
     sim_acc = next((a for a in accounts if a.get("login_ref") == "10001234"), None)
 
-    def poll(recently: list[str]) -> dict:
+    def poll(recently: list[str], acct: dict | None = None) -> dict:
         r = client.post(
             AGENT + "/ea/v1/commands/poll",
             json={
                 "ea_version": "1.0.0",
                 "terminal": terminal(),
-                "account": account(),
+                "account": acct or account(),
                 "recently_acked": recently,
                 "observed_at": iso_now(),
             },
@@ -292,13 +294,14 @@ def main() -> int:
         return r.json() if r.status_code == 200 else {}
 
     def ack(cid: str, code: str = "OBSERVE_ONLY_ACK",
-            msg: str = "received; not executed (OBSERVE_ONLY slice 1)") -> int:
+            msg: str = "received; not executed (OBSERVE_ONLY slice 1)",
+            acct: dict | None = None) -> int:
         r = client.post(
             AGENT + "/ea/v1/commands/ack",
             json={
                 "ea_version": "1.0.0",
                 "terminal": terminal(),
-                "account": account(),
+                "account": acct or account(),
                 "command_id": cid,
                 "ack_code": code,
                 "ack_message": msg,
@@ -726,12 +729,13 @@ def main() -> int:
             })
             prev_close = close
 
-        def post_bars(chosen: list[dict], batch_index: int, batch_total: int, tag: str) -> None:
+        def post_bars(chosen: list[dict], batch_index: int, batch_total: int, tag: str,
+                      acct: dict | None = None) -> None:
             nonlocal failures
             r = client.post(
                 AGENT + "/ea/v1/bars",
                 json={
-                    "ea_version": "1.0.0", "terminal": terminal(), "account": account(),
+                    "ea_version": "1.0.0", "terminal": terminal(), "account": acct or account(),
                     "broker_symbol": "EURUSD", "timeframe": "M15",
                     "batch_index": batch_index, "batch_total": batch_total,
                     "bars": chosen, "observed_at": iso_now(),
@@ -873,6 +877,226 @@ def main() -> int:
         print(f"[ai] mode ADVISORY restored: {'OK' if restored.status_code == 200 else 'FAIL'}")
         if restored.status_code != 200:
             failures += 1
+
+        # 15. Strategy -> AI context -> aggregation -> risk -> durable command.
+        # A separate account keeps the original 135 bars / two engine signals
+        # deterministic. Instances stay DISABLED; SQL fixtures isolate the
+        # automation contract from strategy signal-generation edge timing.
+        auto_acct = {**account(), "login_ref": "10005678"}
+        post("/ea/v1/register", {
+            "ea_version": "1.0.0", "terminal": terminal(), "account": auto_acct,
+            "observed_at": iso_now(),
+        })
+        post("/ea/v1/heartbeat", {
+            **hb, "account": auto_acct, "open_positions": 0, "observed_at": iso_now(),
+        })
+        post("/ea/v1/symbols", {
+            "ea_version": "1.0.0", "terminal": terminal(), "account": auto_acct,
+            "batch_index": 0, "batch_total": 1, "symbols": [sim_symbols()[0]],
+            "observed_at": iso_now(),
+        })
+        auto_acc = None
+        for _ in range(20):
+            accounts = client.get(API + "/api/v1/accounts").json()["data"]
+            auto_acc = next((a for a in accounts if a.get("login_ref") == "10005678"), None)
+            if auto_acc is not None:
+                break
+            time.sleep(0.25)
+        if auto_acc is None:
+            print("[automation] FAIL: isolated account not registered")
+            failures += 1
+        else:
+            auto_id = auto_acc["account_id"]
+
+            def auto_check(name: str, ok: bool, detail: str = "") -> None:
+                nonlocal failures
+                print(f"[automation] {name}: {'OK' if ok else 'FAIL'} {detail}")
+                if not ok:
+                    failures += 1
+
+            def auto_config(enabled: bool, risk_fraction: str) -> None:
+                r = client.put(f"{API}/api/v1/accounts/{auto_id}/config", json={
+                    "filters": {"max_daily_orders": 500},
+                    "risk": {"per_trade_risk_fraction": risk_fraction},
+                    "ai": {"mode": "ADVISORY"},
+                    "automation": {"command_generation": enabled},
+                })
+                if r.status_code != 200:
+                    auto_check("config_put", False, f"status={r.status_code} {r.text[:100]}")
+
+            for code in ("ma_cross", "trend_following"):
+                r = client.post(f"{API}/api/v1/accounts/{auto_id}/strategy-instances", json={
+                    "strategy_code": code, "broker_symbol": "EURUSD",
+                    "timeframe": "M15", "config": {},
+                })
+                auto_check(f"bind_{code}", r.status_code in (200, 409), f"status={r.status_code}")
+            auto_instances = client.get(
+                f"{API}/api/v1/accounts/{auto_id}/strategy-instances"
+            ).json().get("data", [])
+            instance_by_code = {i["strategy_code"]: i for i in auto_instances}
+            for instance in auto_instances:
+                r = client.post(
+                    f"{API}/api/v1/accounts/{auto_id}/strategy-instances/"
+                    f"{instance['instance_id']}/status",
+                    json={"status": "DISABLED"},
+                )
+                auto_check(f"disable_{instance['strategy_code']}", r.status_code == 200)
+
+            fixture_now = datetime.now(timezone.utc)
+            valid_until = fixture_now + timedelta(seconds=300)
+            fixture_ids: dict[tuple[int, str], str] = {}
+            fixtures = (
+                (134, "ma_cross", "BUY", 0.40),
+                (134, "trend_following", "BUY", 0.90),
+                (133, "ma_cross", "BUY", 0.70),
+                (133, "trend_following", "SELL", 0.80),
+                (132, "ma_cross", "BUY", 0.75),
+            )
+            with psycopg.connect(PG_DSN) as conn:
+                for bar_index, code, direction, strength in fixtures:
+                    source_bar = datetime.fromisoformat(sim_bars[bar_index]["bar_time"])
+                    signal_id = str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"quantpilot-e2e:{auto_id}:{bar_index}:{code}:{direction}",
+                    ))
+                    fixture_ids[(bar_index, code)] = signal_id
+                    reference = Decimal(sim_bars[bar_index]["close"])
+                    buy = direction == "BUY"
+                    doc = {
+                        "signal_id": signal_id,
+                        "strategy_id": code,
+                        "symbol": "EURUSD",
+                        "timeframe": "M15",
+                        "signal_type": "ENTRY",
+                        "direction": direction,
+                        "strength": strength,
+                        "generated_at": fixture_now.isoformat(),
+                        "market_data_at": source_bar.isoformat(),
+                        "reference_price": str(reference),
+                        "proposed_stop_loss": str(reference + Decimal("-0.005" if buy else "0.005")),
+                        "proposed_take_profit": str(reference + Decimal("0.010" if buy else "-0.010")),
+                        "valid_until": valid_until.isoformat(),
+                        "features_ref": "e2e.automation.fixture",
+                        "reason_codes": ["E2E_AUTOMATION_FIXTURE"],
+                    }
+                    conn.execute(
+                        """
+                        INSERT INTO strategy_signals
+                            (signal_id, account_id, strategy_instance_id, signal_json,
+                             source_bar_time, generated_at, expires_at)
+                        VALUES (%s, %s, %s, CAST(%s AS jsonb), %s, %s, %s)
+                        ON CONFLICT (signal_id) DO UPDATE SET
+                            signal_json = EXCLUDED.signal_json,
+                            generated_at = EXCLUDED.generated_at,
+                            expires_at = EXCLUDED.expires_at
+                        """,
+                        (signal_id, auto_id, instance_by_code[code]["instance_id"],
+                         json.dumps(doc), source_bar, fixture_now, valid_until),
+                    )
+
+            def auto_commands() -> list[dict]:
+                rows = client.get(f"{API}/api/v1/commands", params={
+                    "account_id": auto_id, "limit": 500,
+                }).json().get("data", [])
+                return [row for row in rows if row.get("created_by") == "signal-aggregator"]
+
+            baseline_ids = {row["command_id"] for row in auto_commands()}
+
+            # OFF dominates even with a non-zero risk budget.
+            auto_config(False, "0.01")
+            post_bars(sim_bars[:100], 0, 3, "automation backfill 1", acct=auto_acct)
+            post_bars(sim_bars[100:131], 1, 3, "automation backfill 2", acct=auto_acct)
+            post_bars(sim_bars[131:], 2, 3, "automation OFF", acct=auto_acct)
+            time.sleep(3)
+            off_ids = {row["command_id"] for row in auto_commands()}
+            auto_check("default_off", off_ids == baseline_ids,
+                       f"commands={len(off_ids)}")
+
+            # Explicit ON is still safe when the sizing budget is zero.
+            auto_config(True, "0")
+            post_bars([sim_bars[134]], 0, 1, "automation zero risk", acct=auto_acct)
+            time.sleep(2)
+            zero_risk_ids = {row["command_id"] for row in auto_commands()}
+            auto_check("zero_risk_no_command", zero_risk_ids == baseline_ids,
+                       f"commands={len(zero_risk_ids)}")
+
+            # Two BUY signals become one command; the strongest is primary.
+            auto_config(True, "0.01")
+            post_bars([sim_bars[134]], 0, 1, "automation aggregate", acct=auto_acct)
+            time.sleep(2)
+            post_bars([sim_bars[134]], 0, 1, "automation aggregate replay", acct=auto_acct)
+            time.sleep(2)
+            rows = auto_commands()
+            aggregated_ids = {row["command_id"] for row in rows}
+            allowed_rows = [row for row in rows if row.get("status") != "REJECTED"]
+            allowed = allowed_rows[0] if len(allowed_rows) == 1 else None
+            aggregate_ok = (
+                baseline_ids <= aggregated_ids
+                and len(aggregated_ids - baseline_ids) <= 1
+                and allowed is not None
+                and allowed.get("signal_id") == fixture_ids[(134, "trend_following")]
+                and Decimal(allowed["payload"]["volume"]) > 0
+            )
+            auto_check("same_direction_aggregated_once", aggregate_ok,
+                       f"commands={len(rows)} signal={allowed.get('signal_id') if allowed else '-'}")
+            if allowed:
+                detail = client.get(f"{API}/api/v1/commands/{allowed['command_id']}").json().get("data", {})
+                auto_check("aggregated_risk_allow",
+                           (detail.get("risk_decision") or {}).get("decision") == "ALLOW",
+                           f"risk={detail.get('risk_decision')}")
+
+            # Opposite directions on one source bar never create a command.
+            post_bars([sim_bars[133]], 0, 1, "automation conflict", acct=auto_acct)
+            time.sleep(2)
+            conflict_ids = {row["command_id"] for row in auto_commands()}
+            auto_check("opposite_direction_conflict", conflict_ids == aggregated_ids,
+                       f"commands={len(conflict_ids)}")
+
+            # A cloud stop persists an automated REJECTED command, never QUEUED.
+            stopped = client.post(f"{API}/api/v1/risk/stop", json={
+                "scope": "ACCOUNT", "account_id": auto_id,
+                "reason": "automation e2e", "locked": False, "updated_by": "sim_ea",
+            })
+            auto_check("account_stop_set", stopped.status_code == 200)
+            post_bars([sim_bars[132]], 0, 1, "automation risk reject", acct=auto_acct)
+            time.sleep(2)
+            resumed = client.post(f"{API}/api/v1/risk/resume", json={
+                "scope": "ACCOUNT", "account_id": auto_id,
+            })
+            auto_check("account_stop_resumed", resumed.status_code == 200)
+            rows = auto_commands()
+            risk_ids = {row["command_id"] for row in rows}
+            rejected = next((row for row in rows if row.get("status") == "REJECTED"), None)
+            reject_detail = (
+                client.get(f"{API}/api/v1/commands/{rejected['command_id']}").json().get("data", {})
+                if rejected else {}
+            )
+            auto_check(
+                "risk_rejected_durable",
+                aggregated_ids <= risk_ids
+                and len(risk_ids - aggregated_ids) <= 1
+                and rejected is not None
+                and (reject_detail.get("risk_decision") or {}).get("reason_codes")
+                    == ["ACCOUNT_STOP_NEW_RISK"],
+                f"commands={len(rows)} risk={reject_detail.get('risk_decision')}",
+            )
+
+            # Drain the isolated account: only the ALLOW row may be delivered.
+            delivered_auto: list[str] = []
+            for _ in range(4):
+                got = poll([], acct=auto_acct).get("commands", [])
+                if not got:
+                    break
+                cid = got[0]["command_id"]
+                delivered_auto.append(cid)
+                ack(cid, acct=auto_acct)
+            time.sleep(2)
+            leaked = rejected is not None and rejected["command_id"] in delivered_auto
+            auto_check("rejected_never_delivered", not leaked, f"delivered={delivered_auto}")
+            if allowed:
+                auto_check("allowed_observe_only_ack", command_status(allowed["command_id"]) == "ACKED",
+                           f"status={command_status(allowed['command_id'])}")
+            auto_config(False, "0")
 
     print(f"\nagent-side failures: {failures}")
     return failures

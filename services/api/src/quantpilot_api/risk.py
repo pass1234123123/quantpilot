@@ -37,7 +37,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 from typing import Any
 from uuid import UUID
 
@@ -73,6 +73,45 @@ R_SL_REQUIRED = "STOP_LOSS_REQUIRED"
 R_SL_INVALID = "INVALID_STOP_LOSS"
 R_PER_TRADE = "PER_TRADE_RISK_EXCEEDED"
 R_ESTIMATE_UNAVAILABLE = "RISK_ESTIMATE_UNAVAILABLE"
+R_RISK_NOT_CONFIGURED = "RISK_NOT_CONFIGURED"
+
+
+class SizingError(ValueError):
+    """Automatic position sizing cannot produce a safe command volume."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def calculate_volume(
+    *,
+    basis: Decimal,
+    risk_fraction: Decimal,
+    entry: Decimal,
+    stop_loss: Decimal,
+    tick_size: Decimal,
+    tick_value_loss: Decimal,
+    volume_min: Decimal,
+    volume_max: Decimal,
+    volume_step: Decimal,
+) -> Decimal:
+    """PRD 9.3 risk-budget sizing, using broker tick economics and Decimal."""
+    if risk_fraction <= 0:
+        raise SizingError(R_RISK_NOT_CONFIGURED)
+    values = (basis, entry, stop_loss, tick_size, tick_value_loss, volume_min,
+              volume_max, volume_step)
+    if any(value <= 0 for value in values):
+        raise SizingError(R_ESTIMATE_UNAVAILABLE)
+    loss_per_lot = abs(entry - stop_loss) / tick_size * tick_value_loss
+    if loss_per_lot <= 0:
+        raise SizingError(R_ESTIMATE_UNAVAILABLE)
+    raw_volume = basis * risk_fraction / loss_per_lot
+    volume = (raw_volume / volume_step).to_integral_value(rounding=ROUND_FLOOR) * volume_step
+    volume = min(volume, volume_max)
+    if volume < volume_min:
+        raise SizingError(R_VOL_BELOW_MIN)
+    return volume
 
 
 @dataclass
@@ -121,6 +160,7 @@ def evaluate_command(
     payload: dict[str, Any],
     config: AccountConfig,
     config_version: int,
+    context: dict[str, Any] | None = None,
 ) -> RiskDecision:
     """Run the cloud gate for one risk-increasing command (PRD 9.2 order).
 
@@ -151,6 +191,8 @@ def evaluate_command(
             "weekend_block": filters.weekend_block,
         },
     }
+    if context:
+        snap.update(context)
 
     def reject(reason: str) -> RiskDecision:
         snap_json = _jsonable(snap)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -360,6 +361,62 @@ def main() -> int:
               and cfg.get("risk", {}).get("require_stop_loss") is True,
               f"per_trade={cfg.get('risk', {}).get('per_trade_risk_fraction')}")
 
+    # ---- isolated strategy automation account (PRD 3.2/9.3/13.4) ----------
+    auto = next((a for a in accounts if a.get("login_ref") == "10005678"), None)
+    check("automation.account_present", auto is not None)
+    auto_id = auto["account_id"] if auto else None
+    if auto:
+        auto_cfg = client.get(f"{API}/api/v1/accounts/{auto_id}/config").json()["data"]["config"]
+        check("automation.safe_config_restored",
+              (auto_cfg.get("automation") or {}).get("command_generation") is False
+              and (auto_cfg.get("risk") or {}).get("per_trade_risk_fraction") == "0",
+              f"automation={auto_cfg.get('automation')} risk={(auto_cfg.get('risk') or {}).get('per_trade_risk_fraction')}")
+
+        auto_rows = client.get(f"{API}/api/v1/commands", params={
+            "account_id": auto_id, "limit": 500,
+        }).json().get("data", [])
+        auto_rows = [row for row in auto_rows if row.get("created_by") == "signal-aggregator"]
+        allowed = next((row for row in auto_rows if row.get("status") != "REJECTED"), None)
+        rejected = next((row for row in auto_rows if row.get("status") == "REJECTED"), None)
+
+        def expected_command(bar_time: str) -> str:
+            key = ":".join((
+                "quantpilot-signal-group-v1", auto_id, "EURUSD", "M15", bar_time, "BUY",
+            ))
+            return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+        expected_ids = {
+            expected_command("2026-01-06T09:30:00+00:00"),
+            expected_command("2026-01-06T09:00:00+00:00"),
+        }
+        check("automation.deterministic_replay",
+              len(auto_rows) == 2 and {row["command_id"] for row in auto_rows} == expected_ids,
+              f"commands={len(auto_rows)} ids={[row['command_id'] for row in auto_rows]}")
+        if allowed:
+            strong_signal = str(uuid.uuid5(
+                uuid.NAMESPACE_URL, f"quantpilot-e2e:{auto_id}:134:trend_following:BUY",
+            ))
+            volume = Decimal(allowed["payload"]["volume"])
+            detail = client.get(f"{API}/api/v1/commands/{allowed['command_id']}").json()["data"]
+            check("automation.aggregated_allowed",
+                  allowed.get("status") == "ACKED"
+                  and allowed.get("signal_id") == strong_signal
+                  and volume > 0 and volume == volume.quantize(Decimal("0.01"))
+                  and (detail.get("risk_decision") or {}).get("decision") == "ALLOW",
+                  f"status={allowed.get('status')} volume={volume} risk={detail.get('risk_decision')}")
+        else:
+            check("automation.aggregated_allowed", False, "ALLOW command missing")
+        if rejected:
+            detail = client.get(f"{API}/api/v1/commands/{rejected['command_id']}").json()["data"]
+            check("automation.rejected_terminal",
+                  rejected.get("delivered_at") is None
+                  and rejected.get("delivery_attempts") == 0
+                  and (detail.get("risk_decision") or {}).get("reason_codes")
+                      == ["ACCOUNT_STOP_NEW_RISK"],
+                  f"status={rejected.get('status')} risk={detail.get('risk_decision')}")
+        else:
+            check("automation.rejected_terminal", False, "REJECTED command missing")
+
     # ---- 2. PostgreSQL row counts ------------------------------------------
     with psycopg.connect(PG_DSN) as conn:
         for table in TABLES:
@@ -508,6 +565,80 @@ def main() -> int:
         ).fetchone()[0]
         check("pg.ai_analyses_have_accounts", orphan_analyses == 0,
               f"orphans={orphan_analyses}")
+
+        # ---- 7. Strategy automation invariants (PRD 3.2/7.5/9.3) -----------
+        if auto_id:
+            automation_rows = conn.execute(
+                """
+                SELECT c.command_id::text, c.status, d.decision, d.risk_snapshot
+                  FROM commands c
+                  JOIN risk_decisions d ON d.command_id = c.command_id
+                 WHERE c.account_id = %s AND c.created_by = 'signal-aggregator'
+                 ORDER BY c.created_at
+                """,
+                (auto_id,),
+            ).fetchall()
+            check("pg.automation_commands_and_decisions_unique",
+                  len(automation_rows) == 2
+                  and len({row[0] for row in automation_rows}) == 2,
+                  f"rows={len(automation_rows)}")
+            allow_row = next((row for row in automation_rows if row[2] == "ALLOW"), None)
+            if allow_row:
+                snapshot = allow_row[3]
+                ai = snapshot.get("ai") or {}
+                expected_signals = sorted(
+                    str(uuid.uuid5(
+                        uuid.NAMESPACE_URL, f"quantpilot-e2e:{auto_id}:134:{code}:BUY",
+                    ))
+                    for code in ("ma_cross", "trend_following")
+                )
+                check("pg.automation_contributors_and_ai_context",
+                      snapshot.get("signal_ids") == expected_signals
+                      and bool(ai.get("analysis_id"))
+                      and ai.get("model_provider") == "statistical-regime"
+                      and ai.get("signal_decision") == "REVIEW"
+                      and _utc(ai.get("source_bar_time")) == "2026-01-06T09:30:00+00:00"
+                      and (snapshot.get("thresholds") or {}).get("per_trade_risk_fraction") == "0.01",
+                      f"signals={snapshot.get('signal_ids')} ai={ai}")
+                check("pg.automation_ai_is_advisory",
+                      allow_row[1] == "ACKED" and allow_row[2] == "ALLOW"
+                      and ai.get("signal_decision") == "REVIEW",
+                      f"command={allow_row[1]} risk={allow_row[2]} ai={ai.get('signal_decision')}")
+            else:
+                check("pg.automation_contributors_and_ai_context", False, "ALLOW decision missing")
+                check("pg.automation_ai_is_advisory", False, "ALLOW decision missing")
+
+            conflict_ids = sorted((
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"quantpilot-e2e:{auto_id}:133:ma_cross:BUY")),
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"quantpilot-e2e:{auto_id}:133:trend_following:SELL")),
+            ))
+            conflict = conn.execute(
+                """
+                SELECT payload FROM system_events
+                 WHERE event_type = 'signal.conflict'
+                   AND payload->>'account_id' = %s
+                   AND payload->>'source_bar_time' = '2026-01-06T09:15:00+00:00'
+                 ORDER BY occurred_at DESC LIMIT 1
+                """,
+                (auto_id,),
+            ).fetchone()
+            check("pg.automation_conflict_audited",
+                  conflict is not None and (conflict[0].get("signal_ids") == conflict_ids),
+                  f"event={conflict[0] if conflict else None}")
+
+            sizing_failure = conn.execute(
+                """
+                SELECT payload FROM system_events
+                 WHERE event_type = 'signal.command_failed'
+                   AND payload->>'account_id' = %s
+                   AND payload->>'source_bar_time' = '2026-01-06T09:30:00+00:00'
+                   AND payload->>'reason' = 'RISK_NOT_CONFIGURED'
+                 ORDER BY occurred_at DESC LIMIT 1
+                """,
+                (auto_id,),
+            ).fetchone()
+            check("pg.automation_zero_risk_audited", sizing_failure is not None,
+                  f"event={sizing_failure[0] if sizing_failure else None}")
 
     return finish()
 
