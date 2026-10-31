@@ -1,16 +1,20 @@
 """FastAPI application: node/terminal/account routes + health (PRD 13.2).
 
 All responses use the unified envelope {data, error, request_id, timestamp}.
-This slice has NO auth/RBAC yet; trade commands are channel-only: the EA
-acknowledges receipt and never executes (OBSERVE_ONLY, PRD 21.3). The cloud
-risk gate (PRD 9) refuses risk-increasing commands BEFORE they are queued:
-they land in terminal state REJECTED and are never delivered.
+Service auth (PRD 14): every /api/* route requires the X-API-Key header;
+RBAC/user roles are deferred to the commercialization phase. Trade commands
+are channel-only: the EA acknowledges receipt and never executes
+(OBSERVE_ONLY, PRD 21.3). The cloud risk gate (PRD 9) refuses
+risk-increasing commands BEFORE they are queued: they land in terminal
+state REJECTED and are never delivered.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -74,6 +78,31 @@ def healthz() -> JSONResponse:
     except Exception as exc:
         return err(503, "UNHEALTHY", f"db unreachable: {exc}")
     return ok({"status": "ok", "db": "reachable"})
+
+
+# --------------------------------------------------------------------------
+# service auth (PRD 14): every /api/* route requires the X-API-Key header.
+# Fail-closed: without QP_API_KEY configured the API refuses all traffic
+# (503) instead of silently running open. Non-/api/ paths (/healthz, docs)
+# stay public. The env is read per request so the key can be rotated
+# without a restart.
+# --------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    expected = os.environ.get("QP_API_KEY", "")
+    if not expected:
+        logger.error("QP_API_KEY not configured; refusing API request to %s", path)
+        return err(503, "API_KEY_NOT_CONFIGURED", "set QP_API_KEY before exposing the API")
+    supplied = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(supplied, expected):
+        logger.warning("rejected unauthenticated API request to %s", path)
+        return err(401, "UNAUTHORIZED", "missing or invalid X-API-Key header")
+    return await call_next(request)
 
 
 # --------------------------------------------------------------------------

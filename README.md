@@ -67,6 +67,11 @@ copy .env.example .env      # 填入真实 QP_* 配置（.env 不入 Git）
 .venv\Scripts\python -m quantpilot_agent         # Agent    127.0.0.1:8787
 ```
 
+安全（PRD 14）：云端 API 所有 `/api/*` 路由要求 `X-API-Key` 请求头（fail-closed：
+未配置 `QP_API_KEY` 时拒绝全部 API 流量，`/healthz` 保持公开）。Agent、`sim_ea.py`、
+`e2e_verify.py` 与 Vite dev proxy 均从 `.env` 读取该 key；RBAC/用户体系按 PRD 属
+商业化阶段（P2）。
+
 冒烟与验收：
 
 ```powershell

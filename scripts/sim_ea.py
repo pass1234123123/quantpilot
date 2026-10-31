@@ -96,8 +96,13 @@ def sim_symbols() -> list[dict]:
 
 
 def main() -> int:
-    # trust_env=False: never route 127.0.0.1 through a system proxy
-    client = httpx.Client(timeout=10, trust_env=False)
+    # trust_env=False: never route 127.0.0.1 through a system proxy;
+    # X-API-Key: cloud API auth (direct /api/v1 calls below)
+    client = httpx.Client(
+        timeout=10,
+        trust_env=False,
+        headers={"X-API-Key": os.environ.get("QP_API_KEY", "")},
+    )
     failures = 0
 
     def post(path: str, body: dict) -> None:

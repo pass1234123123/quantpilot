@@ -73,7 +73,11 @@ def _utc(value) -> str:
 
 
 def main() -> int:
-    client = httpx.Client(timeout=10, trust_env=False)
+    client = httpx.Client(
+        timeout=10,
+        trust_env=False,
+        headers={"X-API-Key": os.environ.get("QP_API_KEY", "")},
+    )
 
     # ---- 1. API endpoints -------------------------------------------------
     r = client.get(f"{API}/healthz")

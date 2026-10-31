@@ -50,7 +50,9 @@ def main() -> None:
     registrar = _RegistrarThread(config, node_id_holder)
     registrar.start()
 
-    server = AgentHttpServer(config.host, config.port, config.token, event_queue, config.api_base_url)
+    server = AgentHttpServer(
+        config.host, config.port, config.token, event_queue, config.api_base_url, config.api_key
+    )
     info("agent.listening", host=config.host, port=config.port)
     try:
         server.serve_forever()
@@ -87,7 +89,7 @@ class _RegistrarThread:
     def __init__(self, config: AgentConfig, holder: _NodeIdHolder) -> None:
         self._config = config
         self._holder = holder
-        self._client = CloudClient(config.api_base_url)
+        self._client = CloudClient(config.api_base_url, config.api_key)
         self._running = True
         self._thread = threading.Thread(target=self._run, name="qp-registrar", daemon=True)
 

@@ -19,6 +19,7 @@ class AgentConfig:
     token: str
     device_id: str
     api_base_url: str
+    api_key: str
     nats_url: str
     agent_version: str
     state_dir: Path
@@ -28,12 +29,16 @@ class AgentConfig:
         token = os.environ.get("QP_AGENT_TOKEN", "")
         if not token:
             raise RuntimeError("QP_AGENT_TOKEN is required (see .env.example)")
+        api_key = os.environ.get("QP_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("QP_API_KEY is required (cloud API rejects unauthenticated calls)")
         return cls(
             host=os.environ.get("QP_AGENT_HOST", "127.0.0.1"),
             port=int(os.environ.get("QP_AGENT_PORT", "8787")),
             token=token,
             device_id=os.environ["QP_DEVICE_ID"],
             api_base_url=os.environ.get("QP_API_BASE_URL", "http://127.0.0.1:8000"),
+            api_key=api_key,
             nats_url=os.environ["QP_NATS_URL"],
             agent_version=os.environ.get("QP_AGENT_VERSION", "0.1.0"),
             state_dir=Path(os.environ.get("QP_STATE_DIR", ".state/agent")),

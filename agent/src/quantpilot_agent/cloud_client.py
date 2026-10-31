@@ -10,8 +10,11 @@ from .log import info, warn
 
 
 class CloudClient:
-    def __init__(self, base_url: str) -> None:
-        self._client = httpx.Client(base_url=base_url, timeout=httpx.Timeout(5.0))
+    def __init__(self, base_url: str, api_key: str = "") -> None:
+        headers = {"X-API-Key": api_key} if api_key else {}
+        self._client = httpx.Client(
+            base_url=base_url, timeout=httpx.Timeout(5.0), headers=headers
+        )
 
     def close(self) -> None:
         self._client.close()

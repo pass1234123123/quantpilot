@@ -1,3 +1,4 @@
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -9,6 +10,8 @@ from pydantic import ValidationError
 
 
 NOW = datetime(2026, 1, 5, tzinfo=timezone.utc)
+TEST_API_KEY = "test-api-key"
+AUTH = {"X-API-Key": TEST_API_KEY}
 
 
 def body_dict(instance_id: UUID) -> dict:
@@ -92,6 +95,8 @@ class BacktestContractTests(unittest.TestCase):
 
 class BacktestRouteTests(unittest.TestCase):
     def setUp(self) -> None:
+        # route tests run behind the X-API-Key middleware
+        os.environ.setdefault("QP_API_KEY", TEST_API_KEY)
         self.client = TestClient(__import__("quantpilot_api.app", fromlist=["app"]).app)
         self.instance_id = uuid4()
         self.key = uuid4()
@@ -105,7 +110,7 @@ class BacktestRouteTests(unittest.TestCase):
             response = self.client.post(
                 "/api/v1/backtests",
                 json=body_dict(self.instance_id),
-                headers={"Idempotency-Key": str(self.key)},
+                headers={"Idempotency-Key": str(self.key), **AUTH},
             )
 
         self.assertEqual(response.status_code, 200, response.text)
@@ -115,12 +120,14 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertEqual(create.call_args.args[1], self.key)
 
         with patch.object(backtests, "get_backtest", return_value=stored):
-            fetched = self.client.get(f"/api/v1/backtests/{job_id}")
+            fetched = self.client.get(f"/api/v1/backtests/{job_id}", headers=AUTH)
         self.assertEqual(fetched.status_code, 200, fetched.text)
         self.assertEqual(fetched.json()["data"]["job_id"], str(job_id))
 
     def test_post_requires_idempotency_key(self) -> None:
-        response = self.client.post("/api/v1/backtests", json=body_dict(self.instance_id))
+        response = self.client.post(
+            "/api/v1/backtests", json=body_dict(self.instance_id), headers=AUTH
+        )
         self.assertEqual(response.status_code, 422)
 
     def test_list_backtests_filters_by_account_and_wraps_envelope(self) -> None:
@@ -128,7 +135,9 @@ class BacktestRouteTests(unittest.TestCase):
 
         rows = [{"job_id": str(uuid4()), "status": "COMPLETED", "strategy_code": "ma_cross"}]
         with patch.object(backtests, "list_backtests", return_value=rows) as listed:
-            response = self.client.get(f"/api/v1/backtests?account_id={self.instance_id}&limit=5")
+            response = self.client.get(
+                f"/api/v1/backtests?account_id={self.instance_id}&limit=5", headers=AUTH
+            )
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIsNone(response.json()["error"])

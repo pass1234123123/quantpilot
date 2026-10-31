@@ -98,9 +98,13 @@ class AgentHttpServer:
         token: str,
         event_queue: "queue.Queue[dict[str, Any]]",
         api_base_url: str = "http://127.0.0.1:8000",
+        api_key: str = "",
     ) -> None:
         outer = self
-        outer._cloud = httpx.Client(base_url=api_base_url, timeout=httpx.Timeout(5.0))
+        cloud_headers = {"X-API-Key": api_key} if api_key else {}
+        outer._cloud = httpx.Client(
+            base_url=api_base_url, timeout=httpx.Timeout(5.0), headers=cloud_headers
+        )
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "QuantPilotAgent/0.1"
