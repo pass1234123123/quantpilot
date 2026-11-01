@@ -60,11 +60,18 @@ class FrontendNoServiceKeyFallbackTests(unittest.TestCase):
         api_ts = _read("api.ts")
         # personal qpk_ keys pass; any other key (the shared service key)
         # is simply not sent, so the backend answers 401 -> login gate.
-        self.assertIn("key.startsWith('qpk_')", api_ts)
+        # R3 P1-02: the prefix check runs on the trimmed key inside
+        # loginWithApiKey and rejects shared service keys outright.
+        self.assertIn("trimmed.startsWith('qpk_')", api_ts)
         self.assertNotIn("localStorage.getItem('qp.token')", api_ts)
         self.assertIn("setAuthRequiredListener", api_ts)
         # expired/invalid session re-opens the gate instead of falling back
         self.assertIn("authRequiredListener?.()", api_ts)
+        # R3: login-key rides its own credential channel; the retired R2
+        # settings-slot accessors must stay out of the API client.
+        self.assertIn("X-API-Key", api_ts)
+        self.assertNotIn("getApiKey", api_ts)
+        self.assertNotIn("setApiKey", api_ts)
 
     def test_vite_proxy_no_longer_injects_service_key(self):
         config = (FRONTEND / "vite.config.ts").read_text(encoding="utf-8")
@@ -81,9 +88,15 @@ class FrontendLoginGateTests(unittest.TestCase):
 
     def test_app_shell_gates_on_verified_session(self):
         app_vue = _read("App.vue")
+        # R3 P1-01: four-state gate (boot -> setup -> auth -> app); the
+        # first-run connection page gates the login gate itself so a
+        # fresh desktop install can never hit a relative /api request.
+        self.assertIn("ConnectionSetup", app_vue)
+        self.assertIn("gate === 'setup'", app_vue)
+        self.assertIn("gate === 'auth'", app_vue)
+        self.assertIn("gate === 'app'", app_vue)
         self.assertIn("LoginView", app_vue)
         self.assertIn("verifySession", app_vue)
-        self.assertIn('v-else-if="!authUser"', app_vue)
 
     def test_login_view_exists_and_emits_identity(self):
         login = _read("components/LoginView.vue")

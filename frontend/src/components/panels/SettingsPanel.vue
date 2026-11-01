@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useDashboardStore } from '../../stores/dashboard'
-import { api } from '../../api'
-import { clearApiKey, getApiKey, setApiKey } from '../../secure-store'
+import { getApiBase, setApiBase, testApiBase, validateApiBase } from '../../api'
 
 const store = useDashboardStore()
 
@@ -14,49 +13,36 @@ const terminal = computed(() =>
 const account = computed(() => store.selectedAccount)
 const snap = computed(() => store.snapshot)
 
-// 桌面连接（Tauri 生产模式无 Vite 代理，需直连 API 并自带密钥）
-// API Key 存于系统凭据管理器（secure-store），不再写 localStorage
-const connBase = ref(localStorage.getItem('qp.apiBase') ?? '')
-const connKey = ref(getApiKey())
-const connTesting = ref(false)
+// 桌面连接（Tauri 生产模式无 Vite 代理，需直连 API）。
+// R3 P1-01/P1-02：此处仅维护 API 地址；登录凭据（JWT / 个人 qpk_ Key）
+// 统一在登录页管理并保存于系统凭据管理器，Settings 不再收集任何密钥。
+const connBase = ref(getApiBase())
+const connBusy = ref(false)
 const connResult = ref<'' | 'ok' | 'fail'>('')
 const connError = ref('')
 
 async function saveConn() {
-  localStorage.setItem('qp.apiBase', connBase.value.trim())
-  try {
-    await setApiKey(connKey.value)
-    connResult.value = ''
-  } catch (e) {
+  if (connBusy.value) return
+  const raw = connBase.value.trim()
+  const check = validateApiBase(raw)
+  if (!check.ok) {
     connResult.value = 'fail'
-    connError.value = e instanceof Error ? e.message : String(e)
+    connError.value = check.error ?? 'API 地址无效'
+    return
   }
-}
-
-async function clearConn() {
-  localStorage.removeItem('qp.apiBase')
-  try {
-    await clearApiKey()
-  } catch {
-    // credential already gone - treat as cleared
-  }
-  connBase.value = ''
-  connKey.value = ''
-  connResult.value = ''
-}
-
-async function testConn() {
-  connTesting.value = true
+  connBusy.value = true
   connResult.value = ''
   connError.value = ''
   try {
-    await api.nodes()
+    await testApiBase(raw) // 先连通测试，成功才落盘（R3 P1-01）
+    setApiBase(raw)
+    connBase.value = getApiBase()
     connResult.value = 'ok'
   } catch (e) {
     connResult.value = 'fail'
     connError.value = e instanceof Error ? e.message : String(e)
   } finally {
-    connTesting.value = false
+    connBusy.value = false
   }
 }
 
@@ -117,22 +103,16 @@ const runModeText = computed(() => {
           <span>API 地址</span>
           <el-input v-model="connBase" placeholder="http://127.0.0.1:8000" size="small" style="width: 320px" />
         </div>
-        <div class="settings__row">
-          <span>个人 API Key</span>
-          <el-input v-model="connKey" type="password" show-password placeholder="qpk_…（个人密钥，可选；登录 Token 优先）" size="small" style="width: 320px" />
-        </div>
       </div>
       <div class="settings__conn">
-        <el-button size="small" type="primary" @click="saveConn">保存</el-button>
-        <el-button size="small" :loading="connTesting" @click="testConn">测试连接</el-button>
-        <el-button size="small" text @click="clearConn">清除</el-button>
-        <el-tag v-if="connResult === 'ok'" type="success" size="small">连接成功，密钥有效</el-tag>
+        <el-button size="small" type="primary" :loading="connBusy" @click="saveConn">测试并保存</el-button>
+        <el-tag v-if="connResult === 'ok'" type="success" size="small">连接成功，已保存</el-tag>
         <el-tag v-else-if="connResult === 'fail'" type="danger" size="small">失败：{{ connError }}</el-tag>
       </div>
       <div class="settings__note">
-        <p>· 登录（用户名 + 密码）是访问业务功能的首选方式；此处可选用个人 API Key（qpk_ 前缀，在「AI/账户授权管理」由管理员或自助创建）。</p>
-        <p>· 共享服务密钥仅用于 Agent / EA 机器通道，在此处填入无法访问业务数据（后端按机器身份拒绝，R2 P1-01）。</p>
-        <p>· 密钥与登录 Token 均保存进系统凭据管理器（Windows 凭据管理器），不落 localStorage 与磁盘明文。</p>
+        <p>· 保存前自动连通测试（GET /healthz）；地址格式要求协议 + 主机 + 端口（如 http://127.0.0.1:8000）。</p>
+        <p>· 登录使用用户名密码或个人 API Key（qpk_），均在登录页完成，凭据保存于系统凭据管理器。</p>
+        <p>· 共享服务密钥仅用于 Agent / EA 机器通道，不能作为用户身份登录（R2 P1-01）。</p>
       </div>
     </div>
 

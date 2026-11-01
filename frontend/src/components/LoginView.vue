@@ -2,23 +2,38 @@
 import { ref } from 'vue'
 import { api, type AuthUser } from '../api'
 
-// R2 remediation P2-05/T6: standalone login gate. The app must not show
-// any business view before a personal identity exists (JWT via login or
-// a personal qpk_ key configured in Settings).
-const emit = defineEmits<{ (e: 'success', user: AuthUser): void }>()
+// R3 P1-02: dual-mode gate - username/password (JWT) OR the personal
+// qpk_ API key (own credential slot, X-API-Key lane). A shared service
+// key is a machine lane and is rejected before any request is sent.
+type Mode = 'password' | 'apikey'
 
+const emit = defineEmits<{
+  (e: 'success', user: AuthUser): void
+  (e: 'reconfigure'): void
+}>()
+
+const mode = ref<Mode>('password')
 const username = ref('')
 const password = ref('')
+const apiKey = ref('')
 const busy = ref(false)
 const errorText = ref('')
 
 async function submit() {
-  if (!username.value.trim() || !password.value) return
+  if (busy.value) return
   busy.value = true
   errorText.value = ''
   try {
-    const user = await api.login(username.value.trim(), password.value)
-    password.value = ''
+    let user: AuthUser
+    if (mode.value === 'password') {
+      if (!username.value.trim() || !password.value) return
+      user = await api.login(username.value.trim(), password.value)
+      password.value = ''
+    } else {
+      if (!apiKey.value.trim()) return
+      user = await api.loginWithApiKey(apiKey.value)
+      apiKey.value = ''
+    }
     emit('success', user)
   } catch (e) {
     errorText.value = e instanceof Error ? e.message : String(e)
@@ -39,22 +54,39 @@ async function submit() {
         </div>
       </div>
 
+      <el-radio-group v-model="mode" size="large" class="login__modes">
+        <el-radio-button value="password">用户名密码</el-radio-button>
+        <el-radio-button value="apikey">个人 API Key</el-radio-button>
+      </el-radio-group>
+
+      <template v-if="mode === 'password'">
+        <el-input
+          v-model="username"
+          placeholder="用户名"
+          size="large"
+          autocomplete="username"
+          @keyup.enter="submit"
+        />
+        <el-input
+          v-model="password"
+          type="password"
+          show-password
+          placeholder="密码"
+          size="large"
+          autocomplete="current-password"
+          @keyup.enter="submit"
+        />
+      </template>
       <el-input
-        v-model="username"
-        placeholder="用户名"
-        size="large"
-        autocomplete="username"
-        @keyup.enter="submit"
-      />
-      <el-input
-        v-model="password"
+        v-else
+        v-model="apiKey"
         type="password"
         show-password
-        placeholder="密码"
+        placeholder="qpk_…（个人密钥，AI/账户授权管理中创建）"
         size="large"
-        autocomplete="current-password"
         @keyup.enter="submit"
       />
+
       <el-button type="primary" size="large" class="login__btn" :loading="busy" @click="submit">
         登 录
       </el-button>
@@ -67,10 +99,19 @@ async function submit() {
         :closable="false"
       />
 
+      <el-link
+        type="primary"
+        :underline="false"
+        class="login__reconf"
+        @click="emit('reconfigure')"
+      >
+        修改 API 连接地址
+      </el-link>
+
       <div class="login__note">
-        <p>· 共享服务密钥仅用于 Agent / EA 机器通道，不能作为用户身份登录。</p>
-        <p>· 登录 Token 保存于系统凭据管理器（桌面端），不写入浏览器存储。</p>
-        <p>· 角色与账户授权由管理员分配；会话过期后需重新登录。</p>
+        <p>· 个人 API Key 以 qpk_ 开头；共享服务密钥仅用于 Agent / EA 机器通道，不能登录。</p>
+        <p>· 登录 Token 与个人 API Key 分开保存于系统凭据管理器（桌面端），不写入浏览器存储。</p>
+        <p>· 角色与账户授权由管理员分配；密钥撤销或会话过期后需重新登录。</p>
       </div>
     </div>
   </div>
@@ -120,7 +161,11 @@ async function submit() {
 
 .login__name { font-weight: 700; letter-spacing: 1.5px; font-size: 15px; }
 .login__sub { font-size: 10.5px; color: var(--qp-text-dim); letter-spacing: 0.6px; margin-top: 3px; }
+.login__modes { display: flex; width: 100%; }
+.login__modes :deep(.el-radio-button) { flex: 1; }
+.login__modes :deep(.el-radio-button__inner) { width: 100%; }
 .login__btn { width: 100%; letter-spacing: 6px; }
+.login__reconf { width: 100%; justify-content: center; font-size: 11.5px; }
 
 .login__note { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
 .login__note p {

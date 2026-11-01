@@ -216,7 +216,7 @@ class RiskIsolationTests(unittest.TestCase):
                 "/api/v1/risk/stop",
                 json={
                     "scope": "ACCOUNT", "account_id": str(other),
-                    "reason": "unit", "updated_by": "unit-test",
+                    "reason": "unit",
                 },
                 headers=headers,
             )
@@ -225,13 +225,27 @@ class RiskIsolationTests(unittest.TestCase):
 
     def test_global_risk_controls_are_admin_only(self) -> None:
         for path, body in (
-            ("/api/v1/risk/stop", {"scope": "GLOBAL", "reason": "x", "updated_by": "t"}),
-            ("/api/v1/risk/resume", {"scope": "GLOBAL", "reason": "x", "updated_by": "t"}),
+            ("/api/v1/risk/stop", {"scope": "GLOBAL", "reason": "x"}),
+            ("/api/v1/risk/resume", {"scope": "GLOBAL", "reason": "x"}),
         ):
             with bearer(role="TRADER") as headers:
                 resp = self.client.post(path, json=body, headers=headers)
             self.assertEqual(resp.status_code, 403, path)
             self.assertEqual(resp.json()["error"]["code"], "FORBIDDEN")
+
+    def test_forged_updated_by_is_rejected(self) -> None:
+        """R3 P2-02: the operator identity comes from the principal only -
+        a body-supplied updated_by is a 422, not a silent override."""
+        mine = uuid4()
+        for path, body in (
+            ("/api/v1/risk/stop", {"scope": "ACCOUNT", "account_id": str(mine),
+                                   "updated_by": "forged-attacker"}),
+            ("/api/v1/risk/resume", {"scope": "ACCOUNT", "account_id": str(mine),
+                                     "updated_by": "forged-attacker"}),
+        ):
+            with bearer(role="TRADER", granted_accounts=[mine]) as headers:
+                resp = self.client.post(path, json=body, headers=headers)
+            self.assertEqual(resp.status_code, 422, path)
 
 
 class BacktestIsolationTests(unittest.TestCase):
@@ -422,7 +436,9 @@ class LoginHardeningTests(unittest.TestCase):
         self.auth = auth
         self.client = _client()
         # the failure buckets are process-global; isolate every test
+        # (R3 P2-03 added the pure-IP spray bucket alongside the pair bucket)
         self.addCleanup(auth._login_failures.clear)
+        self.addCleanup(getattr(auth, "_login_failures_ip", {}).clear)
 
     def test_rate_limit_locks_after_max_failures(self) -> None:
         with (

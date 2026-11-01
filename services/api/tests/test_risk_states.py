@@ -243,9 +243,10 @@ class StopResumeEndpointTests(unittest.TestCase):
                     patch.object(self.app_module.db, "conn",
                                  return_value=connection_context),
                     patch.object(self.app_module.writers, "add_system_event"),
+                    patch.object(self.app_module.audit, "record"),
                 ):
                     body = {"scope": "ACCOUNT", "account_id": str(ACCOUNT),
-                            "reason": "unit", "updated_by": "unit-test"}
+                            "reason": "unit"}
                     if status != "STOP_NEW_RISK":
                         body["status"] = status
                     resp = self._post("/api/v1/risk/stop", body)
@@ -259,7 +260,7 @@ class StopResumeEndpointTests(unittest.TestCase):
                           side_effect=[_row("LOCKED")]):
             resp = self._post("/api/v1/risk/stop", {
                 "scope": "ACCOUNT", "account_id": str(ACCOUNT),
-                "status": "WARNING", "reason": "weaken", "updated_by": "unit-test",
+                "status": "WARNING", "reason": "weaken",
             })
         self.assertEqual(resp.status_code, 409)
         self.assertIn("resume", resp.json()["error"]["message"])
@@ -282,10 +283,11 @@ class StopResumeEndpointTests(unittest.TestCase):
                     patch.object(self.app_module.db, "conn",
                                  return_value=MagicMock()),
                     patch.object(self.app_module.writers, "add_system_event"),
+                    patch.object(self.app_module.audit, "record"),
                 ):
                     resp = self._post("/api/v1/risk/resume", {
                         "scope": "ACCOUNT", "account_id": str(ACCOUNT),
-                        "reason": "resume", "updated_by": "unit-test",
+                        "reason": "resume",
                     })
                 self.assertEqual(resp.status_code, 200, resp.text)
                 self.assertEqual(resp.json()["data"]["status"], "NORMAL")
@@ -295,10 +297,34 @@ class StopResumeEndpointTests(unittest.TestCase):
                          side_effect=[_row("LOCKED")]):
             resp = self._post("/api/v1/risk/resume", {
                 "scope": "ACCOUNT", "account_id": str(ACCOUNT),
-                "reason": "resume", "updated_by": "unit-test",
+                "reason": "resume",
             })
         self.assertEqual(resp.status_code, 409)
         self.assertIn("confirm_locked", resp.json()["error"]["message"])
+
+    def test_stop_stamps_principal_identity(self) -> None:
+        """R3 P2-02: updated_by in the DB write and the audit row is the
+        authenticated principal (bearer() -> "root"), never the request
+        body - the model no longer even carries the field."""
+        post_row = _row("STOP_NEW_RISK", version=4)
+        connection = MagicMock()
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        with (
+            patch.object(self.app_module.db, "query_one",
+                         side_effect=[None, post_row]),
+            patch.object(self.app_module.db, "conn",
+                         return_value=connection_context),
+            patch.object(self.app_module.writers, "add_system_event"),
+            patch.object(self.app_module.audit, "record") as audit_rec,
+        ):
+            resp = self._post("/api/v1/risk/stop", {
+                "scope": "ACCOUNT", "account_id": str(ACCOUNT), "reason": "unit",
+            })
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # DB write params: (scope, account, status, reason, updated_by)
+        self.assertEqual(connection.execute.call_args[0][1][4], "root")
+        self.assertEqual(audit_rec.call_args.kwargs["actor"], "root")
 
 
 if __name__ == "__main__":

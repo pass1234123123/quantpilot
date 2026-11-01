@@ -1,14 +1,23 @@
 /**
- * Secure secret storage: desktop shell service key (phase-3 R3) + the
- * user-session JWT (R2 remediation P1-03).
+ * Secure secret storage: the user's login credentials (R2 P1-03 + R3 P1-02).
  *
- * Desktop (Tauri webview): secrets live in the OS credential store
- * (Windows Credential Manager) via the Rust `credential_*` commands —
- * never in localStorage. Browser/dev mode has no Tauri bridge: the
- * service key keeps its legacy localStorage entry, while the session
- * token goes to sessionStorage (survives reload, dies with the tab).
- * Pre-remediation installs (token under localStorage qp.token) are
- * migrated once and wiped - tokens never stay in localStorage.
+ * Two SEPARATE credential slots - a JWT and a personal API key are
+ * different credential types and are never conflated:
+ *   - auth_token     JWT issued by POST /api/v1/auth/login (password login)
+ *   - login_api_key  personal qpk_... key entered on the LOGIN page
+ *                     (R3 P1-02); travels via X-API-Key, never as a JWT
+ *
+ * Desktop (Tauri webview): both live in the OS credential store
+ * (Windows Credential Manager) via the Rust `credential_*` commands -
+ * never in localStorage. Browser/dev mode has no Tauri bridge: both go
+ * to sessionStorage (survives reload, dies with the tab). Pre-remediation
+ * installs (token under localStorage qp.token) are migrated once and
+ * wiped - tokens never stay in localStorage.
+ *
+ * The R2 "Settings key" slot (api_key / qp.apiKey) is RETIRED: the shared
+ * service key is a machine lane and never a user identity. A personal
+ * qpk_ key previously stored there is migrated once into the login-key
+ * slot; the legacy entry is wiped either way.
  *
  * Values are cached in memory so request code stays synchronous; init()
  * must run before the app mounts (see main.ts).
@@ -16,12 +25,14 @@
 import { invoke } from '@tauri-apps/api/core'
 import { ref } from 'vue'
 
-const LEGACY_KEY = 'qp.apiKey'
-const STORE_KEY = 'api_key'
+const LEGACY_KEY = 'qp.apiKey' // R2 dev-mode Settings key (retired)
+const LEGACY_KEY_STORE_KEY = 'api_key' // R2 desktop Settings key (retired)
+const LOGIN_KEY_STORE_KEY = 'login_api_key'
 const TOKEN_STORE_KEY = 'auth_token'
 const LEGACY_TOKEN_KEY = 'qp.token'
 const LEGACY_USER_KEY = 'qp.user'
 const SESSION_TOKEN_KEY = 'qp.session.token' // browser/dev fallback only
+const SESSION_LOGIN_KEY = 'qp.session.loginKey' // browser/dev fallback only
 
 export function isDesktop(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -33,7 +44,7 @@ export interface SessionUser {
   role: string
 }
 
-let apiKey = ''
+let loginApiKey = ''
 let authToken = ''
 /** Reactive so role-gated UI updates on login/logout without a store. */
 const sessionUser = ref<SessionUser | null>(null)
@@ -53,50 +64,67 @@ async function migrateLegacyToken(): Promise<string> {
   return legacyToken
 }
 
-export async function initSecureStore(): Promise<void> {
-  if (!isDesktop()) {
-    apiKey = localStorage.getItem(LEGACY_KEY) ?? ''
-    await migrateLegacyToken()
-    authToken = sessionStorage.getItem(SESSION_TOKEN_KEY) ?? ''
-    return
-  }
-  const stored = await invoke<string | null>('credential_get', { key: STORE_KEY })
-  if (stored) {
-    apiKey = stored
-  } else {
-    // one-time migration from the pre-R3 localStorage copy, then wipe it
-    const legacy = localStorage.getItem(LEGACY_KEY)
-    if (legacy) {
-      await invoke('credential_set', { key: STORE_KEY, value: legacy })
-      localStorage.removeItem(LEGACY_KEY)
-      apiKey = legacy
+async function initDesktop(): Promise<void> {
+  // R3 P1-02: one-time migration of the retired R2 Settings key. A
+  // personal qpk_ key stored there becomes the login key; anything else
+  // (e.g. a shared service key) is dropped - the slot is never a
+  // credential source again and is wiped either way.
+  let loginKey =
+    (await invoke<string | null>('credential_get', { key: LOGIN_KEY_STORE_KEY })) ?? ''
+  if (!loginKey) {
+    const legacy = await invoke<string | null>('credential_get', {
+      key: LEGACY_KEY_STORE_KEY,
+    })
+    if (legacy && legacy.startsWith('qpk_')) {
+      await invoke('credential_set', { key: LOGIN_KEY_STORE_KEY, value: legacy })
+      loginKey = legacy
     }
   }
+  await invoke('credential_delete', { key: LEGACY_KEY_STORE_KEY }).catch(() => {})
+  localStorage.removeItem(LEGACY_KEY)
+  loginApiKey = loginKey
+
   const token = await invoke<string | null>('credential_get', { key: TOKEN_STORE_KEY })
   authToken = token ?? (await migrateLegacyToken())
 }
 
-export function getApiKey(): string {
-  return apiKey
+export async function initSecureStore(): Promise<void> {
+  if (!isDesktop()) {
+    localStorage.removeItem(LEGACY_KEY) // retired Settings key slot
+    await migrateLegacyToken()
+    authToken = sessionStorage.getItem(SESSION_TOKEN_KEY) ?? ''
+    loginApiKey = sessionStorage.getItem(SESSION_LOGIN_KEY) ?? ''
+    return
+  }
+  await initDesktop()
 }
 
-export async function setApiKey(value: string): Promise<void> {
+// -- personal login API key (qpk_) ---------------------------------------
+// The key entered on the LOGIN page (R3 P1-02). Desktop: OS credential
+// store. Browser/dev: sessionStorage. NEVER localStorage, and NEVER the
+// same slot as the JWT - the two credential types stay separate.
+
+export function getLoginApiKey(): string {
+  return loginApiKey
+}
+
+export async function setLoginApiKey(value: string): Promise<void> {
   const trimmed = value.trim()
   if (isDesktop()) {
-    await invoke('credential_set', { key: STORE_KEY, value: trimmed })
+    await invoke('credential_set', { key: LOGIN_KEY_STORE_KEY, value: trimmed })
   } else {
-    localStorage.setItem(LEGACY_KEY, trimmed)
+    sessionStorage.setItem(SESSION_LOGIN_KEY, trimmed)
   }
-  apiKey = trimmed
+  loginApiKey = trimmed
 }
 
-export async function clearApiKey(): Promise<void> {
+export async function clearLoginApiKey(): Promise<void> {
   if (isDesktop()) {
-    await invoke('credential_delete', { key: STORE_KEY })
+    await invoke('credential_delete', { key: LOGIN_KEY_STORE_KEY })
   } else {
-    localStorage.removeItem(LEGACY_KEY)
+    sessionStorage.removeItem(SESSION_LOGIN_KEY)
   }
-  apiKey = ''
+  loginApiKey = ''
 }
 
 // -- user session token (JWT) --------------------------------------------

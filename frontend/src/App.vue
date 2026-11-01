@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { useDashboardStore } from './stores/dashboard'
-import { api, setAuthRequiredListener, type AuthUser } from './api'
+import { api, getApiBase, setAuthRequiredListener, type AuthUser } from './api'
+import ConnectionSetup from './components/ConnectionSetup.vue'
 import LoginView from './components/LoginView.vue'
 import SidebarNav from './components/SidebarNav.vue'
 import KpiBand from './components/KpiBand.vue'
@@ -73,13 +74,17 @@ const viewSub = computed(() => viewMeta[activeView.value].sub)
 const store = useDashboardStore()
 let timer: ReturnType<typeof setInterval> | null = null
 
-// R2 remediation T6 (login gate): no business view renders before a
-// personal identity exists. Startup re-validates the stored token against
-// the backend (never trusts a cached copy); a mid-session 401 (expiry,
-// revoke, disable, role change) bounces the user back here via the
-// api.ts listener - it never degrades to the shared service key (P1-01).
+// R3 gate chain (P1-01 + P1-02): setup -> login -> app.
+//   boot   checking connection config + stored session
+//   setup  first-run connection page (desktop has no Vite proxy: the API
+//          base MUST exist before the login gate, or the login request
+//          hits the webview origin and never reaches the cloud API)
+//   auth   login gate (password -> JWT, or personal qpk_ key)
+//   app    business views; a mid-session 401 (expiry, revoke, disable,
+//          role change) bounces back to 'auth' via the api.ts listener
+type GateState = 'boot' | 'setup' | 'auth' | 'app'
+const gate = ref<GateState>('boot')
 const authUser = ref<AuthUser | null>(null)
-const sessionChecking = ref(true)
 
 function startApp() {
   store.refreshAll()
@@ -95,37 +100,45 @@ function stopApp() {
 
 setAuthRequiredListener(() => {
   authUser.value = null
+  gate.value = 'auth'
   stopApp()
 })
 
+function onConfigured() {
+  gate.value = 'auth'
+}
+
 function onLoggedIn(user: AuthUser) {
   authUser.value = user
+  gate.value = 'app'
   startApp()
 }
 
 function logout() {
   api.logout()
   authUser.value = null
+  gate.value = 'auth'
   stopApp()
 }
 
-// Tauri webview detection (desktop shell), no extra package dependency.
-const isDesktopShell = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
-// Desktop production builds have no Vite proxy: when API calls fail and no
-// direct connection is configured, guide the user to Settings.
-const desktopNeedsConfig = computed(
-  () => isDesktopShell && !localStorage.getItem('qp.apiBase') && !!store.error,
-)
-
 onMounted(async () => {
+  // P1-01: the connection config gates the login gate itself.
+  if (!getApiBase()) {
+    gate.value = 'setup'
+    return
+  }
   try {
-    authUser.value = await api.verifySession()
+    const user = await api.verifySession()
+    if (user) {
+      authUser.value = user
+      gate.value = 'app'
+      startApp()
+      return
+    }
   } catch {
     authUser.value = null
-  } finally {
-    sessionChecking.value = false
   }
-  if (authUser.value) startApp()
+  gate.value = 'auth'
 })
 onBeforeUnmount(() => {
   stopApp()
@@ -134,13 +147,19 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="sessionChecking" class="boot">
-    <div class="boot__card">正在检查登录会话…</div>
+  <div v-if="gate === 'boot'" class="boot">
+    <div class="boot__card">正在检查 API 连接与登录会话…</div>
   </div>
 
-  <LoginView v-else-if="!authUser" @success="onLoggedIn" />
+  <ConnectionSetup v-else-if="gate === 'setup'" @configured="onConfigured" />
 
-  <div v-else class="shell">
+  <LoginView
+    v-else-if="gate === 'auth'"
+    @success="onLoggedIn"
+    @reconfigure="gate = 'setup'"
+  />
+
+  <div v-else-if="gate === 'app' && authUser" class="shell">
     <SidebarNav :active="activeView" @select="activeView = $event as ViewKey" />
 
     <div class="main">
@@ -174,16 +193,6 @@ onBeforeUnmount(() => {
           <el-button size="small" type="danger" plain @click="logout">登出</el-button>
         </div>
       </header>
-
-      <el-alert
-        v-if="desktopNeedsConfig"
-        title="桌面模式：尚未配置 API 连接"
-        description="桌面安装版没有 Vite 代理，请到「设置 → 桌面连接」填写 API 地址与 API Key 后保存。"
-        type="warning"
-        show-icon
-        :closable="false"
-        style="margin-bottom: 12px"
-      />
 
       <el-alert
         v-if="store.error"

@@ -1,12 +1,17 @@
-/** Cloud API client (dev via Vite proxy -> http://127.0.0.1:8000).
- *  All responses use the unified envelope {data, error, request_id, timestamp}. */
+/** Cloud API client. All requests go to the configured API base
+ *  (qp.apiBase, set on the first-run ConnectionSetup page or in
+ *  Settings); responses use the unified envelope {data, error,
+ *  request_id, timestamp}. Dev and desktop share the same direct
+ *  connection path - no Vite proxy masking (R3 P1-01). */
 
 import {
   clearAuthToken,
-  getApiKey,
+  clearLoginApiKey,
   getAuthToken,
+  getLoginApiKey,
   getSessionUser,
   setAuthToken,
+  setLoginApiKey,
   setSessionUser,
 } from './secure-store'
 
@@ -508,24 +513,99 @@ export interface AuditLogRow {
   created_at: string
 }
 
-// Desktop production mode (Tauri) has no Vite dev proxy: allow configuring a
-// direct API base URL + key in the Settings panel, persisted in localStorage.
-// Dev mode leaves both empty -> relative paths + proxy-injected key (unchanged).
-function withBase(path: string): string {
-  const base = localStorage.getItem('qp.apiBase') ?? ''
-  return base ? `${base.replace(/\/+$/, '')}${path}` : path
+// API base configuration (R3 P1-01). The desktop shell (Tauri production)
+// has no Vite dev proxy: without an explicit base, requests hit the
+// webview origin and never reach the cloud API - the first-install login
+// deadlock. The base is configured on the first-run ConnectionSetup page
+// BEFORE the login gate, validated, and connectivity-tested. Dev mode
+// configures it too (direct connection) so dev and production share the
+// exact same request path - a proxy cannot mask a desktop bug again.
+// The base URL is not a secret: localStorage is fine.
+
+export function getApiBase(): string {
+  return (localStorage.getItem('qp.apiBase') ?? '').trim().replace(/\/+$/, '')
 }
 
-// P1-01 remediation: NO service-key fallback for desktop users. The only
-// accepted identities are the logged-in user's JWT (preferred) or a
-// PERSONAL API key (qpk_ prefix). The shared service key is a machine
-// lane (agent/EA) and never identifies a person: a non-qpk_ key is
-// simply not sent, so the backend answers 401 and the gate re-opens.
+export function setApiBase(value: string): void {
+  localStorage.setItem('qp.apiBase', value.trim().replace(/\/+$/, ''))
+}
+
+function withBase(path: string): string {
+  const base = getApiBase()
+  return base ? `${base}${path}` : path
+}
+
+/** Structural validation BEFORE any network attempt (R3 P1-01):
+ *  scheme http/https, non-empty host, port (if present) 1-65535, and no
+ *  path/query/fragment - the client appends /api/v1/... itself. */
+export function validateApiBase(value: string): { ok: boolean; error?: string } {
+  const raw = value.trim()
+  if (!raw) return { ok: false, error: 'API 地址不能为空' }
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return { ok: false, error: '格式无效：需以 http:// 或 https:// 开头' }
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { ok: false, error: '协议仅支持 http:// 或 https://' }
+  }
+  if (!url.hostname) return { ok: false, error: '主机名不能为空' }
+  if (url.port) {
+    const port = Number(url.port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return { ok: false, error: '端口必须在 1-65535 之间' }
+    }
+  }
+  if (url.pathname !== '/' && url.pathname !== '') {
+    return { ok: false, error: '地址不应包含路径（仅协议+主机+端口）' }
+  }
+  if (url.search || url.hash) return { ok: false, error: '地址不应包含查询参数' }
+  return { ok: true }
+}
+
+/** Connectivity probe: GET {base}/healthz - a public, credential-free
+ *  endpoint. 5s timeout. Throws a user-facing message on failure.
+ *  Persists nothing: callers save the base only after this passes. */
+export async function testApiBase(value: string): Promise<void> {
+  const check = validateApiBase(value)
+  if (!check.ok) throw new Error(check.error)
+  const base = value.trim().replace(/\/+$/, '')
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 5000)
+  try {
+    const res = await fetch(`${base}/healthz`, {
+      headers: { Accept: 'application/json' },
+      signal: ctrl.signal,
+    })
+    if (!res.ok) throw new Error(`API 响应异常：HTTP ${res.status}`)
+    const body = (await res.json().catch(() => null)) as ApiEnvelope<unknown> | null
+    if (!body || typeof body !== 'object' || !('data' in body)) {
+      throw new Error('目标不是 QuantPilot API（响应缺少统一结构）')
+    }
+  } catch (e) {
+    if (e instanceof Error && e.name === 'AbortError') {
+      throw new Error('连接超时（5 秒）：请确认 API 已启动且地址正确')
+    }
+    if (e instanceof TypeError) {
+      throw new Error('无法连接到 API：网络错误或地址不可达')
+    }
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// R3 P1-02: the only accepted identities are the logged-in user's JWT
+// (password login) or the personal qpk_ key entered ON THE LOGIN PAGE.
+// The retired R2 Settings-slot key is no longer a credential source, and
+// the shared service key is a machine lane that never identifies a
+// person - neither is ever sent here.
 function authHeaders(): Record<string, string> {
   const token = getAuthToken()
   if (token) return { Authorization: `Bearer ${token}` }
-  const key = getApiKey()
-  if (key.startsWith('qpk_')) return { 'X-API-Key': key }
+  const key = getLoginApiKey()
+  if (key) return { 'X-API-Key': key }
   return {}
 }
 
@@ -539,10 +619,12 @@ export function setAuthRequiredListener(fn: AuthRequiredListener | null): void {
   authRequiredListener = fn
 }
 
-// A 401 means the session is gone: clear the stored token and notify
+// A 401 means the session is gone: clear BOTH credential slots (the JWT
+// and the personal login key are mutually exclusive by design) and notify
 // the gate. There is no fallback identity to degrade into (P1-01).
 function dropSession(): void {
   void clearAuthToken().catch(() => {})
+  void clearLoginApiKey().catch(() => {})
   setSessionUser(null)
   authRequiredListener?.()
 }
@@ -636,9 +718,35 @@ export const api = {
       const message = body?.error?.message ?? '登录失败'
       throw new Error(`${code}: ${message}`)
     }
+    await clearLoginApiKey().catch(() => {})
     await setAuthToken(body.data.token)
     setSessionUser(body.data.user)
     return body.data.user
+  },
+  /** R3 P1-02: personal API key login. The key must be a qpk_ personal
+   *  key - a shared service key is a machine lane and is rejected here.
+   *  It is NOT a JWT and never masquerades as one: it lives in its own
+   *  credential slot and travels via X-API-Key; the backend resolves it
+   *  to its user (role, grants, revocation) on every request, so a
+   *  revoked key stops working immediately. */
+  loginWithApiKey: async (key: string): Promise<AuthUser> => {
+    const trimmed = key.trim()
+    if (!trimmed.startsWith('qpk_')) {
+      throw new Error('个人 API Key 必须以 qpk_ 开头；共享服务密钥不能用于登录')
+    }
+    // clear the JWT first: the backend ignores X-API-Key while an
+    // Authorization header is present, and a stale token must not leak
+    // into the new session
+    await clearAuthToken().catch(() => {})
+    await setLoginApiKey(trimmed)
+    try {
+      const me = await get<AuthUser>('/api/v1/auth/me')
+      setSessionUser(me)
+      return me
+    } catch (e) {
+      await clearLoginApiKey().catch(() => {})
+      throw e
+    }
   },
   logout: () => {
     dropSession()
@@ -646,11 +754,12 @@ export const api = {
   currentUser: (): AuthUser | null => {
     return getSessionUser()
   },
-  /** Reload-safe session restore: re-validate the stored token against
-   *  the backend (user still active, role current) instead of trusting
-   *  any cached copy. Returns null when there is no usable session. */
+  /** Reload-safe session restore: re-validate EITHER stored credential
+   *  (the JWT from password login, or the personal login key) against
+   *  the backend instead of trusting any cached copy. Returns null when
+   *  there is no usable session. */
   verifySession: async (): Promise<AuthUser | null> => {
-    if (!getAuthToken()) return null
+    if (!getAuthToken() && !getLoginApiKey()) return null
     try {
       const me = await get<AuthUser>('/api/v1/auth/me')
       setSessionUser(me)

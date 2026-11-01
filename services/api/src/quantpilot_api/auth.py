@@ -28,6 +28,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -37,6 +38,9 @@ from dataclasses import dataclass
 import bcrypt
 
 from . import db
+from .login_throttle import RedisLoginThrottle
+
+logger = logging.getLogger("quantpilot.auth")
 
 ROLES = ("ADMIN", "TRADER", "ANALYST", "VIEWER")
 USER_KEY_PREFIX = "qpk_"
@@ -262,12 +266,24 @@ def _dummy_verify(password: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# login rate limiting (P2-03): in-memory sliding window per (ip, username)
+# login rate limiting (R2 P2-03 + R3 P2-03): layered throttling.
+#
+# Local layer (always on): in-memory sliding window per (ip, username) AND
+# per ip alone - the pure-IP bucket catches password sprays that rotate
+# usernames. Shared layer (optional): RedisLoginThrottle via QP_REDIS_URL
+# so multiple API instances count failures together and restarts do not
+# clear attack counters. Redis outages degrade to memory-only limiting
+# (loud, time-boxed) instead of failing logins or letting them through.
 # --------------------------------------------------------------------------
 
 _LOGIN_MAX_FAILURES = int(os.environ.get("QP_LOGIN_MAX_FAILURES", "10"))
 _LOGIN_WINDOW_SECONDS = int(os.environ.get("QP_LOGIN_WINDOW_SECONDS", "900"))
+_LOGIN_IP_MAX_FAILURES = int(
+    os.environ.get("QP_LOGIN_IP_MAX_FAILURES", str(_LOGIN_MAX_FAILURES * 5))
+)
 _login_failures: dict[str, list[float]] = {}
+_login_failures_ip: dict[str, list[float]] = {}
+_shared_throttle: RedisLoginThrottle | None = None
 
 
 def _login_bucket(username: str, remote_ip: str) -> str:
@@ -284,19 +300,74 @@ def _prune_bucket(bucket: str, now: float) -> list[float]:
     return stamps
 
 
+def _prune_ip_bucket(ip: str, now: float) -> list[float]:
+    stamps = [
+        t
+        for t in _login_failures_ip.get(ip, [])
+        if now - t < _LOGIN_WINDOW_SECONDS
+    ]
+    _login_failures_ip[ip] = stamps
+    return stamps
+
+
+def _throttle() -> RedisLoginThrottle | None:
+    """Shared Redis layer, lazily built from QP_REDIS_URL (R3 P2-03).
+
+    Rebuilt when the URL or the limits change so tests can point the env
+    around without restarting the process; an unbuildable client logs a
+    warning and leaves limiting memory-only (never an exception on the
+    login path)."""
+    global _shared_throttle
+    url = os.environ.get("QP_REDIS_URL", "")
+    if not url:
+        _shared_throttle = None
+        return None
+    current = _shared_throttle
+    if (
+        current is not None
+        and current.url == url
+        and current._max == _LOGIN_MAX_FAILURES
+        and current._ip_max == _LOGIN_IP_MAX_FAILURES
+        and current._window == _LOGIN_WINDOW_SECONDS
+    ):
+        return current
+    try:
+        current = RedisLoginThrottle(
+            url, _LOGIN_MAX_FAILURES, _LOGIN_IP_MAX_FAILURES, _LOGIN_WINDOW_SECONDS
+        )
+    except Exception:  # noqa: BLE001 - bad URL/config must not break login
+        logger.exception("cannot build Redis login throttle; memory-only limiting")
+        current = None
+    _shared_throttle = current
+    return current
+
+
 def login_too_many_attempts(username: str, remote_ip: str) -> bool:
-    bucket = _login_bucket(username, remote_ip)
-    return len(_prune_bucket(bucket, time.time())) >= _LOGIN_MAX_FAILURES
+    if len(_prune_bucket(_login_bucket(username, remote_ip), time.time())) >= _LOGIN_MAX_FAILURES:
+        return True
+    if len(_prune_ip_bucket(remote_ip, time.time())) >= _LOGIN_IP_MAX_FAILURES:
+        return True
+    shared = _throttle()
+    return shared is not None and shared.too_many_attempts(username, remote_ip)
 
 
 def record_login_failure(username: str, remote_ip: str) -> None:
     bucket = _login_bucket(username, remote_ip)
     _prune_bucket(bucket, time.time())
     _login_failures.setdefault(bucket, []).append(time.time())
+    _login_failures_ip.setdefault(remote_ip, []).append(time.time())
+    shared = _throttle()
+    if shared is not None:
+        shared.record_failure(username, remote_ip)
 
 
 def clear_login_failures(username: str, remote_ip: str) -> None:
     _login_failures.pop(_login_bucket(username, remote_ip), None)
+    # the pure-IP bucket is deliberately NOT cleared by a success: it
+    # counts spray patterns across usernames and ages out via the window
+    shared = _throttle()
+    if shared is not None:
+        shared.clear_failures(username, remote_ip)
 
 
 def verify_login(username: str, password: str) -> dict | None:

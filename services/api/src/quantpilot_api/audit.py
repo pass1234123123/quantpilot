@@ -44,15 +44,20 @@ def record(
     object_type: str,
     object_id: str | None = None,
     payload: dict[str, Any] | None = None,
+    actor: str | None = None,
 ) -> None:
     """Append one audit row; NEVER raises (auditing must not break the
-    audited operation - failures are logged loudly instead)."""
+    audited operation - failures are logged loudly instead).
+
+    actor: the authenticated principal's username (R3 P2-02 - the caller
+    cannot forge it; it comes from request.state.principal). Machine-lane
+    callers leave it None and fall back to the module default."""
     try:
         db.execute(
             _INSERT,
             (
                 account_id,
-                ACTOR,
+                actor if actor else ACTOR,
                 action,
                 object_type,
                 object_id,

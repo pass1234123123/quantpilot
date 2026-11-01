@@ -531,8 +531,11 @@ def node_heartbeat(body: NodeHeartbeatRequest, request: Request) -> JSONResponse
 
 @app.get("/api/v1/nodes")
 def list_nodes(request: Request) -> JSONResponse:
-    rows = db.query(
-        """
+    """R3 P2-01: ADMIN sees every node; other named users only nodes that
+    carry at least one of their granted accounts. Nodes without any granted
+    account are infrastructure data they have no business seeing."""
+    principal = getattr(request.state, "principal", None)
+    base = """
         SELECT n.id::text AS node_id, n.device_id, n.hostname, n.os_info,
                n.agent_version, n.status, n.last_seen_at, n.version,
                (SELECT count(*) FROM mt5_terminals t WHERE t.node_id = n.id) AS terminals,
@@ -540,24 +543,51 @@ def list_nodes(request: Request) -> JSONResponse:
                   JOIN mt5_terminals t2 ON a.terminal_id = t2.id
                  WHERE t2.node_id = n.id) AS accounts
           FROM trading_nodes n
+    """
+    if principal is not None and principal.kind == "user" and not principal.is_admin:
+        rows = db.query(
+            base
+            + """
+         WHERE EXISTS (SELECT 1
+                         FROM trading_accounts a
+                         JOIN mt5_terminals t2 ON a.terminal_id = t2.id
+                         JOIN user_account_grants g ON g.account_id = a.id
+                        WHERE t2.node_id = n.id AND g.user_id = %s)
          ORDER BY n.created_at
-        """
-    )
+            """,
+            (principal.user_id,),
+        )
+    else:
+        rows = db.query(base + " ORDER BY n.created_at")
     return ok(db.jsonable(rows), request)
 
 
 @app.get("/api/v1/terminals")
 def list_terminals(request: Request) -> JSONResponse:
-    rows = db.query(
-        """
+    """R3 P2-01: ADMIN sees every terminal; other named users only
+    terminals that carry at least one of their granted accounts."""
+    principal = getattr(request.state, "principal", None)
+    base = """
         SELECT t.id::text AS terminal_id, t.node_id::text AS node_id, n.device_id,
                t.terminal_path_hash, t.terminal_build, t.terminal_company,
                t.server, t.status, t.last_seen_at
           FROM mt5_terminals t
           JOIN trading_nodes n ON n.id = t.node_id
+    """
+    if principal is not None and principal.kind == "user" and not principal.is_admin:
+        rows = db.query(
+            base
+            + """
+         WHERE EXISTS (SELECT 1
+                         FROM trading_accounts a
+                         JOIN user_account_grants g ON g.account_id = a.id
+                        WHERE a.terminal_id = t.id AND g.user_id = %s)
          ORDER BY t.created_at
-        """
-    )
+            """,
+            (principal.user_id,),
+        )
+    else:
+        rows = db.query(base + " ORDER BY t.created_at")
     return ok(db.jsonable(rows), request)
 
 
@@ -889,20 +919,37 @@ def account_calendar(account_id: str, request: Request, hours: int = 48) -> JSON
 
 @app.get("/api/v1/events")
 def list_system_events(request: Request, limit: int = 100, severity: str | None = None) -> JSONResponse:
-    """System event feed, newest-first. Optional severity filter (INFO/WARN/ERROR)."""
+    """System event feed, newest-first. Optional severity filter
+    (INFO/WARN/ERROR).
+
+    R3 P2-01: ADMIN sees everything. Other named users see only events tied
+    to one of their granted accounts (system_events.account_id). Events
+    that cannot be tied to an account (auth/login activity, node
+    lifecycle, pipeline errors) are global observation data: ADMIN-only,
+    deny-by-default. No query parameter can widen this - the filter is
+    derived from the authenticated principal, never from the request."""
     limit = max(1, min(limit, 500))
     base = """
         SELECT e.id::text AS event_id, e.source, e.event_type, e.severity,
                e.payload, e.occurred_at
           FROM system_events e
     """
-    if severity is None:
-        rows = db.query(base + " ORDER BY e.occurred_at DESC LIMIT %s", (limit,))
-    else:
-        rows = db.query(
-            base + " WHERE e.severity = %s ORDER BY e.occurred_at DESC LIMIT %s",
-            (severity, limit),
+    principal = getattr(request.state, "principal", None)
+    params: list = []
+    clauses: list[str] = []
+    if principal is not None and principal.kind == "user" and not principal.is_admin:
+        clauses.append(
+            "e.account_id IN (SELECT account_id FROM user_account_grants WHERE user_id = %s)"
         )
+        params.append(principal.user_id)
+    if severity is not None:
+        clauses.append("e.severity = %s")
+        params.append(severity)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.query(
+        base + where + " ORDER BY e.occurred_at DESC LIMIT %s",
+        (*params, limit),
+    )
     return ok(db.jsonable(rows), request)
 
 
@@ -1394,7 +1441,6 @@ class RiskStopRequest(BaseModel):
         default=None,
         description="target 9.5 breaker state; default STOP_NEW_RISK",
     )
-    updated_by: str = Field(default="api", max_length=64)
 
     @model_validator(mode="after")
     def _scope_matches_account(self) -> "RiskStopRequest":
@@ -1490,9 +1536,13 @@ def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
     through POST /api/v1/risk/resume (LOCKED needs confirm_locked there).
     scope=ACCOUNT is grant-checked, scope=GLOBAL is ADMIN-only (P1-02):
     a GLOBAL breaker stops every account, which is never a per-user action.
-    Broadcast to the EA/agent is a later slice; the cloud gate reads this
-    state on every new-risk command."""
+    R3 P2-02: the operator identity is ALWAYS the authenticated principal
+    (risk_states.updated_by, the system event and the audit row all use
+    it). The request body cannot forge it - the field is rejected outright
+    (extra="forbid"). Broadcast to the EA/agent is a later slice; the cloud
+    gate reads this state on every new-risk command."""
     p = request.state.principal
+    updated_by = p.username  # R3 P2-02: server-side identity, never the body
     account_uuid: UUID | None = None
     if body.scope == "ACCOUNT":
         account_uuid = _account_or_404(str(body.account_id))
@@ -1525,7 +1575,7 @@ def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
                           updated_at = now(),
                           version = risk_states.version + 1
             """,
-            (body.scope, account_uuid, status, body.reason, body.updated_by),
+            (body.scope, account_uuid, status, body.reason, updated_by),
         )
     writers.add_system_event(
         source="api",
@@ -1536,9 +1586,18 @@ def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
             "account_id": str(account_uuid) if account_uuid else None,
             "status": status,
             "reason": body.reason,
-            "updated_by": body.updated_by,
+            "updated_by": updated_by,
         },
     )
+    if account_uuid is not None:
+        audit.record(
+            account_uuid,
+            "RISK_STOP",
+            "risk_state",
+            str(account_uuid),
+            {"scope": body.scope, "status": status, "reason": body.reason},
+            actor=updated_by,
+        )
     row = _stop_row(body.scope, account_uuid)
     assert row is not None
     return ok(_state_payload(row, body.scope, str(account_uuid) if account_uuid else None), request)
@@ -1547,8 +1606,11 @@ def risk_stop(body: RiskStopRequest, request: Request) -> JSONResponse:
 @app.post("/api/v1/risk/resume")
 def risk_resume(body: RiskResumeRequest, request: Request) -> JSONResponse:
     """Return to NORMAL. LOCKED requires confirm_locked=true (PRD 9.5).
-    scope=ACCOUNT is grant-checked, scope=GLOBAL is ADMIN-only (P1-02)."""
+    scope=ACCOUNT is grant-checked, scope=GLOBAL is ADMIN-only (P1-02).
+    R3 P2-02: the operator identity is the authenticated principal - the
+    request body cannot supply or forge updated_by."""
     p = request.state.principal
+    updated_by = p.username  # R3 P2-02: server-side identity, never the body
     account_uuid: UUID | None = None
     if body.scope == "ACCOUNT":
         account_uuid = _account_or_404(str(body.account_id))
@@ -1574,7 +1636,7 @@ def risk_resume(body: RiskResumeRequest, request: Request) -> JSONResponse:
                        updated_at = now(), version = version + 1
                  WHERE scope = 'GLOBAL' AND account_id IS NULL
                 """,
-                (body.updated_by,),
+                (updated_by,),
             )
         else:
             connection.execute(
@@ -1584,7 +1646,7 @@ def risk_resume(body: RiskResumeRequest, request: Request) -> JSONResponse:
                        updated_at = now(), version = version + 1
                  WHERE scope = 'ACCOUNT' AND account_id = %s
                 """,
-                (body.updated_by, account_uuid),
+                (updated_by, account_uuid),
             )
     writers.add_system_event(
         source="api",
@@ -1593,10 +1655,19 @@ def risk_resume(body: RiskResumeRequest, request: Request) -> JSONResponse:
         payload={
             "scope": body.scope,
             "account_id": str(account_uuid) if account_uuid else None,
-            "updated_by": body.updated_by,
+            "updated_by": updated_by,
             "detail": "resumed to NORMAL; new-risk commands pass the gate again",
         },
     )
+    if account_uuid is not None:
+        audit.record(
+            account_uuid,
+            "RISK_RESUME",
+            "risk_state",
+            str(account_uuid),
+            {"scope": body.scope, "from_status": row["status"]},
+            actor=updated_by,
+        )
     row = _stop_row(body.scope, account_uuid)
     assert row is not None
     return ok(_state_payload(row, body.scope, str(account_uuid) if account_uuid else None), request)

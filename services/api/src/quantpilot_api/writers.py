@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -24,6 +25,32 @@ from quantpilot_contracts.constants import EA_RUN_MODES
 logger = logging.getLogger("quantpilot.writers")
 
 EVENT_COL = ("registered", "heartbeat", "symbols", "shutdown")
+
+_UUID_TEXT_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _event_account_id(account_id: Any, payload: dict[str, Any]) -> UUID | None:
+    """Resolve the account a system event belongs to (R3 P2-01).
+
+    Explicit account_id wins; otherwise the payload's account_id is used
+    when it is a well-formed UUID. Anything else means "no account" ->
+    NULL -> global event, visible to ADMIN only (deny-by-default).
+    """
+    value = account_id if account_id is not None else payload.get("account_id")
+    if value is None:
+        return None
+    if isinstance(value, UUID):
+        return value
+    text = str(value)
+    if not _UUID_TEXT_RE.match(text):
+        return None
+    try:
+        return UUID(text)
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _dec(value: Any) -> Decimal | None:
@@ -229,14 +256,29 @@ def check_identity_mismatch(terminal_id: str, new_login_ref: str) -> None:
 # event handlers
 # --------------------------------------------------------------------------
 
-def add_system_event(source: str, event_type: str, severity: str, payload: dict[str, Any]) -> None:
+def add_system_event(
+    source: str,
+    event_type: str,
+    severity: str,
+    payload: dict[str, Any],
+    account_id: Any = None,
+) -> None:
+    """Insert one system event row.
+
+    R3 P2-01: the row carries the account it belongs to (explicit
+    account_id arg wins; else a well-formed payload account_id is used) so
+    GET /api/v1/events can scope non-admin reads to granted accounts.
+    Events with no account stay NULL = global, ADMIN-only.
+    """
+    resolved = _event_account_id(account_id, payload)
     with db.conn() as connection:
         connection.execute(
             """
-            INSERT INTO system_events (source, event_type, severity, payload, occurred_at)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO system_events (source, event_type, severity, payload,
+                                       account_id, occurred_at)
+            VALUES (%s, %s, %s, %s, %s, now())
             """,
-            (source, event_type, severity, json.dumps(payload, default=str)),
+            (source, event_type, severity, json.dumps(payload, default=str), resolved),
         )
 
 
