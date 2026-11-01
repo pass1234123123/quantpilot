@@ -22,9 +22,12 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # R3.3: remediation branches must run the pipeline BEFORE they can
+    # be merged to master - a push event uses the workflow file from
+    # the pushed branch, so hardening work verifies its own guards
+    branches: [master, "r3.*"]
   pull_request:
-    branches: [master]
+    branches: [master, "r3.*"]
   workflow_dispatch:
 
 permissions:

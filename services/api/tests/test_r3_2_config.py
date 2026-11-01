@@ -148,7 +148,7 @@ class ThrottleConfigGateTests(unittest.TestCase):
         )
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaises(LoginThrottleUnavailable):
-                self.auth.login_too_many_attempts("nina", "1.2.3.4")
+                self.auth.reserve_login_attempt("nina", "1.2.3.4")
 
     def test_6_dead_redis_boots_but_rejects_logins(self) -> None:
         # Redis being down is NOT a config error: the API starts, but
@@ -162,7 +162,7 @@ class ThrottleConfigGateTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.auth.validate_login_throttle_config()  # boot OK
             with self.assertRaises(LoginThrottleUnavailable):
-                self.auth.login_too_many_attempts("olga", "5.6.7.8")
+                self.auth.reserve_login_attempt("olga", "5.6.7.8")
 
 
 class OutageRecoveryTests(unittest.TestCase):
@@ -199,19 +199,19 @@ class OutageRecoveryTests(unittest.TestCase):
             patch.dict(os.environ, self._required_env(), clear=True),
             _fake_redis_env(server),
         ):
-            self.assertFalse(self.auth.login_too_many_attempts("paul", "9.9.9.9"))
+            self.assertIsNotNone(self.auth.reserve_login_attempt("paul", "9.9.9.9"))
             # Redis "drops": every command now fails
             throttle = self.auth._throttle()
             with patch.object(
-                throttle._client,
-                "get",
+                throttle,
+                "_reserve_script",
                 side_effect=redis_lib.exceptions.ConnectionError("down"),
             ):
                 with self.assertRaises(LoginThrottleUnavailable):
-                    self.auth.login_too_many_attempts("paul", "9.9.9.9")
+                    self.auth.reserve_login_attempt("paul", "9.9.9.9")
             # stand-down window: still refusing, never degrading
             with self.assertRaises(LoginThrottleUnavailable):
-                self.auth.login_too_many_attempts("paul", "9.9.9.9")
+                self.auth.reserve_login_attempt("paul", "9.9.9.9")
 
     def test_8_recovery_resumes_shared_counting(self) -> None:
         from quantpilot_api.auth import LoginThrottleUnavailable
@@ -223,23 +223,23 @@ class OutageRecoveryTests(unittest.TestCase):
             _fake_redis_env(server),
         ):
             for _ in range(3):
-                self.auth.record_login_failure("tina", "3.3.3.3")
-            # fresh in-process state: only the SHARED counter remains
+                self.assertIsNotNone(self.auth.reserve_login_attempt("tina", "3.3.3.3"))
+            # fresh in-process state: only the SHARED budget remains
             self.auth._login_failures.clear()
             self.auth._login_failures_ip.clear()
             throttle = self.auth._throttle()
             # outage -> 503 (twice: error + stand-down window)
             with patch.object(
-                throttle._client,
-                "get",
+                throttle,
+                "_reserve_script",
                 side_effect=redis_lib.exceptions.ConnectionError("down"),
             ):
                 with self.assertRaises(LoginThrottleUnavailable):
-                    self.auth.login_too_many_attempts("tina", "3.3.3.3")
-            self.assertIsNone(throttle.too_many_attempts("tina", "3.3.3.3"))
+                    self.auth.reserve_login_attempt("tina", "3.3.3.3")
+            self.assertIsNone(throttle.reserve("tina", "3.3.3.3", "probe"))
             # window over -> "recovered": the SHARED verdict returns
             throttle._degraded_until = 0.0
-            self.assertTrue(self.auth.login_too_many_attempts("tina", "3.3.3.3"))
+            self.assertIsNone(self.auth.reserve_login_attempt("tina", "3.3.3.3"))
 
 
 class LifespanGateWiringTests(unittest.TestCase):

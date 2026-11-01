@@ -1,4 +1,4 @@
-"""R3.2 P2: real-Redis multi-process login-throttle verification.
+"""R3.3 P1-02: real-Redis multi-process login-throttle verification.
 
 Spawns ONE real redis-server plus TWO independent API processes
 (uvicorn, different ports) in redis_required mode and verifies the six
@@ -11,10 +11,34 @@ mandated behaviors over real HTTP:
     (fail-closed; no silent degradation to per-instance counting)
   4 after Redis recovers both instances resume shared counting
     automatically (the 60 s stand-down window expires, no restart needed)
-  5 concurrent login attempts cannot bypass the limit (atomic Lua
-    INCR+EXPIRE: every recorded failure is counted exactly once)
+  5 concurrent login attempts cannot bypass the limit (R3.3 P1-01:
+    120 concurrent wrong-password requests -> the password check runs
+    EXACTLY max times; the R3.2 check-then-increment race let 17 run
+    past a limit of 10) plus crashed-reservation reclaim via the
+    sliding-window trim
   6 a correct login clears ONLY the (ip, username) pair bucket; the
-    pure-IP spray bucket survives
+    pure-IP spray bucket keeps every recorded failure
+
+Data-safety hardening (R3.3 P1-02) - the R3.2 version of this script
+could destroy data of a Redis it did not own (a foreign server already
+listening on the test port: the script connected to it, FLUSHDB'd it
+and SHUTDOWN'd it). Now:
+
+  * port preflight: if the target port is already serving ANY listener
+    the script aborts BEFORE sending a single command
+  * exclusive ephemeral port by default (--redis-port 0 picks a free
+    port), so the default path cannot collide at all
+  * ownership proof: the server must accept OUR generated password AND
+    refuse an unauthenticated PING (NOAUTH). A foreign unprotected
+    server fails the second check
+  * the child process must still be alive after boot (a port conflict
+    makes redis-server exit immediately; the R3.2 version missed that
+    and kept talking to whoever owned the port)
+  * the freshly started server must be EMPTY (dbsize == 0)
+  * no FLUSHDB / FLUSHALL anywhere: only the qp:login:* namespace this
+    suite creates is deleted (SCAN + DEL)
+  * teardown only terminates the process WE spawned - never a
+    redis-cli SHUTDOWN that could hit someone else's server
 
 This is NOT a pytest test: it drives real processes over HTTP and needs
 the dev PostgreSQL tunnel (every login writes a system_events row).
@@ -34,6 +58,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +83,12 @@ RESULTS: list[tuple[str, bool]] = []
 PAIR_KEY = "qp:login:pair:{ip}|{username}"
 IP_KEY = "qp:login:ip:{ip}"
 CLIENT_IP = "127.0.0.1"  # both API processes see the loopback client
+NAMESPACE = "qp:login:*"
+# pinned to the API's defaults so the assertions below are exact; the
+# API processes get these values forced into their environment
+PAIR_MAX = 10
+IP_MAX = 50
+WINDOW_SECONDS = 900
 
 
 def log(message: str) -> None:
@@ -99,30 +131,38 @@ def wait_http_healthy(port: int, timeout: float = 60.0) -> bool:
     return False
 
 
-def wait_redis_up(port: int, timeout: float = 15.0) -> bool:
-    # protocol=2: redis-py defaults to the RESP3 handshake (HELLO 3) which
-    # real Redis 5.x rejects; the test server is tporadowski 5.0.14.1
-    client = redis_lib.Redis(host="127.0.0.1", port=port, socket_connect_timeout=0.5, protocol=2)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if client.ping():
-                return True
-        except Exception:
-            pass
-        time.sleep(0.3)
-    return False
+# ------------------------------------------------------- port safety (P1-02)
 
 
-def wait_redis_down(port: int, timeout: float = 10.0) -> bool:
-    # protocol=2: redis-py defaults to the RESP3 handshake (HELLO 3) which
-    # real Redis 5.x rejects; the test server is tporadowski 5.0.14.1
-    client = redis_lib.Redis(host="127.0.0.1", port=port, socket_connect_timeout=0.5, protocol=2)
+def port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def assert_port_free(port: int, what: str) -> None:
+    """Abort BEFORE sending a single command if the port is taken. The
+    R3.2 version skipped this: a foreign Redis on the port meant the
+    script happily FLUSHDB'd and SHUTDOWN'd someone else's server."""
+    if port_in_use(port):
+        raise RuntimeError(
+            f"port {port} is already serving another listener - refusing to "
+            f"run the {what} test against a service this script did not "
+            f"create (R3.3 P1-02: no connection, no cleanup, no shutdown)"
+        )
+
+
+def pick_free_port() -> int:
+    """An exclusive ephemeral port the OS guarantees free right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def wait_port_down(port: int, timeout: float = 10.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            client.ping()
-        except Exception:
+        if not port_in_use(port):
             return True
         time.sleep(0.3)
     return False
@@ -131,12 +171,24 @@ def wait_redis_down(port: int, timeout: float = 10.0) -> bool:
 # ---------------------------------------------------------------- process mgmt
 
 
-def redis_start(redis_dir: Path, port: int, log_handle) -> subprocess.Popen:
+def redis_start(redis_dir: Path, port: int, password: str, log_handle) -> subprocess.Popen:
+    """Start OUR Redis and PROVE the port answers to it (R3.3 P1-02):
+
+    1. the port must be free before we spawn anything
+    2. the child must still be alive after boot (a port conflict makes
+       redis-server exit immediately)
+    3. our generated password must authenticate
+    4. an unauthenticated PING must be refused (NOAUTH) - a foreign
+       unprotected server would answer PING instead
+    5. the fresh instance must be EMPTY (dbsize == 0)
+    """
+    assert_port_free(port, "redis")
     proc = subprocess.Popen(
         [
             str(redis_dir / "redis-server.exe"),
             "--port", str(port),
             "--bind", "127.0.0.1",
+            "--requirepass", password,
             "--save", "",
             "--appendonly", "no",
         ],
@@ -144,27 +196,88 @@ def redis_start(redis_dir: Path, port: int, log_handle) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         cwd=str(redis_dir),
     )
-    if not wait_redis_up(port):
-        raise RuntimeError(f"redis-server did not come up on :{port}")
+    # ownership check 1: alive (a lost port race makes it exit at once)
+    time.sleep(1.0)
+    if proc.poll() is not None:
+        raise RuntimeError(
+            f"redis-server exited immediately with code {proc.returncode} "
+            f"(port {port} conflict?) - the test server never came up"
+        )
+    # ownership checks 2+3: our password works, a stranger's PING doesn't
+    authed = redis_lib.Redis(
+        host="127.0.0.1", port=port, password=password,
+        socket_connect_timeout=0.5, protocol=2,
+    )
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("redis-server died during startup")
+        try:
+            if authed.ping():
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+    else:
+        raise RuntimeError(f"redis-server did not answer authenticated PING on :{port}")
+    stranger = redis_lib.Redis(
+        host="127.0.0.1", port=port,
+        socket_connect_timeout=0.5, protocol=2,
+    )
+    try:
+        stranger.ping()
+        raise RuntimeError(
+            "server answered an UNAUTHENTICATED ping - this is not the "
+            "password-protected instance this script spawned; aborting"
+        )
+    except redis_lib.exceptions.AuthenticationError:
+        pass  # expected: NOAUTH proves requirepass is armed
+    if authed.dbsize() != 0:
+        raise RuntimeError(
+            "freshly started redis-server is not empty - refusing to run "
+            "against a database holding foreign keys"
+        )
     return proc
 
 
-def redis_stop(redis_dir: Path, port: int) -> None:
-    subprocess.run(
-        [str(redis_dir / "redis-cli.exe"), "-p", str(port), "shutdown", "nosave"],
-        capture_output=True,
-        timeout=10,
-    )
-    if not wait_redis_down(port):
+def redis_stop(proc: subprocess.Popen, port: int) -> None:
+    """Only the process WE spawned is terminated (R3.3 P1-02). The R3.2
+    version sent `redis-cli shutdown nosave` to whatever owned the port -
+    if that was a foreign server it got killed."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+    if not wait_port_down(port):
         raise RuntimeError(f"redis-server on :{port} did not stop")
 
 
-def api_start(port: int, redis_port: int, log_handle) -> subprocess.Popen:
+def clear_login_namespace(redis: redis_lib.Redis) -> int:
+    """Delete ONLY the qp:login:* keys this suite creates (R3.3 P1-02).
+    The R3.2 version called FLUSHDB, which wipes every key of whatever
+    database the connection points at - including keys this test never
+    owned."""
+    keys = list(redis.scan_iter(match=NAMESPACE, count=100))
+    if keys:
+        redis.delete(*keys)
+    return len(keys)
+
+
+def api_start(port: int, redis_port: int, redis_password: str, log_handle) -> subprocess.Popen:
     env = dict(os.environ)
     env.update(
         {
             "QP_LOGIN_THROTTLE_MODE": "redis_required",
-            "QP_LOGIN_THROTTLE_REDIS_URL": f"redis://127.0.0.1:{redis_port}/0",
+            "QP_LOGIN_THROTTLE_REDIS_URL": (
+                f"redis://:{redis_password}@127.0.0.1:{redis_port}/0"
+            ),
+            # pin the limits so the exact-count assertions below hold
+            "QP_LOGIN_MAX_FAILURES": str(PAIR_MAX),
+            "QP_LOGIN_IP_MAX_FAILURES": str(IP_MAX),
+            "QP_LOGIN_WINDOW_SECONDS": str(WINDOW_SECONDS),
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -223,7 +336,7 @@ def ensure_test_user(username: str, password: str) -> None:
 def test_1_shared_counts(redis: redis_lib.Redis, port_a: int, port_b: int) -> None:
     log("--- test 1: instance A's counts are visible to instance B ---")
     user = "shareduser"
-    statuses = [login(port_a, user, "wrong-password") for _ in range(10)]
+    statuses = [login(port_a, user, "wrong-password") for _ in range(PAIR_MAX)]
     ok_401 = all(s == (401, "INVALID_CREDENTIALS") for s in statuses)
     check("1a ten failed logins via A all 401", ok_401, str(statuses[-1]))
 
@@ -233,17 +346,18 @@ def test_1_shared_counts(redis: redis_lib.Redis, port_a: int, port_b: int) -> No
         status_a == (429, "TOO_MANY_ATTEMPTS"),
         str(status_a),
     )
-    # B's in-process buckets are EMPTY: only the shared Redis counter can block
+    # B's in-process buckets are EMPTY: only the shared Redis budget can block
     status_b = login(port_b, user, "wrong-password")
     check(
         "1c instance B sees A's counts (429)",
         status_b == (429, "TOO_MANY_ATTEMPTS"),
         str(status_b),
     )
-    pair = redis.get(PAIR_KEY.format(ip=CLIENT_IP, username=user))
-    check("1d shared pair counter == 10", pair is not None and int(pair) == 10, str(pair))
-    ttl = redis.ttl(PAIR_KEY.format(ip=CLIENT_IP, username=user))
-    check("1e pair counter has TTL (atomic INCR+EXPIRE)", ttl > 0, f"ttl={ttl}")
+    pair_key = PAIR_KEY.format(ip=CLIENT_IP, username=user)
+    zcard = redis.zcard(pair_key)
+    check("1d shared pair zset == 10 (atomic reservations)", zcard == PAIR_MAX, f"zcard={zcard}")
+    ttl = redis.ttl(pair_key)
+    check("1e pair zset has TTL (crash-leak backstop)", ttl > 0, f"ttl={ttl}")
 
 
 def test_3_outage_503(port_a: int, port_b: int) -> None:
@@ -257,7 +371,7 @@ def test_3_outage_503(port_a: int, port_b: int) -> None:
         )
 
 
-def test_4_recovery(port_a: int, port_b: int, standdown_wait: float) -> None:
+def test_4_recovery(redis: redis_lib.Redis, port_a: int, port_b: int, standdown_wait: float) -> None:
     log("--- test 4: Redis recovers -> shared counting resumes automatically ---")
     status = login(port_a, "recoveruser", "wrong-password")
     check(
@@ -267,7 +381,7 @@ def test_4_recovery(port_a: int, port_b: int, standdown_wait: float) -> None:
     )
     log(f"waiting {standdown_wait:.0f}s for the stand-down window to expire ...")
     time.sleep(standdown_wait)
-    statuses = [login(port_a, "recoveruser", "wrong-password") for _ in range(10)]
+    statuses = [login(port_a, "recoveruser", "wrong-password") for _ in range(PAIR_MAX)]
     check(
         "4b ten failed logins via A all 401 after recovery",
         all(s == (401, "INVALID_CREDENTIALS") for s in statuses),
@@ -279,49 +393,104 @@ def test_4_recovery(port_a: int, port_b: int, standdown_wait: float) -> None:
         status_b == (429, "TOO_MANY_ATTEMPTS"),
         str(status_b),
     )
+    zcard = redis.zcard(PAIR_KEY.format(ip=CLIENT_IP, username="recoveruser"))
+    check("4d shared pair zset == 10 after recovery", zcard == PAIR_MAX, f"zcard={zcard}")
 
 
 def test_5_concurrency(redis: redis_lib.Redis, port_a: int, port_b: int) -> None:
-    log("--- test 5: concurrent attempts cannot bypass the limit ---")
+    log("--- test 5: 120 concurrent attempts cannot bypass the limit ---")
     user = "wronguser"
-    redis.flushdb()
+    cleared = clear_login_namespace(redis)
+    log(f"cleared {cleared} qp:login:* keys from earlier tests")
 
     def one(port: int) -> tuple[int, str]:
         return login(port, user, "wrong-password")
 
-    with ThreadPoolExecutor(max_workers=30) as pool:
-        futures = [pool.submit(one, p) for p in (port_a, port_b) for _ in range(15)]
+    # R3.3 P1-01 acceptance: two independent API processes, MORE than
+    # 100 concurrent wrong-password requests
+    total = 120
+    with ThreadPoolExecutor(max_workers=40) as pool:
+        futures = [pool.submit(one, p) for p in (port_a, port_b) for _ in range(total // 2)]
         results = [f.result() for f in futures]
 
     n_401 = sum(1 for s in results if s[0] == 401)
     n_429 = sum(1 for s in results if s[0] == 429)
-    check("5a every concurrent attempt got 401 or 429", n_401 + n_429 == 30, f"401={n_401} 429={n_429}")
-    check("5b threshold reached (>= 10 recorded failures)", n_401 >= 10, f"401={n_401}")
-
-    pair_key = PAIR_KEY.format(ip=CLIENT_IP, username=user)
-    shared_count = int(redis.get(pair_key) or 0)
+    others = [s for s in results if s[0] not in (401, 429)]
     check(
-        "5c atomic Lua: every recorded failure counted EXACTLY once",
-        shared_count == n_401,
-        f"redis={shared_count} recorded={n_401}",
+        "5a every concurrent attempt got 401 or 429",
+        n_401 + n_429 == total and not others,
+        f"401={n_401} 429={n_429} other={others[:2]}",
     )
-    ttl = redis.ttl(pair_key)
-    check("5d counter TTL always set (no orphaned counters)", ttl > 0, f"ttl={ttl}")
-
-    for name, port in (("A", port_a), ("B", port_b)):
-        status = login(port, user, "wrong-password")
-        check(
-            f"5e instance {name} still blocked after the burst (429)",
-            status == (429, "TOO_MANY_ATTEMPTS"),
-            str(status),
-        )
+    # the R3.2 race let 17 password verifications run past a limit of
+    # 10; the atomic reservation must run the check EXACTLY max times
+    check(
+        "5b password verifications EXACTLY at the limit (no race)",
+        n_401 == PAIR_MAX,
+        f"401={n_401} (limit={PAIR_MAX})",
+    )
+    check(
+        "5c everything else refused 429",
+        n_429 == total - PAIR_MAX,
+        f"429={n_429}",
+    )
+    pair_key = PAIR_KEY.format(ip=CLIENT_IP, username=user)
+    ip_key = IP_KEY.format(ip=CLIENT_IP)
+    zc_pair = redis.zcard(pair_key)
+    check(
+        "5d shared pair zset == limit (atomic reservation)",
+        zc_pair == PAIR_MAX,
+        f"zcard={zc_pair}",
+    )
+    zc_ip = redis.zcard(ip_key)
+    check(
+        "5e shared ip zset == accepted attempts",
+        zc_ip == PAIR_MAX,
+        f"zcard={zc_ip}",
+    )
+    # P1-01 leak handling, on an ISOLATED user: burst user's local-layer
+    # buckets inside instance A are also full (A's requests reached the
+    # shared layer first and won the whole budget), so the leak test uses
+    # a fresh username whose LOCAL buckets are empty in both processes -
+    # only the shared layer decides. Ten in-window reservations are
+    # planted (as if ten attempts just happened; one of them "leaked"
+    # when a process crashed mid-verification - the zset cannot tell
+    # them apart, which is exactly the point):
+    leak_user = "leakuser"
+    leak_pair = PAIR_KEY.format(ip=CLIENT_IP, username=leak_user)
+    now_ms = int(time.time() * 1000)
+    redis.zadd(leak_pair, {f"leak-att-{i}": now_ms for i in range(PAIR_MAX)})
+    status = login(port_a, leak_user, "wrong-password")
+    check(
+        "5f in-window reservations (incl. a leaked one) block login (429)",
+        status == (429, "TOO_MANY_ATTEMPTS"),
+        str(status),
+    )
+    # simulate 15 minutes passing: every reservation - leaked ones
+    # included - slides out of the window together, so leaked quota is
+    # reclaimed by the window trim and never permanently lost
+    aged = now_ms - WINDOW_SECONDS * 1000 - 1000
+    for member in redis.zrange(leak_pair, 0, -1):
+        redis.zadd(leak_pair, {member: aged})
+    status = login(port_a, leak_user, "wrong-password")
+    check(
+        "5g aged-out reservations reclaimed by window trim (401)",
+        status == (401, "INVALID_CREDENTIALS"),
+        str(status),
+    )
+    zc_after = redis.zcard(leak_pair)
+    check(
+        "5h zset rebuilt from one fresh attempt (no permanent loss)",
+        zc_after == 1,
+        f"zcard={zc_after}",
+    )
 
 
 def test_6_success_clears_pair_only(
     redis: redis_lib.Redis, port_a: int, port_b: int, username: str, password: str
 ) -> None:
     log("--- test 6: correct login clears ONLY the pair bucket ---")
-    redis.flushdb()
+    cleared = clear_login_namespace(redis)
+    log(f"cleared {cleared} qp:login:* keys from earlier tests")
     pair_key = PAIR_KEY.format(ip=CLIENT_IP, username=username)
     ip_key = IP_KEY.format(ip=CLIENT_IP)
 
@@ -329,16 +498,18 @@ def test_6_success_clears_pair_only(
         login(port_a, username, "wrong-password")  # r32test failures
     for _ in range(2):
         login(port_a, "sprayuser", "wrong-password")  # same-IP spray
-    before_ip = int(redis.get(ip_key) or 0)
-    check("6a setup: ip spray bucket holds 5 failures", before_ip == 5, f"ip={before_ip}")
+    before_ip = redis.zcard(ip_key)
+    check("6a setup: ip spray zset holds 5 failures", before_ip == 5, f"ip={before_ip}")
 
     status, _ = login(port_a, username, password)
     check("6b correct password login succeeds (200)", status == 200, f"status={status}")
 
-    pair_value = redis.get(pair_key)
-    check("6c pair bucket (ip, username) cleared", pair_value is None, str(pair_value))
-    after_ip = int(redis.get(ip_key) or 0)
-    check("6d ip spray bucket retained after success", after_ip == 5, f"ip={after_ip}")
+    zc_pair = redis.zcard(pair_key)
+    check("6c pair bucket (ip, username) cleared", zc_pair == 0, f"zcard={zc_pair}")
+    after_ip = redis.zcard(ip_key)
+    # the successful attempt released ONLY its own spray slot; the five
+    # recorded failures (3 + 2) stay counted
+    check("6d ip spray zset retained after success", after_ip == 5, f"ip={after_ip}")
 
     status, code = login(port_b, username, "wrong-password")
     check(
@@ -360,12 +531,18 @@ def main() -> int:
         ),
         help="folder holding redis-server.exe / redis-cli.exe",
     )
-    parser.add_argument("--redis-port", type=int, default=6399)
+    parser.add_argument(
+        "--redis-port",
+        type=int,
+        default=0,
+        help="exclusive port for the test redis-server (default 0 = pick "
+        "a free ephemeral port; a busy port aborts the run)",
+    )
     parser.add_argument("--port-a", type=int, default=8101)
     parser.add_argument("--port-b", type=int, default=8102)
     parser.add_argument("--user", default="r32test")
     parser.add_argument("--password", default="R32-Test-Pass!9")
-    parser.add_argument("--log-dir", default=str(ROOT / "artifacts" / "r3.2"))
+    parser.add_argument("--log-dir", default=str(ROOT / "artifacts" / "r3.3"))
     parser.add_argument("--standdown-wait", type=float, default=65.0)
     args = parser.parse_args()
 
@@ -373,8 +550,16 @@ def main() -> int:
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # R3.3 P1-02: a random per-run password proves the server on the
+    # port is OURS (and arms the NOAUTH ownership check)
+    redis_password = secrets.token_hex(16)
+    redis_port = args.redis_port or pick_free_port()
+
     # protocol=2 (RESP2): required against the real Redis 5.x test server
-    redis = redis_lib.Redis(host="127.0.0.1", port=args.redis_port, decode_responses=True, protocol=2)
+    redis = redis_lib.Redis(
+        host="127.0.0.1", port=redis_port, password=redis_password,
+        decode_responses=True, protocol=2,
+    )
     proc_redis = None
     proc_a: subprocess.Popen | None = None
     proc_b: subprocess.Popen | None = None
@@ -391,6 +576,25 @@ def main() -> int:
         for exe in ("redis-server.exe", "redis-cli.exe"):
             if not check(f"preflight: {exe} present", (redis_dir / exe).exists(), str(redis_dir)):
                 return 2
+        # port safety FIRST (R3.3 P1-02): it needs no external services,
+        # and a busy port must abort the run before ANYTHING is started
+        # or connected - the port-conflict acceptance test depends on
+        # this running ahead of the PostgreSQL preflight
+        if args.redis_port:
+            # explicit port: must be free RIGHT NOW, or abort without
+            # sending a single command to whoever owns it
+            try:
+                assert_port_free(args.redis_port, "redis")
+            except RuntimeError as exc:
+                check("preflight: requested redis port free", False, str(exc))
+                return 2
+            check("preflight: requested redis port free", True, f"port={args.redis_port}")
+        else:
+            check(
+                "preflight: exclusive ephemeral redis port picked",
+                True,
+                f"port={redis_port}",
+            )
         try:
             with psycopg.connect(os.environ["QP_PG_DSN"], connect_timeout=5) as conn:
                 conn.execute("SELECT 1")
@@ -407,14 +611,20 @@ def main() -> int:
         api_a_log = open(log_dir / "uvicorn-a.log", "ab")
         api_b_log = open(log_dir / "uvicorn-b.log", "ab")
 
-        log(f"starting redis-server on 127.0.0.1:{args.redis_port} (real binary)")
-        proc_redis = redis_start(redis_dir, args.redis_port, redis_log)
+        log(
+            f"starting redis-server on 127.0.0.1:{redis_port} "
+            f"(real binary, password-protected, ownership-checked)"
+        )
+        proc_redis = redis_start(redis_dir, redis_port, redis_password, redis_log)
         log(f"starting API instance A on 127.0.0.1:{args.port_a} (redis_required)")
-        proc_a = api_start(args.port_a, args.redis_port, api_a_log)
+        proc_a = api_start(args.port_a, redis_port, redis_password, api_a_log)
         log(f"starting API instance B on 127.0.0.1:{args.port_b} (redis_required)")
-        proc_b = api_start(args.port_b, args.redis_port, api_b_log)
-        check("boot: real redis + two independent API processes up", True,
-              f"redis:{args.redis_port} A:{args.port_a} B:{args.port_b}")
+        proc_b = api_start(args.port_b, redis_port, redis_password, api_b_log)
+        check(
+            "boot: real redis + two independent API processes up",
+            True,
+            f"redis:{redis_port} A:{args.port_a} B:{args.port_b}",
+        )
 
         # ---- 1: shared counting ----------------------------------------
         test_1_shared_counts(redis, args.port_a, args.port_b)
@@ -422,7 +632,7 @@ def main() -> int:
         # ---- 2: counts survive an instance-A restart -------------------
         log("--- test 2: counts survive an instance A restart ---")
         stop_proc(proc_a, "API instance A")
-        proc_a = api_start(args.port_a, args.redis_port, api_a_log)
+        proc_a = api_start(args.port_a, redis_port, redis_password, api_a_log)
         status = login(args.port_a, "shareduser", "wrong-password")
         check(
             "2 restarted instance A still blocked by the shared counter (429)",
@@ -431,14 +641,14 @@ def main() -> int:
         )
 
         # ---- 3: outage -> both instances 503 ---------------------------
-        log("stopping redis-server (shutdown nosave)")
-        redis_stop(redis_dir, args.redis_port)
+        log("stopping redis-server (terminate - only the process WE spawned)")
+        redis_stop(proc_redis, redis_port)
         test_3_outage_503(args.port_a, args.port_b)
 
         # ---- 4: recovery -> shared counting resumes --------------------
-        log("restarting redis-server")
-        proc_redis = redis_start(redis_dir, args.redis_port, redis_log)
-        test_4_recovery(args.port_a, args.port_b, args.standdown_wait)
+        log("restarting redis-server (fresh password-verified instance)")
+        proc_redis = redis_start(redis_dir, redis_port, redis_password, redis_log)
+        test_4_recovery(redis, args.port_a, args.port_b, args.standdown_wait)
 
         # ---- 5: concurrency -------------------------------------------
         test_5_concurrency(redis, args.port_a, args.port_b)
@@ -454,7 +664,8 @@ def main() -> int:
         stop_proc(proc_b, "API instance B")
         if proc_redis is not None and proc_redis.poll() is None:
             try:
-                redis_stop(redis_dir, args.redis_port)
+                # terminate OUR child only - never a broadcast shutdown
+                redis_stop(proc_redis, redis_port)
             except Exception as exc:  # noqa: BLE001 - best effort cleanup
                 log(f"redis stop failed during teardown: {exc}")
         passed = sum(1 for _, ok in RESULTS if ok)

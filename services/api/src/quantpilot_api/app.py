@@ -242,12 +242,22 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
     attempt, success or failure, lands in system_events. The token embeds
     the user's token_version so any later bump (password reset, role
     change, disable) supersedes it immediately.
+
+    R3.3 P1-01: the throttle slot is spent ATOMICALLY before the slow
+    bcrypt check (auth.reserve_login_attempt checks both limits and
+    records the attempt in one step, in every active layer). The
+    password verdict only decides what happens to the reservation:
+    wrong password keeps it (it IS the failure record), a correct
+    password settles it (pair bucket cleared, own spray slot returned),
+    an aborted verification releases it (not a failure). A concurrent
+    burst can therefore never slip more attempts past the limit than
+    the configured thresholds allow.
     """
     if not os.environ.get("QP_JWT_SECRET", ""):
         return err(503, "JWT_NOT_CONFIGURED", "set QP_JWT_SECRET before issuing tokens")
     remote_ip = request.client.host if request.client else "unknown"
     try:
-        throttled = auth.login_too_many_attempts(body.username, remote_ip)
+        reservation = auth.reserve_login_attempt(body.username, remote_ip)
     except auth.LoginThrottleUnavailable:
         # redis_required mode + Redis down (R3.1 P1): fail closed - a 503
         # beats silently degrading to per-instance counters an attacker
@@ -263,19 +273,29 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
             "LOGIN_THROTTLE_UNAVAILABLE",
             "login throttling is required but unavailable; retry shortly",
         )
-    if throttled:
+    if reservation is None:
+        # refused attempts reserve nothing, so a 429 can never extend
+        # the lockout (R3.3 P1-01)
         writers.add_system_event(
             "api", "auth.login_rate_limited", "WARN", {"username": body.username}
         )
         return err(429, "TOO_MANY_ATTEMPTS", "too many failed login attempts; retry later")
-    user = auth.verify_login(body.username, body.password)
+    try:
+        user = auth.verify_login(body.username, body.password)
+    except Exception:
+        # verification aborted (DB down, client gone): NOT a failure -
+        # both layers give the slot back (R3.3 P1-01)
+        auth.release_login_reservation(reservation)
+        raise
     if user is None:
-        auth.record_login_failure(body.username, remote_ip)
+        # wrong password: the reservation IS the failure record in every
+        # active layer - it was already spent atomically, so there is
+        # no separate increment step left to race with (R3.3 P1-01)
         writers.add_system_event(
             "api", "auth.login_failed", "WARN", {"username": body.username}
         )
         return err(401, "INVALID_CREDENTIALS", "invalid username or password")
-    auth.clear_login_failures(body.username, remote_ip)
+    auth.settle_login_success(reservation)
     token = auth.issue_token(
         user["id"],
         user["username"],
