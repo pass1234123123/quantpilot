@@ -185,22 +185,60 @@ class R31SecurityHardeningTests(unittest.TestCase):
         self.assertIn("QP_LOGIN_THROTTLE_MODE", env_example)
         self.assertIn("QP_LOGIN_THROTTLE_REDIS_URL", env_example)
 
-    def test_failure_recording_is_one_atomic_script(self):
+    def test_attempt_reservation_is_one_atomic_script(self):
         throttle = (
             Path(__file__).resolve().parents[1]
             / "src"
             / "quantpilot_api"
             / "login_throttle.py"
         ).read_text(encoding="utf-8")
-        # R3.1 P1 #7: INCR + EXPIRE land as ONE Lua call - no interleaving
-        # writer can observe a counter without its TTL
-        self.assertIn("_RECORD_LUA", throttle)
-        self.assertIn("redis.call('INCR', KEYS[1])", throttle)
-        self.assertIn("redis.call('EXPIRE', KEYS[1], ARGV[1])", throttle)
+        # R3.3 P1-01: the limit check and the slot spend are ONE Lua
+        # call (trim + ZCARD check + ZADD). The R3.2 acceptance caught
+        # the old design checking first and incrementing only after the
+        # slow bcrypt check - 17 concurrent verifications slipped past a
+        # limit of 10.
+        self.assertIn("_RESERVE_LUA", throttle)
+        self.assertIn("ZREMRANGEBYSCORE", throttle)
+        # R3.3.1: a reservation starts PENDING - the pair member carries
+        # the "p:" state prefix so a later success can tell in-flight
+        # reservations apart from committed failure records
+        self.assertIn(
+            "redis.call('ZADD', KEYS[1], now, 'p:' .. ARGV[3])", throttle
+        )
+        # a blocked verdict must add nothing (no partial spend)
+        self.assertIn("return 0", throttle)
+        # R3.3 P2-01: true sliding window - each attempt ages out via its
+        # own score, never a whole-bucket TTL refresh per failure
+        self.assertNotIn("redis.call('INCR'", throttle)
+        self.assertNotIn("redis.call('EXPIRE'", throttle)
+        # R3.3.1: a wrong password COMMITS its own reservation with one
+        # atomic rename p:{id} -> f:{id}, score preserved (attempt-time
+        # window anchor), idempotent
+        self.assertIn("_COMMIT_LUA", throttle)
+        self.assertIn("local score = redis.call('ZSCORE', KEYS[1], pending)", throttle)
+        self.assertIn("redis.call('ZADD', KEYS[1], score, failed)", throttle)
+        # R3.3.1: a success must NEVER delete whole keys - the old
+        # pipe.delete(pair_key) destroyed other concurrently verifying
+        # requests' reservations, so their later failures vanished
+        # (the R3.3 acceptance race). The settle is one atomic script
+        # that removes ONLY committed "f:" members plus the attempt's
+        # OWN pending member and its own spray slot.
+        self.assertIn("_SETTLE_SUCCESS_LUA", throttle)
+        self.assertNotIn("pipe.delete(pair_key)", throttle)
+        self.assertNotIn("redis.call('DEL'", throttle)
+        self.assertIn("string.sub(members[i], 1, 2) == 'f:'", throttle)
+        # R3.3 P1-01: a success/release gives back its OWN spray slot,
+        # never the whole ip bucket
+        self.assertIn("pipe.zrem(ip_key, attempt_id)", throttle)
+        # R3.3.1: an abort returns only its OWN pending member
+        self.assertIn('pipe.zrem(pair_key, f"p:{attempt_id}")', throttle)
         # R3.1 P1 #9: hostile oversized inputs cannot bloat Redis keys
         self.assertIn("_KEY_PART_MAX", throttle)
         # R3.1 P1 #4: redis_required mode refuses instead of degrading
         self.assertIn("class LoginThrottleUnavailable", throttle)
+        # R3.3.1: a failure that cannot be recorded in the shared budget
+        # fails CLOSED (raises) - a dropped record under-counts
+        self.assertIn("def commit_failure", throttle)
 
 
 if __name__ == "__main__":

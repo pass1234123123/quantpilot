@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 
@@ -266,13 +267,27 @@ def _dummy_verify(password: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# login rate limiting (R2 P2-03 + R3 P2-03 + R3.1 P1): layered throttling.
+# login rate limiting (R2 P2-03 + R3 P2-03 + R3.1 P1 / R3.3 P1-01 + P2-01):
+# layered throttling with ATOMIC attempt reservations.
 #
 # Local layer (always on): in-memory sliding window per (ip, username) AND
 # per ip alone - the pure-IP bucket catches password sprays that rotate
 # usernames. Shared layer: RedisLoginThrottle via
-# QP_LOGIN_THROTTLE_REDIS_URL so multiple API instances count failures
-# together and restarts do not clear attack counters.
+# QP_LOGIN_THROTTLE_REDIS_URL so multiple API instances share one budget
+# and restarts do not clear attack counters.
+#
+# R3.3 P1-01: the R3.2 flow checked first ("too many attempts?") and only
+# recorded the failure AFTER the slow bcrypt check - N concurrent requests
+# all read "under the limit" and all proceeded (the acceptance measured
+# 17 verifications past a limit of 10). Both layers now spend the slot
+# atomically UP FRONT (reserve), and the password verdict only decides
+# what happens to the reservation:
+#     wrong password   the reservation IS the failure record (kept)
+#     correct password the pair bucket is cleared and only this
+#                      attempt's spray slot is released
+#     aborted verify   the reservation is released - not a failure
+# Crashed processes leak at most their in-flight reservations, which
+# the sliding-window trim reclaims (bounded leak, no permanent loss).
 #
 # QP_LOGIN_THROTTLE_MODE (R3.1, one name everywhere; R3.2 makes parsing
 # STRICT - an unknown value is a config error that fails the boot, never
@@ -293,12 +308,35 @@ _LOGIN_WINDOW_SECONDS = int(os.environ.get("QP_LOGIN_WINDOW_SECONDS", "900"))
 _LOGIN_IP_MAX_FAILURES = int(
     os.environ.get("QP_LOGIN_IP_MAX_FAILURES", str(_LOGIN_MAX_FAILURES * 5))
 )
-_login_failures: dict[str, list[float]] = {}
-_login_failures_ip: dict[str, list[float]] = {}
+# each pair entry is (timestamp, attempt_id, state) with state "p"
+# (pending: still verifying) or "f" (committed failure) - the id lets a
+# success or an abort remove EXACTLY its own reservation, and the state
+# lets a success clear ONLY completed failures, never another in-flight
+# request's pending slot (R3.3 P1-01 + R3.3.1). The ip bucket needs no
+# state: nothing ever bulk-deletes from it.
+_login_failures: dict[str, list[tuple[float, str, str]]] = {}
+_login_failures_ip: dict[str, list[tuple[float, str]]] = {}
+# sync login endpoints run on FastAPI's thread pool; the reserve below is
+# check-then-append, so it needs the same atomicity the Lua script gives
+# the shared layer (R3.3 P1-01)
+_login_lock = threading.Lock()
 _shared_throttle: RedisLoginThrottle | None = None
 _warned_memory_only = False
 
 _THROTTLE_MODES = ("memory_only", "redis_required")
+
+
+@dataclass(frozen=True)
+class LoginReservation:
+    """One atomically spent login-attempt slot (R3.3 P1-01).
+
+    Carries everything the settle/release paths need, so the caller
+    never has to re-derive the buckets."""
+
+    username: str
+    remote_ip: str
+    attempt_id: str
+    shared: bool  # the Redis layer holds a slot for this attempt too
 
 
 class LoginThrottleConfigError(RuntimeError):
@@ -313,24 +351,45 @@ def _login_bucket(username: str, remote_ip: str) -> str:
     return f"{remote_ip}|{username.strip().lower()}"
 
 
-def _prune_bucket(bucket: str, now: float) -> list[float]:
+def _prune_bucket(bucket: str, now: float) -> list[tuple[float, str, str]]:
+    """Drop entries older than the window (pendings and committed
+    failures alike - both occupy the budget while in-window). Called
+    under _login_lock, so the trim+count+append in reserve_login_attempt
+    is atomic for the local layer exactly the way the Lua script is
+    for the shared one."""
     stamps = [
-        t
-        for t in _login_failures.get(bucket, [])
+        (t, a, s)
+        for (t, a, s) in _login_failures.get(bucket, [])
         if now - t < _LOGIN_WINDOW_SECONDS
     ]
     _login_failures[bucket] = stamps
     return stamps
 
 
-def _prune_ip_bucket(ip: str, now: float) -> list[float]:
+def _prune_ip_bucket(ip: str, now: float) -> list[tuple[float, str]]:
     stamps = [
-        t
-        for t in _login_failures_ip.get(ip, [])
+        (t, a)
+        for (t, a) in _login_failures_ip.get(ip, [])
         if now - t < _LOGIN_WINDOW_SECONDS
     ]
     _login_failures_ip[ip] = stamps
     return stamps
+
+
+def _release_local_slot(bucket: str, remote_ip: str, attempt_id: str) -> None:
+    """Give one reservation's slot back in both local buckets (an
+    aborted verification, or the shared layer refusing the attempt).
+    R3.3.1: only THIS attempt_id is removed - never another request's
+    pending or committed entry."""
+    with _login_lock:
+        _login_failures[bucket] = [
+            (t, a, s)
+            for (t, a, s) in _login_failures.get(bucket, [])
+            if a != attempt_id
+        ]
+        _login_failures_ip[remote_ip] = [
+            (t, a) for (t, a) in _login_failures_ip.get(remote_ip, []) if a != attempt_id
+        ]
 
 
 def _throttle_mode() -> str:
@@ -391,7 +450,7 @@ def validate_login_throttle_config() -> None:
 def _throttle() -> RedisLoginThrottle | None:
     """Shared Redis layer, lazily built from QP_LOGIN_THROTTLE_REDIS_URL
     (R3 P2-03 / R3.1 P1). Returns None when shared counting is off or
-    unbuildable; login_too_many_attempts decides what None means per mode.
+    unbuildable; reserve_login_attempt decides what None means per mode.
 
     Rebuilt when the URL or the limits change so tests can point the env
     around without restarting the process."""
@@ -430,56 +489,147 @@ def _throttle() -> RedisLoginThrottle | None:
         current = RedisLoginThrottle(
             url, _LOGIN_MAX_FAILURES, _LOGIN_IP_MAX_FAILURES, _LOGIN_WINDOW_SECONDS
         )
-    except Exception:  # noqa: BLE001 - login_too_many_attempts turns this into 503
+    except Exception:  # noqa: BLE001 - reserve_login_attempt turns this into 503
         logger.exception("cannot build Redis login throttle (redis_required mode)")
         current = None
     _shared_throttle = current
     return current
 
 
-def login_too_many_attempts(username: str, remote_ip: str) -> bool:
-    """True = throttled, False = allowed. Raises LoginThrottleUnavailable
-    when redis_required mode cannot consult the shared counter (R3.1 P1):
-    rejecting the attempt (503 in app.py) is strictly safer than letting
-    each instance count on its own while an attacker spreads requests."""
-    if len(_prune_bucket(_login_bucket(username, remote_ip), time.time())) >= _LOGIN_MAX_FAILURES:
-        return True
-    if len(_prune_ip_bucket(remote_ip, time.time())) >= _LOGIN_IP_MAX_FAILURES:
-        return True
+def reserve_login_attempt(username: str, remote_ip: str) -> LoginReservation | None:
+    """Atomically check BOTH limits and spend one attempt slot in both
+    dimensions (R3.3 P1-01).
+
+    Returns:
+      LoginReservation - the slot is spent; the caller must settle or
+                         release it after the password check
+      None              - a limit is reached -> 429; NOTHING was spent,
+                         so refusals can never extend the lockout
+    Raises LoginThrottleUnavailable when redis_required mode cannot reach
+    the shared budget (R3.1 P1): rejecting the attempt (503 in app.py)
+    is strictly safer than letting each instance count on its own while
+    an attacker spreads requests. The local slot is always given back
+    before raising or refusing, so no path leaks a spent-but-unused
+    slot into the local buckets."""
+    attempt_id = secrets.token_hex(16)
+    bucket = _login_bucket(username, remote_ip)
+    with _login_lock:
+        now = time.time()
+        pair = _prune_bucket(bucket, now)
+        ip = _prune_ip_bucket(remote_ip, now)
+        if len(pair) >= _LOGIN_MAX_FAILURES or len(ip) >= _LOGIN_IP_MAX_FAILURES:
+            # local budget already spent: no reservation anywhere
+            return None
+        # the pair entry starts PENDING ("p"): it becomes a committed
+        # failure ("f") only when the password verdict says so (R3.3.1)
+        _login_failures.setdefault(bucket, []).append((now, attempt_id, "p"))
+        _login_failures_ip.setdefault(remote_ip, []).append((now, attempt_id))
     shared = _throttle()
     if shared is None:
         if _throttle_mode() == "redis_required":
+            _release_local_slot(bucket, remote_ip, attempt_id)
             raise LoginThrottleUnavailable(
                 "redis_required: shared login throttle not available"
             )
-        return False
-    verdict = shared.too_many_attempts(username, remote_ip)
+        return LoginReservation(username, remote_ip, attempt_id, shared=False)
+    verdict = shared.reserve(username, remote_ip, attempt_id)
     if verdict is None:
-        if _throttle_mode() == "redis_required":
-            raise LoginThrottleUnavailable(
-                "redis_required: Redis unreachable, refusing to degrade"
+        _release_local_slot(bucket, remote_ip, attempt_id)
+        # _throttle() only returns an instance in redis_required mode,
+        # so "unavailable" always means: fail closed (503)
+        raise LoginThrottleUnavailable(
+            "redis_required: Redis unreachable, refusing to degrade"
+        )
+    if verdict is False:
+        # the shared budget is spent; the optimistic local slot goes back
+        _release_local_slot(bucket, remote_ip, attempt_id)
+        return None
+    return LoginReservation(username, remote_ip, attempt_id, shared=True)
+
+
+def settle_login_success(reservation: LoginReservation) -> None:
+    """A correct password (R3.3 P1-01 lifecycle, R3.3.1 refinement):
+    the pair bucket's COMMITTED failures are cleared - the user just
+    authenticated, so the pair is not under attack - and ONLY this
+    attempt's own pending entry + spray slot are removed. Other
+    requests' still-verifying pendings SURVIVE (R3.3.1: the old
+    whole-bucket clear also deleted concurrent requests' reservations,
+    so a failure completing after this success was never recorded).
+    Other users' spray failures stay untouched in every case."""
+    bucket = _login_bucket(reservation.username, reservation.remote_ip)
+    own = reservation.attempt_id
+    with _login_lock:
+        _login_failures[bucket] = [
+            (t, a, s)
+            for (t, a, s) in _login_failures.get(bucket, [])
+            if s == "p" and a != own
+        ]
+        _login_failures_ip[reservation.remote_ip] = [
+            (t, a)
+            for (t, a) in _login_failures_ip.get(reservation.remote_ip, [])
+            if a != own
+        ]
+    if reservation.shared:
+        shared = _throttle()
+        if shared is not None:
+            shared.settle_success(
+                reservation.username, reservation.remote_ip, reservation.attempt_id
             )
-        return False
-    return verdict
 
 
-def record_login_failure(username: str, remote_ip: str) -> None:
-    bucket = _login_bucket(username, remote_ip)
-    _prune_bucket(bucket, time.time())
-    _login_failures.setdefault(bucket, []).append(time.time())
-    _login_failures_ip.setdefault(remote_ip, []).append(time.time())
+def settle_login_failure(reservation: LoginReservation) -> None:
+    """A wrong password (R3.3.1): the PENDING reservation is COMMITTED
+    as a failure record in every active layer - locally the entry's
+    state flips "p" -> "f" (timestamp unchanged: the window anchors at
+    attempt time), and in the shared layer one atomic Lua call renames
+    "p:{id}" -> "f:{id}" with the score preserved.
+
+    Fail-closed: in redis_required mode an unrecordable failure RAISES
+    LoginThrottleUnavailable (app.py answers 503). A dropped failure
+    record under-counts the shared budget - the attacker-favourable
+    direction - so it must never be swallowed. The local record is
+    written first and stays even when the shared commit raises, so the
+    failing instance itself stays strictly throttled."""
+    bucket = _login_bucket(reservation.username, reservation.remote_ip)
+    own = reservation.attempt_id
+    with _login_lock:
+        _login_failures[bucket] = [
+            (t, a, "f") if (a == own and s == "p") else (t, a, s)
+            for (t, a, s) in _login_failures.get(bucket, [])
+        ]
+    if not reservation.shared:
+        return  # memory_only: the local flip above IS the record
     shared = _throttle()
-    if shared is not None:
-        shared.record_failure(username, remote_ip)
+    if shared is None:
+        # redis_required + the shared layer vanished between reserve and
+        # commit: the failure cannot be recorded where other instances
+        # would see it - fail closed rather than under-count silently
+        raise LoginThrottleUnavailable(
+            "redis_required: cannot record the failed login "
+            "(shared budget unreachable mid-verification)"
+        )
+    shared.commit_failure(
+        reservation.username, reservation.remote_ip, reservation.attempt_id
+    )
 
 
-def clear_login_failures(username: str, remote_ip: str) -> None:
-    _login_failures.pop(_login_bucket(username, remote_ip), None)
-    # the pure-IP bucket is deliberately NOT cleared by a success: it
-    # counts spray patterns across usernames and ages out via the window
-    shared = _throttle()
-    if shared is not None:
-        shared.clear_failures(username, remote_ip)
+def release_login_reservation(reservation: LoginReservation) -> None:
+    """An aborted verification (timeout, crash, client gone) is NOT a
+    failure (R3.3 P1-01): the slot is returned in both dimensions.
+    Best effort on the shared side - if Redis is down the slot ages out
+    through the sliding-window trim, so quota is never permanently
+    lost."""
+    _release_local_slot(
+        _login_bucket(reservation.username, reservation.remote_ip),
+        reservation.remote_ip,
+        reservation.attempt_id,
+    )
+    if reservation.shared:
+        shared = _throttle()
+        if shared is not None:
+            shared.release(
+                reservation.username, reservation.remote_ip, reservation.attempt_id
+            )
 
 
 def verify_login(username: str, password: str) -> dict | None:

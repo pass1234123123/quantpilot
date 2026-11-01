@@ -242,12 +242,29 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
     attempt, success or failure, lands in system_events. The token embeds
     the user's token_version so any later bump (password reset, role
     change, disable) supersedes it immediately.
+
+    R3.3 P1-01 + R3.3.1: the throttle slot is spent ATOMICALLY before
+    the slow bcrypt check (auth.reserve_login_attempt checks both limits
+    and records a PENDING reservation in one step, in every active
+    layer). The password verdict then decides what happens to THAT
+    reservation ONLY:
+      wrong password  -> settle_login_failure COMMITS it as a failure
+                         record ("p" -> "f"; a success never wipes
+                         another request's in-flight pending anymore)
+      correct password -> settle_login_success clears the pair's
+                         committed failure history and removes only its
+                         own pending + spray slot
+      aborted verify -> release_login_reservation returns only its own
+                         slot (not a failure)
+    A concurrent burst can therefore never slip more attempts past the
+    limit than the configured thresholds allow, and a success racing a
+    failure can no longer make that failure vanish (R3.3.1).
     """
     if not os.environ.get("QP_JWT_SECRET", ""):
         return err(503, "JWT_NOT_CONFIGURED", "set QP_JWT_SECRET before issuing tokens")
     remote_ip = request.client.host if request.client else "unknown"
     try:
-        throttled = auth.login_too_many_attempts(body.username, remote_ip)
+        reservation = auth.reserve_login_attempt(body.username, remote_ip)
     except auth.LoginThrottleUnavailable:
         # redis_required mode + Redis down (R3.1 P1): fail closed - a 503
         # beats silently degrading to per-instance counters an attacker
@@ -263,19 +280,45 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
             "LOGIN_THROTTLE_UNAVAILABLE",
             "login throttling is required but unavailable; retry shortly",
         )
-    if throttled:
+    if reservation is None:
+        # refused attempts reserve nothing, so a 429 can never extend
+        # the lockout (R3.3 P1-01)
         writers.add_system_event(
             "api", "auth.login_rate_limited", "WARN", {"username": body.username}
         )
         return err(429, "TOO_MANY_ATTEMPTS", "too many failed login attempts; retry later")
-    user = auth.verify_login(body.username, body.password)
+    try:
+        user = auth.verify_login(body.username, body.password)
+    except Exception:
+        # verification aborted (DB down, client gone): NOT a failure -
+        # both layers give the slot back (R3.3 P1-01)
+        auth.release_login_reservation(reservation)
+        raise
     if user is None:
-        auth.record_login_failure(body.username, remote_ip)
+        # wrong password: the pending reservation is COMMITTED as a
+        # failure record in every active layer ("p" -> "f", R3.3.1).
+        # A commit that cannot reach Redis is answered fail-closed: a
+        # dropped failure record would under-count the shared budget -
+        # the attacker-favourable direction - so 503 beats 401 here
+        try:
+            auth.settle_login_failure(reservation)
+        except auth.LoginThrottleUnavailable:
+            writers.add_system_event(
+                "api",
+                "auth.login_throttle_unavailable",
+                "ERROR",
+                {"username": body.username},
+            )
+            return err(
+                503,
+                "LOGIN_THROTTLE_UNAVAILABLE",
+                "login throttling is required but unavailable; retry shortly",
+            )
         writers.add_system_event(
             "api", "auth.login_failed", "WARN", {"username": body.username}
         )
         return err(401, "INVALID_CREDENTIALS", "invalid username or password")
-    auth.clear_login_failures(body.username, remote_ip)
+    auth.settle_login_success(reservation)
     token = auth.issue_token(
         user["id"],
         user["username"],
