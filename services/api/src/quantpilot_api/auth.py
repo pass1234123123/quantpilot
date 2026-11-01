@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import bcrypt
 
 from . import db
-from .login_throttle import RedisLoginThrottle
+from .login_throttle import LoginThrottleUnavailable, RedisLoginThrottle
 
 logger = logging.getLogger("quantpilot.auth")
 
@@ -266,14 +266,22 @@ def _dummy_verify(password: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# login rate limiting (R2 P2-03 + R3 P2-03): layered throttling.
+# login rate limiting (R2 P2-03 + R3 P2-03 + R3.1 P1): layered throttling.
 #
 # Local layer (always on): in-memory sliding window per (ip, username) AND
 # per ip alone - the pure-IP bucket catches password sprays that rotate
-# usernames. Shared layer (optional): RedisLoginThrottle via QP_REDIS_URL
-# so multiple API instances count failures together and restarts do not
-# clear attack counters. Redis outages degrade to memory-only limiting
-# (loud, time-boxed) instead of failing logins or letting them through.
+# usernames. Shared layer: RedisLoginThrottle via
+# QP_LOGIN_THROTTLE_REDIS_URL so multiple API instances count failures
+# together and restarts do not clear attack counters.
+#
+# QP_LOGIN_THROTTLE_MODE (R3.1, one name everywhere; the R3-era ad-hoc
+# redis key is gone):
+#   memory_only    default; the URL is IGNORED (one loud warning) and the
+#                  in-process buckets stay authoritative
+#   redis_required multi-instance deployments; when Redis is unreachable the
+#                  login path raises LoginThrottleUnavailable and app.py
+#                  answers 503 - NEVER a silent fallback to per-instance
+#                  counters, which an attacker could shard requests around
 # --------------------------------------------------------------------------
 
 _LOGIN_MAX_FAILURES = int(os.environ.get("QP_LOGIN_MAX_FAILURES", "10"))
@@ -284,6 +292,7 @@ _LOGIN_IP_MAX_FAILURES = int(
 _login_failures: dict[str, list[float]] = {}
 _login_failures_ip: dict[str, list[float]] = {}
 _shared_throttle: RedisLoginThrottle | None = None
+_warned_memory_only = False
 
 
 def _login_bucket(username: str, remote_ip: str) -> str:
@@ -310,16 +319,41 @@ def _prune_ip_bucket(ip: str, now: float) -> list[float]:
     return stamps
 
 
+def _throttle_mode() -> str:
+    """QP_LOGIN_THROTTLE_MODE, normalized to the two supported values
+    (R3.1 P1). Unknown values fall back to memory_only - the local layer
+    still limits, and the fallback is logged by _throttle()."""
+    mode = os.environ.get("QP_LOGIN_THROTTLE_MODE", "memory_only").strip().lower()
+    return mode if mode in ("memory_only", "redis_required") else "memory_only"
+
+
 def _throttle() -> RedisLoginThrottle | None:
-    """Shared Redis layer, lazily built from QP_REDIS_URL (R3 P2-03).
+    """Shared Redis layer, lazily built from QP_LOGIN_THROTTLE_REDIS_URL
+    (R3 P2-03 / R3.1 P1). Returns None when shared counting is off or
+    unbuildable; login_too_many_attempts decides what None means per mode.
 
     Rebuilt when the URL or the limits change so tests can point the env
-    around without restarting the process; an unbuildable client logs a
-    warning and leaves limiting memory-only (never an exception on the
-    login path)."""
-    global _shared_throttle
-    url = os.environ.get("QP_REDIS_URL", "")
+    around without restarting the process."""
+    global _shared_throttle, _warned_memory_only
+    url = os.environ.get("QP_LOGIN_THROTTLE_REDIS_URL", "")
+    if _throttle_mode() == "memory_only":
+        if url and not _warned_memory_only:
+            _warned_memory_only = True
+            logger.warning(
+                "SECURITY: QP_LOGIN_THROTTLE_MODE is memory_only, so "
+                "QP_LOGIN_THROTTLE_REDIS_URL is IGNORED and login limiting "
+                "is per-instance only - set QP_LOGIN_THROTTLE_MODE="
+                "redis_required to share failure counts across instances"
+            )
+        _shared_throttle = None
+        return None
+    # redis_required: the shared layer is mandatory
     if not url:
+        logger.error(
+            "QP_LOGIN_THROTTLE_MODE=redis_required but "
+            "QP_LOGIN_THROTTLE_REDIS_URL is empty - password logins are "
+            "rejected with 503 until the URL is configured"
+        )
         _shared_throttle = None
         return None
     current = _shared_throttle
@@ -335,20 +369,37 @@ def _throttle() -> RedisLoginThrottle | None:
         current = RedisLoginThrottle(
             url, _LOGIN_MAX_FAILURES, _LOGIN_IP_MAX_FAILURES, _LOGIN_WINDOW_SECONDS
         )
-    except Exception:  # noqa: BLE001 - bad URL/config must not break login
-        logger.exception("cannot build Redis login throttle; memory-only limiting")
+    except Exception:  # noqa: BLE001 - login_too_many_attempts turns this into 503
+        logger.exception("cannot build Redis login throttle (redis_required mode)")
         current = None
     _shared_throttle = current
     return current
 
 
 def login_too_many_attempts(username: str, remote_ip: str) -> bool:
+    """True = throttled, False = allowed. Raises LoginThrottleUnavailable
+    when redis_required mode cannot consult the shared counter (R3.1 P1):
+    rejecting the attempt (503 in app.py) is strictly safer than letting
+    each instance count on its own while an attacker spreads requests."""
     if len(_prune_bucket(_login_bucket(username, remote_ip), time.time())) >= _LOGIN_MAX_FAILURES:
         return True
     if len(_prune_ip_bucket(remote_ip, time.time())) >= _LOGIN_IP_MAX_FAILURES:
         return True
     shared = _throttle()
-    return shared is not None and shared.too_many_attempts(username, remote_ip)
+    if shared is None:
+        if _throttle_mode() == "redis_required":
+            raise LoginThrottleUnavailable(
+                "redis_required: shared login throttle not available"
+            )
+        return False
+    verdict = shared.too_many_attempts(username, remote_ip)
+    if verdict is None:
+        if _throttle_mode() == "redis_required":
+            raise LoginThrottleUnavailable(
+                "redis_required: Redis unreachable, refusing to degrade"
+            )
+        return False
+    return verdict
 
 
 def record_login_failure(username: str, remote_ip: str) -> None:

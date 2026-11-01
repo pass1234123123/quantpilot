@@ -81,7 +81,8 @@ class CrossTenantIntegrationTests(unittest.TestCase):
             {
                 "QP_API_KEY": f"{PREFIX}-svc-key",
                 "QP_JWT_SECRET": f"{PREFIX}-jwt-secret",
-                "QP_REDIS_URL": "",  # memory-only throttle; no redis needed
+                "QP_LOGIN_THROTTLE_REDIS_URL": "",  # memory_only throttle; no redis needed
+                "QP_LOGIN_THROTTLE_MODE": "memory_only",
             },
         )
         cls.env.start()

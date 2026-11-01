@@ -2,9 +2,10 @@
 
 The frontend slice has no unit-test runner wired up (no vitest), so the
 mandated check "Tauri JWT never lands in localStorage" - plus the P1-01
-no-service-key-fallback rule and the T6 login gate - is enforced as a
-source scan over frontend/src. If a refactor regresses any of these
-invariants this suite fails the same way a backend test would.
+no-service-key-fallback rule, the T6 login gate and the R3.1 HTTPS /
+Redis-config hardening - is enforced as a source scan over frontend/src.
+If a refactor regresses any of these invariants this suite fails the
+same way a backend test would.
 """
 
 from __future__ import annotations
@@ -116,6 +117,90 @@ class FrontendLoginGateTests(unittest.TestCase):
             text = _read(rel)
             self.assertIn(fn, text, f"{rel} lost its role gate")
             self.assertIn(":disabled", text, f"{rel} lost its disabled gate")
+
+
+class R31SecurityHardeningTests(unittest.TestCase):
+    """R3.1: remote-HTTP rejection, shared validator, unified config name,
+    atomic Redis failure recording."""
+
+    def test_remote_http_is_rejected(self):
+        api_ts = _read("api.ts")
+        # loopback whitelist: localhost / 127.0.0.1 / ::1 (bracketed or not)
+        self.assertIn(
+            "LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])",
+            api_ts,
+        )
+        # every other host on http:// is refused before any network attempt
+        self.assertIn(
+            "url.protocol === 'http:' && !LOCAL_HOSTS.has(url.hostname)",
+            api_ts,
+        )
+        self.assertIn("远程地址必须使用 https://", api_ts)
+
+    def test_tls_verification_has_no_escape_hatch(self):
+        offenders: list[str] = []
+        for p in sorted(FRONTEND_SRC.rglob("*")):
+            if p.suffix not in (".ts", ".vue"):
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for needle in (
+                "rejectUnauthorized",
+                "NODE_TLS_REJECT_UNAUTHORIZED",
+                "reject-unauthorized",
+            ):
+                if needle in text:
+                    offenders.append(f"{p.name}: {needle}")
+        # the Tauri shell must not bypass certificate checks either
+        for p in sorted((FRONTEND / "src-tauri").rglob("*.rs")):
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for needle in ("danger_accept_invalid_certs", "accept_invalid_certs"):
+                if needle in text:
+                    offenders.append(f"{p.name}: {needle}")
+        self.assertEqual(offenders, [], "TLS verification was relaxed somewhere")
+
+    def test_both_pages_share_one_validator(self):
+        for rel in (
+            "components/ConnectionSetup.vue",
+            "components/panels/SettingsPanel.vue",
+        ):
+            text = _read(rel)
+            self.assertIn("validateApiBase", text, f"{rel} must use the shared validator")
+            self.assertIn("testApiBase", text, f"{rel} must probe before saving")
+            self.assertNotIn("new URL(", text, f"{rel} must not roll its own URL parsing")
+
+    def test_one_redis_config_name_everywhere(self):
+        api_src = Path(__file__).resolve().parents[1] / "src"
+        offenders: list[str] = []
+        for p in sorted(api_src.rglob("*.py")):
+            text = p.read_text(encoding="utf-8", errors="replace")
+            if "QP_REDIS_URL" in text:
+                offenders.append(p.name)
+        self.assertEqual(offenders, [], "the retired QP_REDIS_URL key is still referenced")
+        auth_py = (api_src / "quantpilot_api" / "auth.py").read_text(encoding="utf-8")
+        self.assertIn("QP_LOGIN_THROTTLE_MODE", auth_py)
+        self.assertIn("QP_LOGIN_THROTTLE_REDIS_URL", auth_py)
+        env_example = (Path(__file__).resolve().parents[3] / ".env.example").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("QP_LOGIN_THROTTLE_MODE", env_example)
+        self.assertIn("QP_LOGIN_THROTTLE_REDIS_URL", env_example)
+
+    def test_failure_recording_is_one_atomic_script(self):
+        throttle = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "quantpilot_api"
+            / "login_throttle.py"
+        ).read_text(encoding="utf-8")
+        # R3.1 P1 #7: INCR + EXPIRE land as ONE Lua call - no interleaving
+        # writer can observe a counter without its TTL
+        self.assertIn("_RECORD_LUA", throttle)
+        self.assertIn("redis.call('INCR', KEYS[1])", throttle)
+        self.assertIn("redis.call('EXPIRE', KEYS[1], ARGV[1])", throttle)
+        # R3.1 P1 #9: hostile oversized inputs cannot bloat Redis keys
+        self.assertIn("_KEY_PART_MAX", throttle)
+        # R3.1 P1 #4: redis_required mode refuses instead of degrading
+        self.assertIn("class LoginThrottleUnavailable", throttle)
 
 
 if __name__ == "__main__":

@@ -535,9 +535,17 @@ function withBase(path: string): string {
   return base ? `${base}${path}` : path
 }
 
-/** Structural validation BEFORE any network attempt (R3 P1-01):
+/** Loopback hosts where plain HTTP is acceptable (local dev only, R3.1 P1).
+ *  URL.hostname lowercases itself and keeps IPv6 brackets ("[::1]"). */
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+
+/** Structural validation BEFORE any network attempt (R3 P1-01 + R3.1 P1):
  *  scheme http/https, non-empty host, port (if present) 1-65535, and no
- *  path/query/fragment - the client appends /api/v1/... itself. */
+ *  path/query/fragment - the client appends /api/v1/... itself.
+ *  HTTP is reserved for loopback: a remote base must be HTTPS or the JWT
+ *  Bearer token, the personal qpk key and trading traffic would cross
+ *  the network in clear text. Shared by ConnectionSetup (first run) and
+ *  SettingsPanel - one function, identical verdicts on both pages. */
 export function validateApiBase(value: string): { ok: boolean; error?: string } {
   const raw = value.trim()
   if (!raw) return { ok: false, error: 'API 地址不能为空' }
@@ -549,6 +557,12 @@ export function validateApiBase(value: string): { ok: boolean; error?: string } 
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     return { ok: false, error: '协议仅支持 http:// 或 https://' }
+  }
+  if (url.protocol === 'http:' && !LOCAL_HOSTS.has(url.hostname)) {
+    return {
+      ok: false,
+      error: '远程地址必须使用 https://（明文 HTTP 仅限本机 localhost / 127.0.0.1 / ::1）',
+    }
   }
   if (!url.hostname) return { ok: false, error: '主机名不能为空' }
   if (url.port) {
@@ -566,7 +580,11 @@ export function validateApiBase(value: string): { ok: boolean; error?: string } 
 
 /** Connectivity probe: GET {base}/healthz - a public, credential-free
  *  endpoint. 5s timeout. Throws a user-facing message on failure.
- *  Persists nothing: callers save the base only after this passes. */
+ *  Persists nothing: callers save the base only after this passes.
+ *  TLS is never relaxed (R3.1 P1): an invalid/self-signed certificate
+ *  fails the fetch (TypeError -> the network-error message below); there
+ *  is no escape hatch anywhere in this client to skip certificate
+ *  verification. */
 export async function testApiBase(value: string): Promise<void> {
   const check = validateApiBase(value)
   if (!check.ok) throw new Error(check.error)

@@ -241,7 +241,24 @@ def auth_login(body: LoginRequest, request: Request) -> JSONResponse:
     if not os.environ.get("QP_JWT_SECRET", ""):
         return err(503, "JWT_NOT_CONFIGURED", "set QP_JWT_SECRET before issuing tokens")
     remote_ip = request.client.host if request.client else "unknown"
-    if auth.login_too_many_attempts(body.username, remote_ip):
+    try:
+        throttled = auth.login_too_many_attempts(body.username, remote_ip)
+    except auth.LoginThrottleUnavailable:
+        # redis_required mode + Redis down (R3.1 P1): fail closed - a 503
+        # beats silently degrading to per-instance counters an attacker
+        # could shard requests around
+        writers.add_system_event(
+            "api",
+            "auth.login_throttle_unavailable",
+            "ERROR",
+            {"username": body.username},
+        )
+        return err(
+            503,
+            "LOGIN_THROTTLE_UNAVAILABLE",
+            "login throttling is required but unavailable; retry shortly",
+        )
+    if throttled:
         writers.add_system_event(
             "api", "auth.login_rate_limited", "WARN", {"username": body.username}
         )

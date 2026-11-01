@@ -12,7 +12,9 @@ Covers the three backend items of round 3:
   writers.add_system_event resolves the event's account for scoping
 * P2-03 login throttling - pure-IP spray bucket, Redis layer shared
   across instances (fakeredis-backed server), counters surviving an API
-  restart, loud degradation to memory-only when Redis dies
+  restart; R3.1 pins the failure semantics in LoginThrottleFailSafeTests:
+  memory_only keeps local limiting, redis_required answers 503 and never
+  degrades silently
 """
 
 import os
@@ -30,6 +32,37 @@ def _client() -> TestClient:
     import quantpilot_api.app as app_module
 
     return TestClient(app_module.app)
+
+
+def _memory_only_env() -> dict:
+    """Hermetic memory_only throttle config (R3.1): the in-process buckets
+    are authoritative regardless of the host environment."""
+    return {
+        **SECRET_ENV,
+        "QP_LOGIN_THROTTLE_MODE": "memory_only",
+        "QP_LOGIN_THROTTLE_REDIS_URL": "",
+    }
+
+
+def _redis_required_env(url: str = "redis://shared/0") -> dict:
+    """redis_required throttle config (R3.1): shared counting is
+    mandatory - an unreachable Redis must refuse logins, not degrade."""
+    return {
+        **SECRET_ENV,
+        "QP_LOGIN_THROTTLE_MODE": "redis_required",
+        "QP_LOGIN_THROTTLE_REDIS_URL": url,
+    }
+
+
+def _fake_redis_env(server):
+    """Point login_throttle's Redis.from_url at a shared fakeredis server
+    so several "API processes" can share one counter store."""
+    from quantpilot_api import login_throttle
+
+    def fake_from_url(url, **_kwargs):
+        return fakeredis.FakeStrictRedis(server=server, decode_responses=True)
+
+    return patch.object(login_throttle.redis.Redis, "from_url", fake_from_url)
 
 
 class GlobalSurfaceScopingTests(unittest.TestCase):
@@ -183,7 +216,11 @@ class SystemEventScopingWriterTests(unittest.TestCase):
 
 
 class LoginThrottleLayeredTests(unittest.TestCase):
-    """P2-03: pure-IP spray bucket + shared Redis layer + degradation."""
+    """P2-03 local layer: pure-IP spray bucket + (ip, username) pairs.
+
+    The shared-Redis scenarios live in LoginThrottleFailSafeTests below
+    (R3.1). These tests pin QP_LOGIN_THROTTLE_MODE=memory_only so the
+    in-process buckets stay authoritative on any host."""
 
     def setUp(self) -> None:
         import quantpilot_api.auth as auth
@@ -192,16 +229,19 @@ class LoginThrottleLayeredTests(unittest.TestCase):
         auth._login_failures.clear()
         auth._login_failures_ip.clear()
         auth._shared_throttle = None
+        auth._warned_memory_only = False
 
     def tearDown(self) -> None:
         self.auth._login_failures.clear()
         self.auth._login_failures_ip.clear()
         self.auth._shared_throttle = None
+        self.auth._warned_memory_only = False
 
     def test_ip_spray_bucket_blocks_rotating_usernames(self) -> None:
         # default _LOGIN_IP_MAX_FAILURES = 5 x _LOGIN_MAX_FAILURES = 50;
         # patch the limits down so the ip bucket alone triggers
         with (
+            patch.dict(os.environ, _memory_only_env()),
             patch.object(self.auth, "_LOGIN_MAX_FAILURES", 100),
             patch.object(self.auth, "_LOGIN_IP_MAX_FAILURES", 3),
         ):
@@ -213,44 +253,72 @@ class LoginThrottleLayeredTests(unittest.TestCase):
             self.assertFalse(self.auth.login_too_many_attempts("user0", "8.8.8.8"))
 
     def test_success_clears_pair_but_not_ip_bucket(self) -> None:
-        self.auth.record_login_failure("alice", "9.9.9.9")
-        self.auth.clear_login_failures("alice", "9.9.9.9")
-        self.assertFalse(self.auth.login_too_many_attempts("alice", "9.9.9.9"))
-        # the ip bucket survived the success (spray protection)
-        self.assertEqual(len(self.auth._login_failures_ip.get("9.9.9.9", [])), 1)
+        with patch.dict(os.environ, _memory_only_env()):
+            self.auth.record_login_failure("alice", "9.9.9.9")
+            self.auth.clear_login_failures("alice", "9.9.9.9")
+            self.assertFalse(self.auth.login_too_many_attempts("alice", "9.9.9.9"))
+            # the ip bucket survived the success (spray protection)
+            self.assertEqual(len(self.auth._login_failures_ip.get("9.9.9.9", [])), 1)
 
-    def _fake_redis_env(self, server):
-        from quantpilot_api import login_throttle
 
-        def fake_from_url(url, **_kwargs):
-            return fakeredis.FakeStrictRedis(server=server, decode_responses=True)
+class LoginThrottleFailSafeTests(unittest.TestCase):
+    """R3.1 P1: explicit fail-closed semantics for the shared Redis layer.
 
-        return patch.object(login_throttle.redis.Redis, "from_url", fake_from_url)
+    The eight mandated fault-injection scenarios:
+      1 healthy Redis           shared verdicts work across instances
+      2 connection failure      too_many_attempts reports None (unavailable)
+      3 timeout                  too_many_attempts reports None
+      4 redis_required outage   login path raises LoginThrottleUnavailable
+                                -> HTTP 503; NEVER a silent fallback to
+                                per-instance counters
+      5 memory_only + outage     local limiting continues, nothing raises
+      6 recovery                the stand-down window expires and the SHARED
+                                counters come back into force automatically
+      7 multi-instance           two processes share one counter
+      8 concurrency             parallel record_failure lands exact counts
+                                (atomic Lua INCR+EXPIRE, TTLs always set)
+    """
 
-    def test_redis_layer_shared_across_instances(self) -> None:
-        # two "API processes": one shared fakeredis server behind both
+    def setUp(self) -> None:
+        import quantpilot_api.auth as auth
+
+        self.auth = auth
+        auth._login_failures.clear()
+        auth._login_failures_ip.clear()
+        auth._shared_throttle = None
+        auth._warned_memory_only = False
+
+    def tearDown(self) -> None:
+        self.auth._login_failures.clear()
+        self.auth._login_failures_ip.clear()
+        self.auth._shared_throttle = None
+        self.auth._warned_memory_only = False
+
+    # -- 1 + 7: healthy shared counting across instances/restarts ---------
+
+    def test_shared_counting_across_instances_and_restarts(self) -> None:
         server = fakeredis.FakeServer()
         with (
-            patch.dict(os.environ, {**SECRET_ENV, "QP_REDIS_URL": "redis://shared/0"}),
+            patch.dict(os.environ, _redis_required_env()),
             patch.object(self.auth, "_LOGIN_MAX_FAILURES", 3),
-            self._fake_redis_env(server),
+            _fake_redis_env(server),
         ):
             for _ in range(3):
                 self.auth.record_login_failure("alice", "9.9.9.9")
-            # process "restart": drop every in-process cache/throttle
+            # process "restart": drop every in-process cache/throttle; a
+            # fresh instance still sees the shared counter
             self.auth._login_failures.clear()
             self.auth._login_failures_ip.clear()
             self.auth._shared_throttle = None
-            # the shared counter survives the restart
             self.assertTrue(self.auth.login_too_many_attempts("alice", "9.9.9.9"))
 
-    def test_redis_layer_counts_by_ip_dimension_too(self) -> None:
+    def test_shared_ip_dimension_still_counts(self) -> None:
         server = fakeredis.FakeServer()
         with (
-            patch.dict(os.environ, {**SECRET_ENV, "QP_REDIS_URL": "redis://shared/0"}),
+            patch.dict(os.environ, _redis_required_env()),
             patch.object(self.auth, "_LOGIN_MAX_FAILURES", 100),
             patch.object(self.auth, "_LOGIN_IP_MAX_FAILURES", 3),
-            self._fake_redis_env(server),
+            _fake_redis_env(server),
         ):
             for i in range(3):
                 self.auth.record_login_failure(f"victim{i}", "7.7.7.7")
@@ -259,12 +327,12 @@ class LoginThrottleLayeredTests(unittest.TestCase):
             self.auth._shared_throttle = None
             self.assertTrue(self.auth.login_too_many_attempts("anyone", "7.7.7.7"))
 
-    def test_redis_success_clears_shared_pair_counter(self) -> None:
+    def test_success_clears_shared_pair_counter(self) -> None:
         server = fakeredis.FakeServer()
         with (
-            patch.dict(os.environ, {**SECRET_ENV, "QP_REDIS_URL": "redis://shared/0"}),
+            patch.dict(os.environ, _redis_required_env()),
             patch.object(self.auth, "_LOGIN_MAX_FAILURES", 3),
-            self._fake_redis_env(server),
+            _fake_redis_env(server),
         ):
             self.auth.record_login_failure("bob", "6.6.6.6")
             self.auth.clear_login_failures("bob", "6.6.6.6")
@@ -273,23 +341,171 @@ class LoginThrottleLayeredTests(unittest.TestCase):
             self.auth._shared_throttle = None
             self.assertFalse(self.auth.login_too_many_attempts("bob", "6.6.6.6"))
 
-    def test_redis_outage_degrades_to_memory_only(self) -> None:
-        # port 1 on localhost: connection refused, fast and certain
-        with patch.dict(os.environ, {**SECRET_ENV, "QP_REDIS_URL": "redis://127.0.0.1:1/0"}):
-            # building the throttle against a dead server must not raise
-            self.auth.record_login_failure("carol", "5.5.5.5")
-            # memory layer still enforces the limit
-            with patch.object(self.auth, "_LOGIN_MAX_FAILURES", 2):
-                self.auth.record_login_failure("carol", "5.5.5.5")
-                self.auth.record_login_failure("carol", "5.5.5.5")
-                self.assertTrue(self.auth.login_too_many_attempts("carol", "5.5.5.5"))
+    # -- 2 + 3: outage detection at the throttle layer ----------------------
 
-    def test_no_redis_url_means_memory_only(self) -> None:
-        env = {k: v for k, v in os.environ.items() if k != "QP_REDIS_URL"}
-        with patch.dict(os.environ, env, clear=True):
-            self.auth.record_login_failure("dave", "4.4.4.4")
+    def test_connection_failure_reports_unavailable(self) -> None:
+        # port 1 on localhost: connection refused, fast and certain
+        from quantpilot_api.login_throttle import RedisLoginThrottle
+
+        throttle = RedisLoginThrottle("redis://127.0.0.1:1/0", 10, 50, 900)
+        self.assertIsNone(throttle.too_many_attempts("carol", "5.5.5.5"))
+        self.assertTrue(throttle.degraded)
+        # recording during the outage must not raise
+        throttle.record_failure("carol", "5.5.5.5")
+
+    def test_timeout_reports_unavailable(self) -> None:
+        import redis as redis_lib
+        from quantpilot_api.login_throttle import RedisLoginThrottle
+
+        server = fakeredis.FakeServer()
+        with _fake_redis_env(server):
+            throttle = RedisLoginThrottle("redis://shared/0", 10, 50, 900)
+        with patch.object(
+            throttle._client,
+            "get",
+            side_effect=redis_lib.exceptions.TimeoutError("simulated timeout"),
+        ):
+            self.assertIsNone(throttle.too_many_attempts("dave", "4.4.4.4"))
+        self.assertTrue(throttle.degraded)
+
+    # -- 4: redis_required refuses instead of degrading ---------------------
+
+    def test_required_mode_raises_when_redis_unreachable(self) -> None:
+        from quantpilot_api.auth import LoginThrottleUnavailable
+
+        with patch.dict(os.environ, _redis_required_env("redis://127.0.0.1:1/0")):
+            with self.assertRaises(LoginThrottleUnavailable):
+                self.auth.login_too_many_attempts("erin", "3.3.3.3")
+            # degraded stand-down window: still refusing, never degrading
+            with self.assertRaises(LoginThrottleUnavailable):
+                self.auth.login_too_many_attempts("erin", "3.3.3.3")
+
+    def test_required_mode_without_url_rejects_logins(self) -> None:
+        from quantpilot_api.auth import LoginThrottleUnavailable
+
+        with patch.dict(os.environ, _redis_required_env("")):
+            with self.assertRaises(LoginThrottleUnavailable):
+                self.auth.login_too_many_attempts("judy", "9.9.9.9")
+
+    def test_required_mode_answers_503_on_the_login_route(self) -> None:
+        import quantpilot_api.app as app_module
+
+        with (
+            patch.dict(os.environ, _redis_required_env("redis://127.0.0.1:1/0")),
+            patch("quantpilot_api.app.writers") as writers,
+        ):
+            client = TestClient(app_module.app)
+            resp = client.post(
+                "/api/v1/auth/login",
+                json={"username": "frank", "password": "whatever"},
+            )
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["error"]["code"], "LOGIN_THROTTLE_UNAVAILABLE")
+        # the outage is auditable, never silent
+        self.assertIn(
+            "auth.login_throttle_unavailable",
+            [call.args[1] for call in writers.add_system_event.call_args_list],
+        )
+
+    # -- 5: memory_only keeps limiting locally ------------------------------
+
+    def test_memory_only_outage_still_limits_locally(self) -> None:
+        # a dead Redis URL is irrelevant in memory_only mode: the local
+        # buckets stay authoritative and nothing ever raises
+        env = {**_memory_only_env(), "QP_LOGIN_THROTTLE_REDIS_URL": "redis://127.0.0.1:1/0"}
+        with (
+            patch.dict(os.environ, env),
+            patch.object(self.auth, "_LOGIN_MAX_FAILURES", 2),
+        ):
+            self.auth.record_login_failure("grace", "2.2.2.2")
+            self.auth.record_login_failure("grace", "2.2.2.2")
+            self.assertTrue(self.auth.login_too_many_attempts("grace", "2.2.2.2"))
+
+    def test_memory_only_with_url_warns_once(self) -> None:
+        # explicit degradation must be loud (R3.1 P1 #5): a configured URL
+        # ignored by the mode earns exactly one SECURITY warning
+        env = {**_memory_only_env(), "QP_LOGIN_THROTTLE_REDIS_URL": "redis://shared/0"}
+        with (
+            patch.dict(os.environ, env),
+            self.assertLogs("quantpilot.auth", level="WARNING") as logs,
+        ):
             self.assertIsNone(self.auth._throttle())
-            self.assertFalse(self.auth.login_too_many_attempts("dave", "4.4.4.4"))
+            self.assertIsNone(self.auth._throttle())
+        warnings = [line for line in logs.output if "memory_only" in line]
+        self.assertEqual(len(warnings), 1)
+
+    def test_unset_config_means_memory_only(self) -> None:
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "QP_REDIS_URL",
+                "QP_LOGIN_THROTTLE_REDIS_URL",
+                "QP_LOGIN_THROTTLE_MODE",
+            )
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.auth.record_login_failure("kate", "4.4.4.4")
+            self.assertIsNone(self.auth._throttle())
+            self.assertFalse(self.auth.login_too_many_attempts("kate", "4.4.4.4"))
+
+    # -- 6: recovery resumes shared counting --------------------------------
+
+    def test_recovery_resumes_shared_counting(self) -> None:
+        import redis as redis_lib
+
+        server = fakeredis.FakeServer()
+        with (
+            patch.dict(os.environ, _redis_required_env()),
+            patch.object(self.auth, "_LOGIN_MAX_FAILURES", 3),
+            _fake_redis_env(server),
+        ):
+            throttle = self.auth._throttle()
+            for _ in range(3):
+                throttle.record_failure("heidi", "1.1.1.1")
+            self.assertTrue(throttle.too_many_attempts("heidi", "1.1.1.1"))
+            # outage: connection errors, then the 60 s stand-down window
+            with patch.object(
+                throttle._client,
+                "get",
+                side_effect=redis_lib.exceptions.ConnectionError("down"),
+            ):
+                self.assertIsNone(throttle.too_many_attempts("heidi", "1.1.1.1"))
+            self.assertIsNone(throttle.too_many_attempts("heidi", "1.1.1.1"))
+            # window over -> "recovered": the SHARED verdict returns
+            throttle._degraded_until = 0.0
+            self.assertTrue(throttle.too_many_attempts("heidi", "1.1.1.1"))
+
+    # -- 8: concurrency lands exact counts -----------------------------------
+
+    def test_concurrent_record_failure_counts_exact(self) -> None:
+        import threading
+
+        from quantpilot_api import login_throttle
+        from quantpilot_api.login_throttle import RedisLoginThrottle
+
+        server = fakeredis.FakeServer()
+        with _fake_redis_env(server):
+            throttle = RedisLoginThrottle("redis://shared/0", 10_000, 50_000, 900)
+
+        def hammer() -> None:
+            for _ in range(25):
+                throttle.record_failure("ivan", "8.8.4.4")
+
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        pair_key = login_throttle._PAIR_KEY.format(ip="8.8.4.4", username="ivan")
+        ip_key = login_throttle._IP_KEY.format(ip="8.8.4.4")
+        self.assertEqual(int(throttle._client.get(pair_key)), 200)
+        self.assertEqual(int(throttle._client.get(ip_key)), 200)
+        # the atomic script leaves no counter behind without its TTL
+        self.assertGreater(int(throttle._client.ttl(pair_key)), 0)
+        self.assertGreater(int(throttle._client.ttl(ip_key)), 0)
 
 
 if __name__ == "__main__":
