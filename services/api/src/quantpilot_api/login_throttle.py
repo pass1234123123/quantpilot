@@ -75,9 +75,14 @@ class RedisLoginThrottle:
         window_seconds: int,
     ) -> None:
         self.url = url
+        # protocol=2 (RESP2): redis-py >= 6 defaults to the RESP3 handshake
+        # (HELLO 3), which real Redis 5.x servers reject with
+        # "unknown command 'HELLO'" - every ping would then fail and
+        # redis_required mode would answer 503 forever. RESP2 is supported
+        # by every Redis from 2.x on, so this is the portable choice.
         self._client = redis.Redis.from_url(
             url, socket_connect_timeout=2, socket_timeout=2,
-            decode_responses=True,
+            decode_responses=True, protocol=2,
         )
         self._record_script = self._client.register_script(_RECORD_LUA)
         self._max = max_failures

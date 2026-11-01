@@ -57,6 +57,11 @@ _sweeper: CommandSweeper | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _consumer, _sweeper
+    # R3.2 P1: validate the login-throttle configuration BEFORE anything
+    # starts - a typo'd QP_LOGIN_THROTTLE_MODE or a missing URL in
+    # redis_required mode fails the boot here, so the service never
+    # accepts a single request on a silently degraded configuration
+    auth.validate_login_throttle_config()
     db.init_pool()
     _consumer = NodeEventsConsumer()
     _consumer.start()

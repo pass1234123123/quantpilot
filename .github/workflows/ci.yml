@@ -1,0 +1,196 @@
+# QuantPilot AI - CI (R3.2)
+#
+# Acceptance-required checks (no step may mask a failure: pytest / vue-tsc
+# / vite / tauri exit non-zero and the workflow run is marked FAILED - the
+# "continue-on-error" escape hatch is deliberately never used):
+#
+#   1. python-unit-tests    - full pytest suite (DB-gated tests auto-skip)
+#   2. postgres-integration - real PostgreSQL 16 container + alembic
+#                             migrations + the 17 cross-tenant scenarios
+#   3. security-source-guards - source-level guards (remote-HTTP rejection
+#                             + localhost whitelist, no localStorage JWT,
+#                             no TLS-verification escape hatch, unified
+#                             Redis config name, atomic failure recording,
+#                             no silent throttle-mode fallback)
+#   4. frontend-build       - vue-tsc type check + vite production build
+#   5. tauri-windows-build  - Windows release build (nsis + msi bundles)
+#
+# ci-required-checks is the single aggregated status branch protection
+# should require: it only passes when every check above passed.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-unit-tests:
+    name: Python unit tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API + shared contracts
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/contracts -e services/api
+          pip install pytest fakeredis
+
+      - name: Run full unit-test suite (DB-gated tests skip cleanly)
+        working-directory: services/api
+        run: python -m pytest tests -v
+
+  postgres-integration:
+    name: PostgreSQL integration (real schema, real SQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: quantpilot
+          POSTGRES_PASSWORD: quantpilot
+          POSTGRES_DB: quantpilot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      QP_PG_DSN: postgresql://quantpilot:quantpilot@127.0.0.1:5432/quantpilot
+      QP_RUN_DB_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API + contracts + alembic
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/contracts -e services/api
+          pip install pytest fakeredis alembic
+
+      - name: Apply alembic migrations (0001..0020)
+        working-directory: infra/postgres
+        run: alembic upgrade head
+
+      - name: Run the 17 cross-tenant scenarios against real PostgreSQL
+        working-directory: services/api
+        run: python -m pytest tests/test_r3_integration.py -v
+
+  security-source-guards:
+    name: Security source guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install API + contracts
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/contracts -e services/api
+          pip install pytest fakeredis
+
+      - name: Enforce source-level security invariants
+        working-directory: services/api
+        run: >-
+          python -m pytest tests/test_frontend_guard.py
+          "tests/test_r3_2_config.py::NoSilentFallbackSourceGuard" -v
+
+  frontend-build:
+    name: Frontend type check + production build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check (vue-tsc)
+        run: pnpm exec vue-tsc -b
+
+      - name: Production build (vite)
+        run: pnpm exec vite build
+
+  tauri-windows-build:
+    name: Windows Tauri release build
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Tauri release build (nsis + msi)
+        run: pnpm tauri build
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantpilot-windows-installers
+          path: |
+            frontend/src-tauri/target/release/bundle/nsis/*.exe
+            frontend/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+  ci-required-checks:
+    name: All required checks passed
+    needs:
+      - python-unit-tests
+      - postgres-integration
+      - security-source-guards
+      - frontend-build
+      - tauri-windows-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm every required job succeeded
+        run: echo "All 5 required checks passed - branch protection can require 'ci-required-checks'."

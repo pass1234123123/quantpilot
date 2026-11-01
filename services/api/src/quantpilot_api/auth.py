@@ -274,14 +274,18 @@ def _dummy_verify(password: str) -> None:
 # QP_LOGIN_THROTTLE_REDIS_URL so multiple API instances count failures
 # together and restarts do not clear attack counters.
 #
-# QP_LOGIN_THROTTLE_MODE (R3.1, one name everywhere; the R3-era ad-hoc
-# redis key is gone):
-#   memory_only    default; the URL is IGNORED (one loud warning) and the
-#                  in-process buckets stay authoritative
+# QP_LOGIN_THROTTLE_MODE (R3.1, one name everywhere; R3.2 makes parsing
+# STRICT - an unknown value is a config error that fails the boot, never
+# a silent fallback to memory_only):
+#   memory_only    default (unset/empty); the URL is IGNORED (one loud
+#                  warning) and the in-process buckets stay authoritative
 #   redis_required multi-instance deployments; when Redis is unreachable the
 #                  login path raises LoginThrottleUnavailable and app.py
 #                  answers 503 - NEVER a silent fallback to per-instance
 #                  counters, which an attacker could shard requests around
+# validate_login_throttle_config() runs in the app lifespan BEFORE the
+# service accepts traffic (R3.2 P1): a typo'd mode or a missing URL fails
+# the boot instead of quietly weakening the deployment.
 # --------------------------------------------------------------------------
 
 _LOGIN_MAX_FAILURES = int(os.environ.get("QP_LOGIN_MAX_FAILURES", "10"))
@@ -293,6 +297,16 @@ _login_failures: dict[str, list[float]] = {}
 _login_failures_ip: dict[str, list[float]] = {}
 _shared_throttle: RedisLoginThrottle | None = None
 _warned_memory_only = False
+
+_THROTTLE_MODES = ("memory_only", "redis_required")
+
+
+class LoginThrottleConfigError(RuntimeError):
+    """Invalid QP_LOGIN_THROTTLE_MODE / QP_LOGIN_THROTTLE_REDIS_URL
+    combination (R3.2 P1). Raised by validate_login_throttle_config()
+    during app startup: a typo like 'redis_require' must fail the boot
+    instead of silently degrading a multi-instance deployment to
+    per-instance counting."""
 
 
 def _login_bucket(username: str, remote_ip: str) -> str:
@@ -320,11 +334,58 @@ def _prune_ip_bucket(ip: str, now: float) -> list[float]:
 
 
 def _throttle_mode() -> str:
-    """QP_LOGIN_THROTTLE_MODE, normalized to the two supported values
-    (R3.1 P1). Unknown values fall back to memory_only - the local layer
-    still limits, and the fallback is logged by _throttle()."""
-    mode = os.environ.get("QP_LOGIN_THROTTLE_MODE", "memory_only").strip().lower()
-    return mode if mode in ("memory_only", "redis_required") else "memory_only"
+    """QP_LOGIN_THROTTLE_MODE (R3.2 P1): unset/empty -> the explicit
+    memory_only default; any OTHER unknown value raises
+    LoginThrottleConfigError. Mapping a typo like 'redis_require' back to
+    memory_only would silently drop a multi-instance deployment to
+    per-instance counting - the exact degradation R3.2 forbids."""
+    raw = os.environ.get("QP_LOGIN_THROTTLE_MODE", "")
+    mode = raw.strip().lower()
+    if not mode:
+        return "memory_only"
+    if mode not in _THROTTLE_MODES:
+        raise LoginThrottleConfigError(
+            f"QP_LOGIN_THROTTLE_MODE={raw!r} is invalid: expected one of "
+            f"{_THROTTLE_MODES} (R3.2: no silent fallback to memory_only)"
+        )
+    return mode
+
+
+def validate_login_throttle_config() -> None:
+    """Startup gate (R3.2 P1): app.py runs this first inside the lifespan,
+    BEFORE the DB pool / consumers start and before the service accepts a
+    single request.
+
+      * unknown explicit mode        -> LoginThrottleConfigError (never a
+        silent fallback to memory_only)
+      * redis_required without a URL -> LoginThrottleConfigError (booting
+        anyway would silently mean memory_only)
+      * memory_only                  -> one explicit SECURITY warning
+      * redis_required + unreachable Redis does NOT fail the boot:
+        password logins keep answering 503 (LoginThrottleUnavailable)
+        until Redis recovers; the rest of the API stays up
+    """
+    mode = _throttle_mode()  # unknown value -> LoginThrottleConfigError
+    url = os.environ.get("QP_LOGIN_THROTTLE_REDIS_URL", "").strip()
+    if mode == "redis_required":
+        if not url:
+            raise LoginThrottleConfigError(
+                "QP_LOGIN_THROTTLE_MODE=redis_required requires "
+                "QP_LOGIN_THROTTLE_REDIS_URL to be set; refusing to start "
+                "instead of silently degrading to per-instance limiting"
+            )
+        logger.info(
+            "login throttle: redis_required - failure counts are shared "
+            "via Redis; while Redis is unreachable password logins "
+            "answer 503"
+        )
+    else:
+        logger.warning(
+            "SECURITY: QP_LOGIN_THROTTLE_MODE=memory_only - login limiting "
+            "is per-instance only; multi-instance deployments must set "
+            "QP_LOGIN_THROTTLE_MODE=redis_required and "
+            "QP_LOGIN_THROTTLE_REDIS_URL"
+        )
 
 
 def _throttle() -> RedisLoginThrottle | None:
