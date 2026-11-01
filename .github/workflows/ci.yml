@@ -45,7 +45,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e packages/contracts -e services/api
-          pip install pytest fakeredis
+          pip install pytest "fakeredis[lua]"
 
       - name: Run full unit-test suite (DB-gated tests skip cleanly)
         working-directory: services/api
@@ -82,7 +82,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e packages/contracts -e services/api
-          pip install pytest fakeredis alembic
+          pip install pytest "fakeredis[lua]" alembic
 
       - name: Apply alembic migrations (0001..0020)
         working-directory: infra/postgres
@@ -106,7 +106,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e packages/contracts -e services/api
-          pip install pytest fakeredis
+          pip install pytest "fakeredis[lua]"
 
       - name: Enforce source-level security invariants
         working-directory: services/api
