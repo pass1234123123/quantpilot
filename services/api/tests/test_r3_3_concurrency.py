@@ -128,10 +128,11 @@ class LocalConcurrencyTests(unittest.TestCase):
             self.assertIsNone(self.auth.reserve_login_attempt("bob", "9.9.9.9"))
             bucket = self.auth._login_bucket("bob", "9.9.9.9")
             with self.auth._login_lock:
-                t_old, a_old = self.auth._login_failures[bucket][0]
+                t_old, a_old, s_old = self.auth._login_failures[bucket][0]
                 self.auth._login_failures[bucket][0] = (
                     t_old - self.auth._LOGIN_WINDOW_SECONDS - 1,
                     a_old,
+                    s_old,
                 )
             self.assertIsNotNone(self.auth.reserve_login_attempt("bob", "9.9.9.9"))
 
@@ -167,10 +168,11 @@ class LocalConcurrencyTests(unittest.TestCase):
             self.assertIsNone(self.auth.reserve_login_attempt("carol", "9.9.9.9"))
             bucket = self.auth._login_bucket("carol", "9.9.9.9")
             with self.auth._login_lock:
-                t, a = self.auth._login_failures[bucket][0]
+                t, a, s = self.auth._login_failures[bucket][0]
                 self.auth._login_failures[bucket][0] = (
                     time.time() - self.auth._LOGIN_WINDOW_SECONDS,
                     a,
+                    s,
                 )
             self.assertIsNotNone(self.auth.reserve_login_attempt("carol", "9.9.9.9"))
 

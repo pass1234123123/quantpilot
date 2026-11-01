@@ -275,7 +275,7 @@ class LoginThrottleLayeredTests(unittest.TestCase):
             bob_bucket = self.auth._login_bucket("bob", "9.9.9.9")
             self.assertEqual(
                 [a for (_, a) in self.auth._login_failures_ip["9.9.9.9"]],
-                [a for (_, a) in self.auth._login_failures[bob_bucket]],
+                [a for (_, a, _) in self.auth._login_failures[bob_bucket]],
             )
             # alice's pair bucket is cleared: she is not throttled anymore
             self.assertIsNotNone(self.auth.reserve_login_attempt("alice", "9.9.9.9"))

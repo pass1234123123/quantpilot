@@ -308,9 +308,13 @@ _LOGIN_WINDOW_SECONDS = int(os.environ.get("QP_LOGIN_WINDOW_SECONDS", "900"))
 _LOGIN_IP_MAX_FAILURES = int(
     os.environ.get("QP_LOGIN_IP_MAX_FAILURES", str(_LOGIN_MAX_FAILURES * 5))
 )
-# each entry is (timestamp, attempt_id): the id lets a success or an
-# abort remove EXACTLY its own reservation (R3.3 P1-01)
-_login_failures: dict[str, list[tuple[float, str]]] = {}
+# each pair entry is (timestamp, attempt_id, state) with state "p"
+# (pending: still verifying) or "f" (committed failure) - the id lets a
+# success or an abort remove EXACTLY its own reservation, and the state
+# lets a success clear ONLY completed failures, never another in-flight
+# request's pending slot (R3.3 P1-01 + R3.3.1). The ip bucket needs no
+# state: nothing ever bulk-deletes from it.
+_login_failures: dict[str, list[tuple[float, str, str]]] = {}
 _login_failures_ip: dict[str, list[tuple[float, str]]] = {}
 # sync login endpoints run on FastAPI's thread pool; the reserve below is
 # check-then-append, so it needs the same atomicity the Lua script gives
@@ -347,13 +351,15 @@ def _login_bucket(username: str, remote_ip: str) -> str:
     return f"{remote_ip}|{username.strip().lower()}"
 
 
-def _prune_bucket(bucket: str, now: float) -> list[tuple[float, str]]:
-    """Drop entries older than the window. Called under _login_lock, so
-    the trim+count+append in reserve_login_attempt is atomic for the
-    local layer exactly the way the Lua script is for the shared one."""
+def _prune_bucket(bucket: str, now: float) -> list[tuple[float, str, str]]:
+    """Drop entries older than the window (pendings and committed
+    failures alike - both occupy the budget while in-window). Called
+    under _login_lock, so the trim+count+append in reserve_login_attempt
+    is atomic for the local layer exactly the way the Lua script is
+    for the shared one."""
     stamps = [
-        (t, a)
-        for (t, a) in _login_failures.get(bucket, [])
+        (t, a, s)
+        for (t, a, s) in _login_failures.get(bucket, [])
         if now - t < _LOGIN_WINDOW_SECONDS
     ]
     _login_failures[bucket] = stamps
@@ -372,10 +378,14 @@ def _prune_ip_bucket(ip: str, now: float) -> list[tuple[float, str]]:
 
 def _release_local_slot(bucket: str, remote_ip: str, attempt_id: str) -> None:
     """Give one reservation's slot back in both local buckets (an
-    aborted verification, or the shared layer refusing the attempt)."""
+    aborted verification, or the shared layer refusing the attempt).
+    R3.3.1: only THIS attempt_id is removed - never another request's
+    pending or committed entry."""
     with _login_lock:
         _login_failures[bucket] = [
-            (t, a) for (t, a) in _login_failures.get(bucket, []) if a != attempt_id
+            (t, a, s)
+            for (t, a, s) in _login_failures.get(bucket, [])
+            if a != attempt_id
         ]
         _login_failures_ip[remote_ip] = [
             (t, a) for (t, a) in _login_failures_ip.get(remote_ip, []) if a != attempt_id
@@ -510,7 +520,9 @@ def reserve_login_attempt(username: str, remote_ip: str) -> LoginReservation | N
         if len(pair) >= _LOGIN_MAX_FAILURES or len(ip) >= _LOGIN_IP_MAX_FAILURES:
             # local budget already spent: no reservation anywhere
             return None
-        _login_failures.setdefault(bucket, []).append((now, attempt_id))
+        # the pair entry starts PENDING ("p"): it becomes a committed
+        # failure ("f") only when the password verdict says so (R3.3.1)
+        _login_failures.setdefault(bucket, []).append((now, attempt_id, "p"))
         _login_failures_ip.setdefault(remote_ip, []).append((now, attempt_id))
     shared = _throttle()
     if shared is None:
@@ -536,18 +548,26 @@ def reserve_login_attempt(username: str, remote_ip: str) -> LoginReservation | N
 
 
 def settle_login_success(reservation: LoginReservation) -> None:
-    """A correct password (R3.3 P1-01 lifecycle): the (ip, username)
-    pair bucket is cleared whole - the user just authenticated, so the
-    pair is not under attack - and ONLY this attempt's slot is released
-    from the pure-IP spray bucket. Other users' recorded failures stay
-    untouched, so a success never wipes the spray statistics."""
+    """A correct password (R3.3 P1-01 lifecycle, R3.3.1 refinement):
+    the pair bucket's COMMITTED failures are cleared - the user just
+    authenticated, so the pair is not under attack - and ONLY this
+    attempt's own pending entry + spray slot are removed. Other
+    requests' still-verifying pendings SURVIVE (R3.3.1: the old
+    whole-bucket clear also deleted concurrent requests' reservations,
+    so a failure completing after this success was never recorded).
+    Other users' spray failures stay untouched in every case."""
     bucket = _login_bucket(reservation.username, reservation.remote_ip)
+    own = reservation.attempt_id
     with _login_lock:
-        _login_failures.pop(bucket, None)
+        _login_failures[bucket] = [
+            (t, a, s)
+            for (t, a, s) in _login_failures.get(bucket, [])
+            if s == "p" and a != own
+        ]
         _login_failures_ip[reservation.remote_ip] = [
             (t, a)
             for (t, a) in _login_failures_ip.get(reservation.remote_ip, [])
-            if a != reservation.attempt_id
+            if a != own
         ]
     if reservation.shared:
         shared = _throttle()
@@ -555,6 +575,42 @@ def settle_login_success(reservation: LoginReservation) -> None:
             shared.settle_success(
                 reservation.username, reservation.remote_ip, reservation.attempt_id
             )
+
+
+def settle_login_failure(reservation: LoginReservation) -> None:
+    """A wrong password (R3.3.1): the PENDING reservation is COMMITTED
+    as a failure record in every active layer - locally the entry's
+    state flips "p" -> "f" (timestamp unchanged: the window anchors at
+    attempt time), and in the shared layer one atomic Lua call renames
+    "p:{id}" -> "f:{id}" with the score preserved.
+
+    Fail-closed: in redis_required mode an unrecordable failure RAISES
+    LoginThrottleUnavailable (app.py answers 503). A dropped failure
+    record under-counts the shared budget - the attacker-favourable
+    direction - so it must never be swallowed. The local record is
+    written first and stays even when the shared commit raises, so the
+    failing instance itself stays strictly throttled."""
+    bucket = _login_bucket(reservation.username, reservation.remote_ip)
+    own = reservation.attempt_id
+    with _login_lock:
+        _login_failures[bucket] = [
+            (t, a, "f") if (a == own and s == "p") else (t, a, s)
+            for (t, a, s) in _login_failures.get(bucket, [])
+        ]
+    if not reservation.shared:
+        return  # memory_only: the local flip above IS the record
+    shared = _throttle()
+    if shared is None:
+        # redis_required + the shared layer vanished between reserve and
+        # commit: the failure cannot be recorded where other instances
+        # would see it - fail closed rather than under-count silently
+        raise LoginThrottleUnavailable(
+            "redis_required: cannot record the failed login "
+            "(shared budget unreachable mid-verification)"
+        )
+    shared.commit_failure(
+        reservation.username, reservation.remote_ip, reservation.attempt_id
+    )
 
 
 def release_login_reservation(reservation: LoginReservation) -> None:

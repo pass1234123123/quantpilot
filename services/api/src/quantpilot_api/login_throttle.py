@@ -25,20 +25,30 @@ login-attempt budget:
   "the last 15 minutes"; the two layers disagreed and Redis-mode users
   could accumulate failures indefinitely.
 
-* reservation lifecycle (R3.3 P1-01):
+* reservation lifecycle (R3.3 P1-01, refined in R3.3.1):
     - reserve() atomically spends one attempt slot in both dimensions
-    - a FAILED password check keeps the reservation: it IS the failure
-      record, in both layers - there is no separate increment step
-      left to race with
-    - a SUCCESSFUL login clears the whole (ip, username) pair bucket
-      (an authenticated user is not an attacker; R3.1 semantics) and
-      releases ONLY its own slot from the pure-IP spray bucket, which
-      keeps every other recorded failure intact
+      and records it as a PENDING member ("p:{attempt_id}")
+    - a FAILED password check COMMITS the reservation: one atomic Lua
+      rename "p:{id}" -> "f:{id}" (score preserved, so the window
+      still anchors at attempt time). The commit is a REQUIRED step,
+      not an optional one: without it a success could not tell an
+      in-flight reservation from a completed failure record
+    - a SUCCESSFUL login clears the (ip, username) pair bucket's
+      FAILED history (an authenticated user is not an attacker; the
+      accepted R3.1 semantics) and removes ONLY its own pending
+      member. R3.3.1: the old whole-key DEL also destroyed OTHER
+      concurrently verifying requests' reservations - a failure that
+      completed during another request's success vanished from the
+      budget. In-flight pendings of other requests now survive, and
+      commit when their own verdict arrives. The pure-IP spray
+      bucket only ever loses this attempt's own slot, so every other
+      recorded failure stays intact
     - an ABORTED verification (timeout, crash, client gone) releases
-      the reservation from both dimensions: it is NOT a failure
-    - a crashed process leaks at most its in-flight reservations, and
-      the window trim reclaims those slots once they age out - quota
-      is never permanently lost
+      ONLY its own pending member in both dimensions: it is NOT a
+      failure
+    - a crashed process leaks at most its in-flight pendings, and the
+      window trim reclaims those slots once they age out - quota is
+      never permanently lost
     - a request refused with 429 reserves nothing, so refusals can
       never extend the lockout
 
@@ -84,6 +94,11 @@ _IP_KEY = "qp:login:ip:{ip}"
 # local layer computes - failures age out one by one instead of the
 # whole bucket's TTL resetting on every new failure.
 #
+# R3.3.1: pair members carry a state prefix - "p:{attempt_id}" while the
+# request is still verifying, "f:{attempt_id}" once the password check
+# has FAILED. The ip spray bucket keeps plain attempt ids: nothing ever
+# bulk-deletes from it, so it needs no state.
+#
 # KEYS[1] = pair zset, KEYS[2] = ip zset
 # ARGV[1] = now_ms, ARGV[2] = window_ms, ARGV[3] = attempt_id,
 # ARGV[4] = pair_max, ARGV[5] = ip_max
@@ -98,8 +113,63 @@ end
 if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[5]) then
   return 0
 end
-redis.call('ZADD', KEYS[1], now, ARGV[3])
+redis.call('ZADD', KEYS[1], now, 'p:' .. ARGV[3])
 redis.call('ZADD', KEYS[2], now, ARGV[3])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+return 1
+"""
+
+# R3.3.1: a wrong password COMMITS its reservation as a failure record:
+# one atomic rename "p:{id}" -> "f:{id}" with the score preserved, so
+# the sliding window still anchors at attempt time (identical to the
+# local layer's timestamp). Idempotent: re-committing an already
+# committed (or removed) reservation is a no-op. The ip spray bucket is
+# untouched - its member (plain attempt id) already occupies the budget
+# and stays exactly as it is.
+#
+# KEYS[1] = pair zset
+# ARGV[1] = now_ms, ARGV[2] = window_ms, ARGV[3] = attempt_id
+_COMMIT_LUA = """
+local now = tonumber(ARGV[1])
+local cutoff = now - tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+local pending = 'p:' .. ARGV[3]
+local failed = 'f:' .. ARGV[3]
+local score = redis.call('ZSCORE', KEYS[1], pending)
+if score then
+  redis.call('ZADD', KEYS[1], score, failed)
+  redis.call('ZREM', KEYS[1], pending)
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+"""
+
+# R3.3.1: a correct password clears the pair bucket's FAILED history
+# (accepted R3.1 semantics) but must NOT touch other requests'
+# in-flight pendings - the old whole-key DEL destroyed reservations of
+# requests that were still verifying, so their later failures were
+# never recorded (the R3.3.1 acceptance scenario: A succeeds and wipes
+# B's pending; B's password then verifies wrong and the budget never
+# learns about it). One script, executed serially by Redis: trim, drop
+# every "f:*" member, drop ONLY this attempt's own "p:{id}" pending,
+# and release this attempt's slot from the ip spray bucket.
+#
+# KEYS[1] = pair zset, KEYS[2] = ip zset
+# ARGV[1] = now_ms, ARGV[2] = window_ms, ARGV[3] = attempt_id
+_SETTLE_SUCCESS_LUA = """
+local now = tonumber(ARGV[1])
+local cutoff = now - tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', cutoff)
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+for i = 1, #members do
+  if string.sub(members[i], 1, 2) == 'f:' then
+    redis.call('ZREM', KEYS[1], members[i])
+  end
+end
+redis.call('ZREM', KEYS[1], 'p:' .. ARGV[3])
+redis.call('ZREM', KEYS[2], ARGV[3])
 redis.call('PEXPIRE', KEYS[1], ARGV[2])
 redis.call('PEXPIRE', KEYS[2], ARGV[2])
 return 1
@@ -139,6 +209,8 @@ class RedisLoginThrottle:
             decode_responses=True, protocol=2,
         )
         self._reserve_script = self._client.register_script(_RESERVE_LUA)
+        self._commit_script = self._client.register_script(_COMMIT_LUA)
+        self._settle_success_script = self._client.register_script(_SETTLE_SUCCESS_LUA)
         self._max = max_failures
         self._ip_max = ip_max_failures
         self._window = window_seconds
@@ -195,36 +267,71 @@ class RedisLoginThrottle:
             return None
         return bool(int(verdict))
 
-    def settle_success(self, username: str, remote_ip: str, attempt_id: str) -> None:
-        """A correct password: the (ip, username) pair bucket is
-        cleared whole (authenticated, not an attacker) and ONLY this
-        attempt's slot is released from the pure-IP spray bucket -
-        every other recorded failure stays (R3.3 P1-01: a success must
-        not wipe the spray statistics)."""
+    def commit_failure(self, username: str, remote_ip: str, attempt_id: str) -> None:
+        """A wrong password: this attempt's PENDING reservation becomes
+        a FAILED record ("p:{id}" -> "f:{id}", score preserved, one
+        atomic script) - R3.3.1.
+
+        Unlike settle_success / release this RAISES
+        LoginThrottleUnavailable when Redis cannot record the failure:
+        a lost failure record under-counts the budget, which is the
+        attacker-favourable direction, so redis_required mode must
+        fail CLOSED (503 in app.py) instead of silently dropping the
+        record. Success/release bookkeeping may stay best-effort
+        because losing THOSE only over-counts."""
         if self.degraded:
-            # the slot ages out via the window trim; no permanent loss
+            raise LoginThrottleUnavailable(
+                "redis_required: cannot record the failed login - "
+                "Redis is unreachable (mid-verification outage)"
+            )
+        pair_key, _ = self._keys(username, remote_ip)
+        try:
+            self._commit_script(
+                keys=[pair_key],
+                args=[int(time.time() * 1000), self._window * 1000, attempt_id],
+            )
+        except Exception as exc:  # noqa: BLE001 - must NOT be swallowed
+            self._mark_degraded(exc)
+            raise LoginThrottleUnavailable(
+                f"redis_required: recording the failed login failed: {exc}"
+            ) from exc
+
+    def settle_success(self, username: str, remote_ip: str, attempt_id: str) -> None:
+        """A correct password: the (ip, username) pair bucket's FAILED
+        history is cleared (authenticated, not an attacker; accepted
+        R3.1 semantics) and ONLY this attempt's own pending member +
+        spray slot are removed - every other in-flight pending and
+        every other recorded failure stays (R3.3.1: the previous
+        whole-key DEL also destroyed concurrent requests' pendings, so
+        their failures were silently dropped; a success must not wipe
+        the spray statistics either)."""
+        if self.degraded:
+            # best effort: the own pending ages out via the window trim;
+            # losing success-side bookkeeping only OVER-counts (safe)
             return
         pair_key, ip_key = self._keys(username, remote_ip)
         try:
-            pipe = self._client.pipeline()
-            pipe.delete(pair_key)
-            pipe.zrem(ip_key, attempt_id)
-            pipe.execute()
+            self._settle_success_script(
+                keys=[pair_key, ip_key],
+                args=[int(time.time() * 1000), self._window * 1000, attempt_id],
+            )
         except Exception as exc:  # noqa: BLE001
             self._mark_degraded(exc)
 
     def release(self, username: str, remote_ip: str, attempt_id: str) -> None:
         """An aborted verification (timeout / crash / client gone) is
-        NOT a failure: this attempt's slot is returned in both
-        dimensions. Best effort - if Redis is down the slot simply ages
-        out through the sliding-window trim, so quota is never
+        NOT a failure: this attempt's own pending member is returned in
+        both dimensions (R3.3.1: the pair member is "p:{id}", so an
+        abort can never remove another request's committed failure
+        record either). Best effort - if Redis is down the slot simply
+        ages out through the sliding-window trim, so quota is never
         permanently lost (R3.3 P1-01 leak handling)."""
         if self.degraded:
             return
         pair_key, ip_key = self._keys(username, remote_ip)
         try:
             pipe = self._client.pipeline()
-            pipe.zrem(pair_key, attempt_id)
+            pipe.zrem(pair_key, f"p:{attempt_id}")
             pipe.zrem(ip_key, attempt_id)
             pipe.execute()
         except Exception as exc:  # noqa: BLE001

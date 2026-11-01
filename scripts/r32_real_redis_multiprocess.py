@@ -1,7 +1,7 @@
 """R3.3 P1-02: real-Redis multi-process login-throttle verification.
 
 Spawns ONE real redis-server plus TWO independent API processes
-(uvicorn, different ports) in redis_required mode and verifies the six
+(uvicorn, different ports) in redis_required mode and verifies the eight
 mandated behaviors over real HTTP:
 
   1 instance A's failure counts are visible to instance B (shared Redis)
@@ -18,6 +18,16 @@ mandated behaviors over real HTTP:
     sliding-window trim
   6 a correct login clears ONLY the (ip, username) pair bucket; the
     pure-IP spray bucket keeps every recorded failure
+  7 R3.3.1: eight REAL in-flight pendings (spent by the very Lua script
+    the API uses, via RedisLoginThrottle straight into the shared
+    Redis) all SURVIVE a successful HTTP login; two subsequent wrong
+    passwords commit REAL f: records next to them; the pair budget
+    then refuses the next reservation exactly (429)
+  8 R3.3.1: 120 CONCURRENT mixed correct/wrong-password logins for ONE
+    account from ONE IP across BOTH instances - every response is
+    200/401/429, no pending is ever stranded (the final pair zset holds
+    only committed f: members), and the ip spray zset ends up holding
+    EXACTLY as many members as wrong-password 401s
 
 Data-safety hardening (R3.3 P1-02) - the R3.2 version of this script
 could destroy data of a Redis it did not own (a foreign server already
@@ -458,7 +468,7 @@ def test_5_concurrency(redis: redis_lib.Redis, port_a: int, port_b: int) -> None
     leak_user = "leakuser"
     leak_pair = PAIR_KEY.format(ip=CLIENT_IP, username=leak_user)
     now_ms = int(time.time() * 1000)
-    redis.zadd(leak_pair, {f"leak-att-{i}": now_ms for i in range(PAIR_MAX)})
+    redis.zadd(leak_pair, {f"p:leak-att-{i}": now_ms for i in range(PAIR_MAX)})
     status = login(port_a, leak_user, "wrong-password")
     check(
         "5f in-window reservations (incl. a leaked one) block login (429)",
@@ -516,6 +526,171 @@ def test_6_success_clears_pair_only(
         "6e same pair not blocked anymore from instance B (401)",
         (status, code) == (401, "INVALID_CREDENTIALS"),
         f"({status}, {code})",
+    )
+
+
+def test_7_pendings_survive_success(
+    redis: redis_lib.Redis,
+    port_a: int,
+    port_b: int,
+    redis_url: str,
+    username: str,
+    password: str,
+) -> None:
+    """R3.3.1 acceptance race (the T1-T6 scenario), deterministic, over
+    real HTTP + real Redis: a successful login must keep OTHER requests'
+    in-flight pendings, and a failure that lands later must still be
+    recorded next to them."""
+    log("--- test 7 (R3.3.1): a success keeps other requests' pendings ---")
+    cleared = clear_login_namespace(redis)
+    log(f"cleared {cleared} qp:login:* keys from earlier tests")
+    pair_key = PAIR_KEY.format(ip=CLIENT_IP, username=username)
+    ip_key = IP_KEY.format(ip=CLIENT_IP)
+
+    # eight REAL in-flight reservations from "other API processes":
+    # spent by the very Lua script the API uses, straight into the
+    # shared Redis both instances talk to (two slots stay free)
+    from quantpilot_api.login_throttle import RedisLoginThrottle
+
+    preset = RedisLoginThrottle(redis_url, PAIR_MAX, IP_MAX, WINDOW_SECONDS)
+    for i in range(PAIR_MAX - 2):
+        ok = preset.reserve(username, CLIENT_IP, f"preset-{i}")
+        if not check(f"7a preset pending {i} reserved", ok is True, str(ok)):
+            return
+    score_before = redis.zscore(pair_key, "p:preset-0")
+
+    # a correct HTTP login lands while those eight are mid-verification
+    status, _code = login(port_a, username, password)
+    check(
+        "7b correct login 200 amid eight in-flight pendings",
+        status == 200,
+        f"status={status}",
+    )
+
+    members = redis.zrange(pair_key, 0, -1)
+    survived = sorted(m for m in members if m.startswith("p:preset-"))
+    check(
+        "7c ALL eight foreign pendings SURVIVED the success",
+        survived == sorted(f"p:preset-{i}" for i in range(PAIR_MAX - 2)),
+        f"members={members}",
+    )
+    check(
+        "7d the survivors' window scores are untouched",
+        redis.zscore(pair_key, "p:preset-0") == score_before,
+        f"before={score_before} after={redis.zscore(pair_key, 'p:preset-0')}",
+    )
+
+    # the two open slots: two wrong passwords commit REAL f: records
+    status, code = login(port_b, username, "definitely-wrong")
+    check(
+        "7e wrong password #1 verified (401)",
+        (status, code) == (401, "INVALID_CREDENTIALS"),
+        f"({status}, {code})",
+    )
+    members = redis.zrange(pair_key, 0, -1)
+    check(
+        "7f failure #1 committed next to the pendings (f: member)",
+        len(members) == PAIR_MAX - 1
+        and sum(1 for m in members if m.startswith("f:")) == 1,
+        f"members={members}",
+    )
+    status, code = login(port_a, username, "definitely-wrong")
+    check(
+        "7g wrong password #2 verified (401)",
+        (status, code) == (401, "INVALID_CREDENTIALS"),
+        f"({status}, {code})",
+    )
+    # the pair budget is now exactly full: the NEXT reservation - before
+    # any password verification - must be refused
+    status, code = login(port_a, username, "definitely-wrong")
+    check(
+        "7h next reservation refused exactly at the limit (429)",
+        (status, code) == (429, "TOO_MANY_ATTEMPTS"),
+        f"({status}, {code})",
+    )
+    members = redis.zrange(pair_key, 0, -1)
+    check(
+        "7i exact accounting: 8 pendings + 2 committed failures",
+        len(members) == PAIR_MAX
+        and sum(1 for m in members if m.startswith("p:preset-")) == PAIR_MAX - 2
+        and sum(1 for m in members if m.startswith("f:")) == 2,
+        f"members={members}",
+    )
+    zc_ip = redis.zcard(ip_key)
+    check(
+        "7j ip spray zset == 10 (the success returned only its own slot)",
+        zc_ip == PAIR_MAX,
+        f"ip={zc_ip}",
+    )
+
+
+def test_8_mixed_storm(
+    redis: redis_lib.Redis, port_a: int, port_b: int, username: str, password: str
+) -> None:
+    """R3.3.1: >=100 CONCURRENT mixed correct/wrong-password logins for
+    ONE account from ONE IP across BOTH instances (same account, same
+    IP). Successes legitimately clear committed history and re-open the
+    budget, so the deterministic verification-count bound lives in test
+    5; what a mixed storm can and must prove are the structural
+    invariants: every response is 200/401/429, no pending is ever
+    stranded, no record is invented, and the spray accounting is
+    EXACT under full concurrency."""
+    log("--- test 8 (R3.3.1): 120 mixed correct/wrong concurrent logins ---")
+    cleared = clear_login_namespace(redis)
+    log(f"cleared {cleared} qp:login:* keys from earlier tests")
+    pair_key = PAIR_KEY.format(ip=CLIENT_IP, username=username)
+    ip_key = IP_KEY.format(ip=CLIENT_IP)
+
+    total = 120
+
+    def one(i: int) -> int:
+        port = port_a if i % 2 == 0 else port_b
+        pwd = password if i % 4 in (0, 1) else "definitely-wrong"
+        status, _code = login(port, username, pwd)
+        return status
+
+    with ThreadPoolExecutor(max_workers=total) as pool:
+        futures = [pool.submit(one, i) for i in range(total)]
+        statuses = [f.result() for f in futures]
+
+    n_200 = statuses.count(200)
+    n_401 = statuses.count(401)
+    n_429 = statuses.count(429)
+    others = [s for s in statuses if s not in (200, 401, 429)]
+    check(
+        "8a every mixed attempt answered 200/401/429 (no 5xx)",
+        n_200 + n_401 + n_429 == total and not others,
+        f"200={n_200} 401={n_401} 429={n_429} other={others[:3]}",
+    )
+    check(
+        "8b the storm was really mixed: both verdicts occurred",
+        n_200 >= 1 and n_401 >= 1,
+        f"200={n_200} 401={n_401}",
+    )
+    members = redis.zrange(pair_key, 0, -1)
+    check(
+        "8c no pending stranded: every survivor is a committed f: record",
+        all(m.startswith("f:") for m in members),
+        f"members={members}",
+    )
+    check(
+        "8d pair zset stayed within the budget ceiling",
+        len(members) <= PAIR_MAX,
+        f"zcard={len(members)}",
+    )
+    check(
+        "8e no invented records: pair holds at most the 401 commits",
+        len(members) <= n_401,
+        f"zcard={len(members)} 401={n_401}",
+    )
+    zc_ip = redis.zcard(ip_key)
+    # every 401 kept its spray member; every 200 returned its own slot -
+    # so the spray zset holds EXACTLY as many members as verified
+    # wrong-password attempts, under full concurrency
+    check(
+        "8f ip spray accounting exact: zcard == verified 401s",
+        zc_ip == n_401,
+        f"ip={zc_ip} 401={n_401}",
     )
 
 
@@ -655,6 +830,21 @@ def main() -> int:
 
         # ---- 6: success clears pair bucket only ------------------------
         test_6_success_clears_pair_only(
+            redis, args.port_a, args.port_b, args.user, args.password
+        )
+
+        # ---- 7 (R3.3.1): pendings survive a success (deterministic) ----
+        test_7_pendings_survive_success(
+            redis,
+            args.port_a,
+            args.port_b,
+            f"redis://:{redis_password}@127.0.0.1:{redis_port}/0",
+            args.user,
+            args.password,
+        )
+
+        # ---- 8 (R3.3.1): 120 mixed concurrent logins, both instances ---
+        test_8_mixed_storm(
             redis, args.port_a, args.port_b, args.user, args.password
         )
 
